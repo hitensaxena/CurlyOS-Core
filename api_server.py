@@ -249,6 +249,48 @@ def stats():
     return counts
 
 
+@app.get("/api/stats/composition")
+def stats_composition(scope: str = SCOPE):
+    """Breakdown of memory + identity by epistemic status / tier, plus how many
+    beliefs changed recently. Powers the dashboard's "state of mind" view."""
+    def _group(conn, sql):
+        try:
+            return {r["k"]: r["n"] for r in conn.execute(sql, [scope]).fetchall() if r["k"]}
+        except Exception:
+            return {}
+
+    with get_conn() as conn:
+        memories_by_status = _group(
+            conn,
+            "SELECT epistemic_status AS k, count(*) AS n FROM memories "
+            "WHERE scope = %s AND valid_to IS NULL GROUP BY epistemic_status",
+        )
+        memories_by_tier = _group(
+            conn,
+            "SELECT tier AS k, count(*) AS n FROM memories "
+            "WHERE scope = %s AND valid_to IS NULL GROUP BY tier",
+        )
+        identity_by_status = _group(
+            conn,
+            "SELECT epistemic_status AS k, count(*) AS n FROM identity_facts "
+            "WHERE scope = %s AND valid_to IS NULL GROUP BY epistemic_status",
+        )
+        try:
+            changed_7d = conn.execute(
+                "SELECT count(*) AS n FROM memories "
+                "WHERE scope = %s AND valid_to >= now() - interval '7 days'",
+                [scope],
+            ).fetchone()["n"]
+        except Exception:
+            changed_7d = 0
+    return {
+        "memories_by_status": memories_by_status,
+        "memories_by_tier": memories_by_tier,
+        "identity_by_status": identity_by_status,
+        "memories_changed_7d": changed_7d,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Memories
 # ---------------------------------------------------------------------------
@@ -301,7 +343,11 @@ def get_memory(mem_id: str):
         sup = None
         if row.get("superseded_by"):
             sup = conn.execute("SELECT id, statement FROM memories WHERE id = %s", [row["superseded_by"]]).fetchone()
-    return {"memory": row, "source_episode": epi, "superseded_by": sup}
+        # Get the memory THIS one replaced (reverse link), for version history
+        prev = conn.execute(
+            "SELECT id, statement FROM memories WHERE superseded_by = %s", [mem_id]
+        ).fetchone()
+    return {"memory": row, "source_episode": epi, "superseded_by": sup, "supersedes": prev}
 
 
 @app.post("/api/memories")
@@ -342,13 +388,20 @@ def invalidate_memory(mem_id: str, body: InvalidateRequest | None = None):
 @app.get("/api/episodes")
 def list_episodes(
     scope: str = SCOPE,
+    modality: str | None = None,
     limit: int = Query(default=50, le=200),
     offset: int = 0,
 ):
+    conditions = ["scope = %s"]
+    params: list[Any] = [scope]
+    if modality:
+        conditions.append("modality = %s")
+        params.append(modality)
+    where = " AND ".join(conditions)
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM episodes WHERE scope = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
-            [scope, limit, offset],
+            f"SELECT * FROM episodes WHERE {where} ORDER BY created_at DESC LIMIT %s OFFSET %s",
+            params + [limit, offset],
         ).fetchall()
     return {"items": rows, "count": len(rows)}
 
@@ -371,19 +424,24 @@ def get_episode(epi_id: str):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/identity")
-def list_identity(scope: str = SCOPE, predicates: str | None = None):
+def list_identity(scope: str = SCOPE, predicates: str | None = None, valid: bool | None = True):
+    """valid=True (default) → current facts; False → superseded; None → all.
+    The webapp uses None to show a fact's history alongside the live value."""
+    conditions = ["scope = %s"]
+    params: list[Any] = [scope]
+    if predicates:
+        conditions.append("predicate = ANY(%s)")
+        params.append([p.strip() for p in predicates.split(",")])
+    if valid is True:
+        conditions.append("valid_to IS NULL")
+    elif valid is False:
+        conditions.append("valid_to IS NOT NULL")
+    where = " AND ".join(conditions)
     with get_conn() as conn:
-        if predicates:
-            preds = [p.strip() for p in predicates.split(",")]
-            rows = conn.execute(
-                "SELECT * FROM identity_facts WHERE scope = %s AND predicate = ANY(%s) AND valid_to IS NULL ORDER BY confidence DESC",
-                [scope, preds],
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM identity_facts WHERE scope = %s AND valid_to IS NULL ORDER BY confidence DESC",
-                [scope],
-            ).fetchall()
+        rows = conn.execute(
+            f"SELECT * FROM identity_facts WHERE {where} ORDER BY confidence DESC",
+            params,
+        ).fetchall()
     return {"items": rows, "count": len(rows)}
 
 

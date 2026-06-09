@@ -15,6 +15,9 @@ services:
     image: pgvector/pgvector:pg16
     container_name: curlyos-pg
     restart: unless-stopped
+    # Cap so a runaway query can't starve the 7.7G host (default shared_buffers
+    # is 128M; the dataset is small — 1.5G is generous).
+    mem_limit: 1500m
     environment:
       POSTGRES_USER: curlyos
       POSTGRES_DB: curlyos
@@ -36,6 +39,9 @@ services:
     image: redis:7.4-alpine
     container_name: curlyos-redis
     restart: unless-stopped
+    # Cap only (no eviction-policy change — other services on this host may
+    # share this redis, so allkeys-lru could evict someone's sessions).
+    mem_limit: 512m
     # Default RDB snapshotting (save 3600 1 300 100 60 10000), matching the
     # original. AOF stays off to preserve current behavior; flip on below if
     # you want stronger durability for the consolidation queue.
