@@ -63,7 +63,9 @@ async def extract_with_llm(
             model=model,
             messages=[
                 {"role": "system", "content": "You extract entity-relation triples. Return JSON only."},
-                {"role": "user", "content": EXTRACTION_PROMPT.format(text=episode_content)},
+                # NOTE: .replace, not .format — the prompt contains a literal JSON
+                # example ({"subject": ...}) that str.format would parse as fields.
+                {"role": "user", "content": EXTRACTION_PROMPT.replace("{text}", episode_content)},
             ],
             response_format={"type": "json_object"},
             temperature=0.1,

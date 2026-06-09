@@ -12,7 +12,7 @@ from typing import Any
 
 import psycopg
 import psycopg.rows
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 # ---------------------------------------------------------------------------
@@ -426,14 +426,39 @@ async def recall(request: Request):
     # memory.retrieval uses positional/tuple row access → tuple_row (see consolidation).
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
     try:
+        emb = await _get_recall_embedder()
+        # Large token_budget so retrieve() returns its full candidate pool — its
+        # assembler otherwise truncates by budget and can drop dense-strong items
+        # that RRF rank-fusion ranked low. We re-rank the pool ourselves below;
+        # the assembled context string is unused here.
         result = await retrieve(
-            RetrievalRequest(query=query, scope=scope, mode=mode),
-            pool=pool, embedder=await _get_recall_embedder(), reranker=FakeReranker(),
+            RetrievalRequest(query=query, scope=scope, mode=mode, token_budget=50000),
+            pool=pool, embedder=emb, reranker=FakeReranker(),
         )
+        cand = result.items
+        # Rerank by true cosine relevance using the STORED memory embeddings:
+        # embed the query once + one SQL pass over the candidate ids (NO per-doc
+        # re-encoding, which is far too slow on this CPU box). This surfaces the
+        # dense-relevant memories that rank-fusion buries.
+        sims: dict[str, float] = {}
+        if cand:
+            qv = (await emb.embed([query]))[0]
+            qlit = "[" + ",".join(repr(float(x)) for x in qv) + "]"
+            async with pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT id, 1 - (embedding <=> %s::vector) FROM memories "
+                        "WHERE id = ANY(%s) AND embedding IS NOT NULL",
+                        (qlit, [it.id for it in cand]),
+                    )
+                    for rid, sim in await cur.fetchall():
+                        sims[rid] = float(sim)
+            cand = sorted(cand, key=lambda it: -sims.get(it.id, -1.0))
         items = [
-            {"id": it.id, "text": it.text[:200], "score": it.score,
+            {"id": it.id, "text": it.text[:200],
+             "score": round(sims.get(it.id, it.score or 0.0), 4),
              "tier": it.tier, "epistemic_status": it.epistemic_status}
-            for it in result.items[:k]
+            for it in cand[:k]
         ]
         return {"results": items, "count": len(items)}
     except Exception as e:
@@ -450,12 +475,26 @@ async def recall(request: Request):
 @app.get("/api/cognition/meta")
 async def cognition_meta(scope: str = SCOPE):
     conn = get_conn()
+    principles = conn.execute(
+        "SELECT id, statement, domain, epistemic_status FROM principles "
+        "WHERE scope = %s AND valid_to IS NULL ORDER BY created_at DESC",
+        [scope],
+    ).fetchall()
     assumptions = conn.execute(
         "SELECT id, statement, domain, confidence, epistemic_status FROM assumptions WHERE scope = %s AND valid_to IS NULL ORDER BY confidence DESC",
         [scope],
     ).fetchall()
+    decision_audits = conn.execute(
+        "SELECT id, decision, domain, quality_score, created_at FROM decision_audits "
+        "WHERE scope = %s ORDER BY created_at DESC LIMIT 50",
+        [scope],
+    ).fetchall()
     conn.close()
-    return {"assumptions": assumptions}
+    return {
+        "principles": principles,
+        "assumptions": assumptions,
+        "decision_audits": decision_audits,
+    }
 
 
 @app.get("/api/cognition/reflection")
@@ -470,14 +509,34 @@ async def cognition_reflection(scope: str = SCOPE):
 
 
 @app.get("/api/cognition/attention")
-async def cognition_attention(scope: str = SCOPE):
+async def cognition_attention(scope: str = SCOPE, window_days: int = 7):
     conn = get_conn()
     gaps = conn.execute(
         "SELECT id, signal_type, description, severity, epistemic_status FROM alignment_signals WHERE scope = %s AND valid_to IS NULL ORDER BY severity DESC",
         [scope],
     ).fetchall()
     conn.close()
-    return {"alignment_gaps": gaps}
+
+    # Allocation (time-by-category + trend) and cognitive load are computed
+    # read-only — no LLM, no writes — so the GET can surface them live for the
+    # dashboard. POST /api/attention/scan additionally writes fresh
+    # alignment_signals; that mutation isn't needed just to display the numbers.
+    allocation = None
+    cognitive_load = None
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from cognition.attention import get_allocation, estimate_cognitive_load
+        pool = await _get_async_pool()
+        try:
+            allocation = await get_allocation(pool=pool, scope=scope, window_days=window_days)
+            cognitive_load = await estimate_cognitive_load(pool=pool, scope=scope, window_days=14)
+        finally:
+            await pool.close()
+    except Exception:
+        # Allocation/load are best-effort enrichment; gaps still render without them.
+        pass
+
+    return {"alignment_gaps": gaps, "allocation": allocation, "cognitive_load": cognitive_load}
 
 
 @app.get("/api/cognition/narrative")
@@ -505,28 +564,84 @@ async def compose_narrative(request: Request):
     if not query:
         raise HTTPException(400, "query is required")
 
+    like = f"%{query}%"
     conn = get_conn()
-    # Get relevant episodes and memories for narrative context
-    episodes = conn.execute(
-        "SELECT id, content, created_at FROM episodes WHERE scope = %s ORDER BY created_at DESC LIMIT 20",
+    # Material for the narrative: episodes/memories matching the query first,
+    # then recent context so there's always something to weave from.
+    if since:
+        rel_eps = conn.execute(
+            "SELECT id, content, created_at FROM episodes "
+            "WHERE scope = %s AND content ILIKE %s AND created_at >= %s "
+            "ORDER BY created_at DESC LIMIT 20",
+            [SCOPE, like, since],
+        ).fetchall()
+    else:
+        rel_eps = conn.execute(
+            "SELECT id, content, created_at FROM episodes "
+            "WHERE scope = %s AND content ILIKE %s ORDER BY created_at DESC LIMIT 20",
+            [SCOPE, like],
+        ).fetchall()
+    recent_eps = conn.execute(
+        "SELECT id, content, created_at FROM episodes WHERE scope = %s ORDER BY created_at DESC LIMIT 12",
         [SCOPE],
     ).fetchall()
     memories = conn.execute(
-        "SELECT id, statement, created_at FROM memories WHERE scope = %s AND valid_to IS NULL ORDER BY created_at DESC LIMIT 20",
-        [SCOPE],
+        "SELECT id, statement, created_at FROM memories "
+        "WHERE scope = %s AND valid_to IS NULL AND statement ILIKE %s "
+        "ORDER BY created_at DESC LIMIT 20",
+        [SCOPE, like],
     ).fetchall()
     conn.close()
 
-    narrative_parts = [f"- {e['content']}" for e in episodes[:5]]
-    narrative = f"Narrative for: {query}\n\n"
-    narrative += f"Based on {len(episodes)} episodes and {len(memories)} memories:\n"
-    narrative += "\n".join(narrative_parts) if narrative_parts else "(no relevant context found)"
+    # Merge relevant + recent episodes, de-duped, relevant first.
+    seen: set = set()
+    episodes = []
+    for e in rel_eps + recent_eps:
+        if e["id"] in seen:
+            continue
+        seen.add(e["id"])
+        episodes.append(e)
+
+    def _heuristic_narrative() -> str:
+        parts = [f"- {e['content']}" for e in episodes[:5]]
+        text = f"Narrative for: {query}\n\n"
+        text += f"Based on {len(episodes)} episodes and {len(memories)} memories:\n"
+        text += "\n".join(parts) if parts else "(no relevant context found)"
+        return text
+
+    client, model = _make_llm_client()
+    narrative = ""
+    if client and (episodes or memories):
+        ctx_lines = [f"- {e['content']}" for e in episodes[:18]]
+        ctx_lines += [f"- (belief) {m['statement']}" for m in memories[:12]]
+        focus = f" Stay within the domain of {domain}." if domain else ""
+        prompt = (
+            "You are composing a short, first-person narrative reflection for Hiten, "
+            "drawn only from his own journal episodes and remembered beliefs below. "
+            "Weave the material into 2-4 cohesive paragraphs that answer the question — "
+            "show how things developed or connect rather than listing them. Ground every "
+            "claim in the material; if it doesn't cover the question, say so plainly."
+            f"{focus}\n\nQuestion: {query}\n\nMaterial:\n" + "\n".join(ctx_lines)
+        )
+        try:
+            resp = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.6,
+                max_tokens=700,
+            )
+            narrative = (resp.choices[0].message.content or "").strip()
+        except Exception:
+            narrative = ""
+    if not narrative:
+        narrative = _heuristic_narrative()
 
     return {
         "query": query,
         "narrative": narrative,
         "sources": len(episodes),
         "memories_referenced": len(memories),
+        "llm": bool(client),
     }
 
 
@@ -1072,6 +1187,142 @@ def _make_llm_client():
     return client, model
 
 
+_embedder_singleton: Any = None
+
+
+async def _get_embedder_cached():
+    """Cached embedder so repeated ingests don't reload bge-m3 each time.
+
+    Caches only a real LocalBgeM3; a FakeEmbedder fallback is returned fresh
+    (not cached) so a later call can still pick up a real model once available.
+    """
+    global _embedder_singleton
+    if _embedder_singleton is not None:
+        return _embedder_singleton
+    emb = await _make_embedder()
+    from shared.embeddings.implementations import FakeEmbedder
+    if not isinstance(emb, FakeEmbedder):
+        _embedder_singleton = emb
+    return emb
+
+
+async def _embed_row(pool: Any, table: str, row_id: str, text: str, embedder: Any) -> bool:
+    """Embed `text` and store it in {table}.embedding for `row_id`. Best-effort.
+
+    `table` is a fixed internal literal ("memories"/"episodes"), never user input.
+    """
+    if not text or not text.strip():
+        return False
+    try:
+        vec = (await embedder.embed([text]))[0]
+        literal = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    f"UPDATE {table} SET embedding = %s::vector WHERE id = %s",
+                    (literal, row_id),
+                )
+        return True
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+async def _process_episode_bg(
+    scope: str, epi_id: str, mem_id: str | None, text: str, extract_knowledge: bool = True,
+) -> None:
+    """Background processing for an ingested episode. Embeds the episode + its
+    memory (so both are dense-recallable immediately), then runs knowledge
+    extraction (LLM → graph; regex fallback). Runs after the HTTP response so
+    capture stays snappy. Manages its own pool/embedder/LLM; best-effort.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from knowledge.graph import extract_and_project
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    pub = _make_publisher_sync()
+    try:
+        embedder = await _get_embedder_cached()
+        # Embeddings first — these make the entry dense-recallable right away.
+        await _embed_row(pool, "episodes", epi_id, text, embedder)
+        if mem_id:
+            await _embed_row(pool, "memories", mem_id, text[:4000], embedder)
+        # Then knowledge-graph extraction (entities/edges).
+        if extract_knowledge:
+            llm_client, _ = _make_llm_client()
+            await extract_and_project(
+                pool, pub, scope, epi_id, text,
+                embedder=embedder, llm_client=llm_client,
+            )
+    except Exception:
+        import traceback
+        traceback.print_exc()
+    finally:
+        await pool.close()
+
+
+@app.post("/api/ingest")
+async def ingest(request: Request, background_tasks: BackgroundTasks):
+    """Record raw text as an episode in curlyos-memory and process it.
+
+    Used by the web app (journal capture). Records an episode, appends a
+    recallable memory, and schedules LLM knowledge extraction in the
+    background so the caller returns immediately.
+
+    Body: {"text": str, "source_ref"?: str, "scope"?: str,
+           "add_memory"?: bool (default true),
+           "extract_knowledge"?: bool (default true)}
+    """
+    body = await request.json()
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    source_ref = body.get("source_ref") or "web:capture"
+    scope = body.get("scope") or SCOPE
+    add_memory = body.get("add_memory", True)
+    extract_knowledge = body.get("extract_knowledge", True)
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from memory.governance import record_episode, add
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    pub = _make_publisher_sync()
+    epi_id = None
+    result: dict = {}
+    try:
+        epi = await record_episode(
+            pool, pub, scope, content=text, source_ref=source_ref,
+        )
+        epi_id = epi["epi_id"]
+        result["epi_id"] = epi_id
+        if add_memory:
+            mem = await add(
+                pool, pub, scope,
+                statement=text[:4000],
+                source_episode_id=epi_id,
+                kind="fact",
+                # canonical so it's recallable: fast/deep recall filter to
+                # epistemic_status='canonical' only ("belief" is in no mode's
+                # filter, so belief memories never surface). A journal/voice
+                # capture is a first-person record, so canonical is apt.
+                epistemic_status="canonical",
+            )
+            result["mem_id"] = mem.get("mem_id")
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+    finally:
+        await pool.close()
+
+    if epi_id:
+        background_tasks.add_task(
+            _process_episode_bg, scope, epi_id, result.get("mem_id"), text, extract_knowledge,
+        )
+    result["processing"] = "scheduled" if epi_id else "skipped"
+    return result
+
+
 @app.post("/api/consolidation/run")
 async def consolidation_run(request: Request):
     """Run consolidation passes.
@@ -1110,6 +1361,144 @@ async def consolidation_run(request: Request):
             await redis.close()
 
 
+async def _sync_identity_from_reflection(pool: Any, pub: Any, scope: str) -> dict:
+    """Promote reflection reports' identity_candidates into identity_facts.
+
+    Closes the reflection→identity loop so identity keeps building as memory
+    grows. propose_identity_fact auto-promotes confidence >= 0.75 to canonical
+    (lower → hypothesis) and supersedes lower-confidence conflicts. Idempotent:
+    skips candidates whose (predicate, object) is already a current fact.
+    Best-effort. Returns counts.
+    """
+    import json
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from identity import propose_identity_fact
+    from memory.governance import record_episode
+
+    cands: list[dict] = []
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT identity_candidates FROM reflection_reports "
+                "WHERE scope = %s AND identity_candidates IS NOT NULL",
+                [scope],
+            )
+            for (ic,) in await cur.fetchall():
+                data = ic if isinstance(ic, list) else (json.loads(ic) if isinstance(ic, str) else [])
+                for c in (data or []):
+                    if not (isinstance(c, dict) and c.get("predicate") and c.get("object") is not None):
+                        continue
+                    obj = str(c["object"])
+                    # Skip raw-transcript junk — reflection sometimes emits whole
+                    # conversation turns as "identity". Real identity values are
+                    # short and free of turn/speaker markers.
+                    if "[turn" in obj or "User:" in obj or "Assistant:" in obj or len(obj) > 120:
+                        continue
+                    cands.append(c)
+
+    # One best (highest-confidence) candidate per predicate: identity_facts holds
+    # one value per predicate and propose_identity_fact supersedes conflicts, so
+    # promoting competing objects for the same predicate would churn.
+    best: dict[str, dict] = {}
+    for c in cands:
+        pred = str(c["predicate"])
+        if pred not in best or float(c.get("confidence", 0.6)) > float(best[pred].get("confidence", 0.6)):
+            best[pred] = c
+
+    promoted = skipped = 0
+    epi_id = None
+    for pred, c in best.items():
+        obj, conf = str(c["object"]), float(c.get("confidence", 0.6))
+        # Idempotent + churn-free: skip predicates that already have a current
+        # fact (don't re-propose/supersede on every reflection run).
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT 1 FROM identity_facts WHERE scope = %s AND predicate = %s "
+                    "AND valid_to IS NULL",
+                    [scope, pred],
+                )
+                if await cur.fetchone():
+                    skipped += 1
+                    continue
+        if epi_id is None:
+            epi = await record_episode(
+                pool, pub, scope,
+                content="Identity facts promoted from reflection reports.",
+                source_ref="reflection:identity-promotion",
+            )
+            epi_id = epi["epi_id"]
+        try:
+            await propose_identity_fact(
+                pool, pub, scope, predicate=pred, object=obj,
+                confidence=conf, source_episode_id=epi_id,
+            )
+            promoted += 1
+        except Exception:
+            skipped += 1
+    return {"identity_promoted": promoted, "identity_skipped": skipped}
+
+
+async def _sync_principles_to_memory(pool: Any, pub: Any, embedder: Any, scope: str) -> dict:
+    """Mirror distilled principles into recallable memories.
+
+    Closes the meta→memory loop so principles surface in /api/search and
+    /api/recall. Stored canonical (recall filters to canonical) with a
+    provenance episode (source_ref='meta:principles-mirror') and embedded so
+    they're dense-recallable. Idempotent: skips principles already mirrored.
+    Best-effort. Returns counts.
+    """
+    import re
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from memory.governance import record_episode, add
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT statement FROM principles WHERE scope = %s AND valid_to IS NULL",
+                [scope],
+            )
+            # Skip word-frequency "principles" (e.g. "... 'use' appears 4 times")
+            # from the pattern-counting distiller — noise in recallable memory.
+            _junk = re.compile(r"appears\s+\d+\s+times", re.I)
+            principles = [
+                r[0] for r in await cur.fetchall()
+                if r[0] and r[0].strip() and not _junk.search(r[0])
+            ]
+
+    added = skipped = 0
+    epi_id = None
+    for statement in principles:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT 1 FROM memories WHERE scope = %s AND statement = %s AND valid_to IS NULL",
+                    [scope, statement],
+                )
+                if await cur.fetchone():
+                    skipped += 1
+                    continue
+        if epi_id is None:
+            epi = await record_episode(
+                pool, pub, scope,
+                content="Principles distilled by meta-cognition.",
+                source_ref="meta:principles-mirror",
+            )
+            epi_id = epi["epi_id"]
+        try:
+            mem = await add(
+                pool, pub, scope, statement=statement,
+                source_episode_id=epi_id, kind="fact", epistemic_status="canonical",
+            )
+            mid = mem.get("mem_id")
+            if mid and embedder is not None:
+                await _embed_row(pool, "memories", mid, statement, embedder)
+            added += 1
+        except Exception:
+            skipped += 1
+    return {"principles_mirrored": added, "principles_skipped": skipped}
+
+
 @app.post("/api/reflection/weekly")
 async def reflection_weekly(request: Request):
     """Run a weekly reflection over the past 7 days.
@@ -1135,6 +1524,7 @@ async def reflection_weekly(request: Request):
             llm_model=llm_model,
         )
         result["llm"] = bool(llm_client)
+        result.update(await _sync_identity_from_reflection(pool, _make_publisher_sync(), scope))
         return result
     except Exception as e:
         import traceback
@@ -1166,6 +1556,7 @@ async def reflection_monthly(request: Request):
             llm_model=llm_model,
         )
         result["llm"] = bool(llm_client)
+        result.update(await _sync_identity_from_reflection(pool, _make_publisher_sync(), scope))
         return result
     except Exception as e:
         import traceback
@@ -1202,11 +1593,17 @@ async def meta_audit(request: Request):
             pool=pool,
             publisher=_make_publisher_sync(),
             scope=scope,
+            llm_client=llm_client,
+            llm_model=llm_model,
+        )
+        sync = await _sync_principles_to_memory(
+            pool, _make_publisher_sync(), await _get_embedder_cached(), scope,
         )
         return {
             "audit": audit_result,
             "principles_distilled": len(principles),
             "principles": principles,
+            **sync,
         }
     except Exception as e:
         import traceback
@@ -1228,6 +1625,7 @@ async def meta_distill(request: Request):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from cognition.meta import distill_principles
 
+    llm_client, llm_model = _make_llm_client()
     pool = await _get_async_pool()
     try:
         principles = await distill_principles(
@@ -1235,8 +1633,13 @@ async def meta_distill(request: Request):
             publisher=_make_publisher_sync(),
             scope=scope,
             min_confidence=min_confidence,
+            llm_client=llm_client,
+            llm_model=llm_model,
         )
-        return {"principles_distilled": len(principles), "principles": principles}
+        sync = await _sync_principles_to_memory(
+            pool, _make_publisher_sync(), await _get_embedder_cached(), scope,
+        )
+        return {"principles_distilled": len(principles), "principles": principles, **sync}
     except Exception as e:
         import traceback
         return {"error": str(e), "traceback": traceback.format_exc(), "scope": scope}

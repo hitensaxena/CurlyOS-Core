@@ -461,64 +461,113 @@ async def run_decision_audit(
 
 # ── Principles distillation ────────────────────────────────────────────────
 
+async def _llm_distill_principles(llm_client: Any, model: str, audit_rows: list) -> list[dict]:
+    """Use an LLM to distill generalizable principles from decision history.
+
+    Returns [{statement, domain, confidence}]. Raises on failure so the caller
+    can decide how to degrade.
+    """
+    import json
+
+    decisions_text = "\n".join(
+        f"- [{(dom or 'general')}] {(dec or '')[:300]}" for dec, dom in audit_rows[:120]
+    )
+    prompt = (
+        "Below are decisions Hiten has made (with domains). Distill 3-7 GENERALIZABLE "
+        "PRINCIPLES — durable, reusable insights about how Hiten thinks, decides, or "
+        "operates that would help predict or advise his future choices. Each must be a "
+        "concise principle in your own words (NOT a restatement of a single decision, and "
+        "NOT a word-frequency or count observation). Give a domain "
+        "(work | creative | health | personal | tooling | general) and a confidence "
+        "0.0-1.0 for how well the decisions support it.\n\n"
+        "Respond as JSON: {\"principles\": [{\"statement\": \"...\", \"domain\": \"...\", "
+        "\"confidence\": 0.0}]}\n\n"
+        f"Decisions:\n{decisions_text}"
+    )
+    response = await llm_client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        temperature=0.3,
+    )
+    data = json.loads(response.choices[0].message.content)
+    out = []
+    for p in data.get("principles", []):
+        if isinstance(p, dict) and p.get("statement"):
+            out.append({
+                "statement": str(p["statement"])[:400],
+                "domain": str(p.get("domain", "general"))[:40] or "general",
+                "confidence": p.get("confidence", 0.7),
+            })
+    return out
+
+
 async def distill_principles(
     pool: Any,
     publisher: Any,
     scope: str,
     min_confidence: float = 0.7,
+    llm_client: Any = None,
+    llm_model: str = "openai/gpt-4o-mini",
 ) -> list[dict]:
-    """Analyze decision_audits for recurring patterns and distill principles.
+    """Distill generalizable principles from recent decision_audits via an LLM.
 
-    Groups similar decisions, extracts recurring themes, and inserts
-    principles at epistemic_status='hypothesis'.
+    Produces durable, reusable insights about how the user decides/operates —
+    not word-frequency patterns. Dedups by statement; inserts canonical when
+    confidence >= 0.75, else hypothesis. Returns [] when no LLM is available
+    (the old verb-counting heuristic produced noise, so it is no longer emitted).
     """
-    import re
-    from collections import Counter
-
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                "SELECT id, decision, domain FROM decision_audits "
-                "WHERE scope = %s "
-                "ORDER BY created_at DESC LIMIT 200",
+                "SELECT decision, domain FROM decision_audits "
+                "WHERE scope = %s ORDER BY created_at DESC LIMIT 200",
                 (scope,),
             )
             audit_rows = await cur.fetchall()
 
-    if not audit_rows:
+    if not audit_rows or llm_client is None:
         return []
 
-    # Extract verb phrases from decisions to find recurring patterns
-    verb_counter: Counter[str] = Counter()
-    for _, decision, _ in audit_rows:
-        # Extract leading verb/action word
-        m = re.match(r'^(\w+)', decision.strip())
-        if m:
-            verb_counter[m.group(1).lower()] += 1
+    try:
+        distilled = await _llm_distill_principles(llm_client, llm_model, audit_rows)
+    except Exception as e:
+        log.warning("LLM principle distillation failed: %s", e)
+        return []
 
     principles: list[dict] = []
-    for verb, count in verb_counter.most_common(10):
-        if count < 2:
+    for p in distilled:
+        statement = str(p.get("statement", "")).strip()
+        if not statement:
             continue
-        confidence = min(0.5 + count * 0.05, 0.95)
-        if confidence < min_confidence:
+        conf = max(0.0, min(1.0, float(p.get("confidence", 0.7))))
+        if conf < min_confidence:
             continue
-        statement = f"Recurring decision pattern: '{verb}' appears {count} times"
-        prn_id = mint("prn")
+        domain = p.get("domain", "general")
+        status = "canonical" if conf >= 0.75 else "hypothesis"
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
+                # Dedup by statement (principles has no supersede path).
+                await cur.execute(
+                    "SELECT 1 FROM principles WHERE scope = %s AND statement = %s "
+                    "AND valid_to IS NULL LIMIT 1",
+                    (scope, statement),
+                )
+                if await cur.fetchone():
+                    continue
+                prn_id = mint("prn")
                 await cur.execute(
                     "INSERT INTO principles (id, scope, statement, domain, epistemic_status) "
                     "VALUES (%s, %s, %s, %s, %s) RETURNING id, valid_from",
-                    (prn_id, scope, statement, "general", "hypothesis"),
+                    (prn_id, scope, statement, domain, status),
                 )
                 pid, vf = await cur.fetchone()
         principles.append({
             "id": pid,
             "statement": statement,
-            "domain": "general",
-            "epistemic_status": "hypothesis",
-            "confidence": confidence,
+            "domain": domain,
+            "epistemic_status": status,
+            "confidence": conf,
             "valid_from": vf.isoformat() if vf else None,
         })
 

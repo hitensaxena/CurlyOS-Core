@@ -59,18 +59,20 @@ CREATE TABLE IF NOT EXISTS reflection_reports (
 
 # ── Reflection prompts ─────────────────────────────────────────────────────
 
-WEEKLY_ANALYSIS_PROMPT = """Analyze the following conversation episodes from the past week.
+WEEKLY_ANALYSIS_PROMPT = """Analyze the following conversation episodes from the past week. The user is Hiten.
 
-For each area, extract:
-1. FINDINGS — new facts, shifted preferences, recurring patterns (with confidence 0.0-1.0)
-2. GOAL_DELTAS — goals mentioned, progress made, blockers
-3. IDENTITY_CANDIDATES — stable preferences/traits (predicate, object, confidence)
+Extract:
+1. FINDINGS — net-new facts, shifted preferences, or recurring patterns (confidence 0.0-1.0).
+2. GOAL_DELTAS — goals mentioned, progress made, blockers.
+3. IDENTITY_CANDIDATES — durable facts about WHO HITEN IS (stable traits, preferences, roles, values, habits) as (predicate, object, confidence).
 
-Rules:
-- Findings are written at hypothesis status — never canonical without user confirmation
-- Identity candidates need confidence ≥ 0.75 to be auto-promoted
-- Be specific — "prefers Zed" ✅, "likes tools" ❌
-- Don't repeat existing knowledge — only net-new observations
+Strict rules for IDENTITY_CANDIDATES:
+- predicate: a short snake_case attribute — e.g. occupation, prefers_editor, works_on, values, sleep_schedule, dietary_preference, personality_trait. Do NOT invent meta-predicates like "expressed_self_reference", "said", "asked", or "mentioned".
+- object: a SHORT concrete value, a few words at most (a name, tool, preference, trait). NEVER a sentence, a task/request, or copied conversation text. Never include "[turn", "User:", "Assistant:", or any transcript fragment.
+- Only STABLE facts true across time — NOT one-off tasks or requests Hiten made in this conversation (e.g. "asked to set up a cron job" is NOT identity).
+- Good: {{"predicate": "prefers_editor", "object": "Zed", "confidence": 0.9}}
+- Bad:  {{"predicate": "expressed_self_reference", "object": "[turn 2] User: can you setup a cron job ..."}}
+- Findings and identity are hypotheses; confidence ≥ 0.75 auto-promotes identity to canonical. Only net-new observations — don't repeat the existing identity context.
 
 Recent episodes:
 {episodes}
