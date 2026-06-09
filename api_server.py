@@ -4,16 +4,22 @@ Runs as a FastAPI app on port 8642. Called by Next.js API routes or directly.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
+import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 import psycopg
 import psycopg.rows
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # Config
@@ -23,16 +29,55 @@ DSN = os.environ.get("CURLYOS_DATABASE_URL", "postgresql://curlyos:***@localhost
 REDIS_URL = os.environ.get("CURLYOS_REDIS_URL", "")
 SCOPE = os.environ.get("CURLYOS_SCOPE", "user:usr_hiten")
 
-app = FastAPI(title="CurlyOS API", version="0.1.0")
+# Root logging config: module loggers (memory/, knowledge/, cognition/) and
+# our own logger all flow to stderr → journald, independent of uvicorn's
+# --log-level (which only governs uvicorn's own loggers).
+logging.basicConfig(
+    level=os.environ.get("CURLYOS_LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("curlyos.api")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Self-heal: re-embed anything a crash/restart left without embeddings.
+    sweep = asyncio.create_task(_sweep_unembedded())
+    yield
+    sweep.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await sweep
+    for pool in _POOLS.values():
+        await pool.close()
+    _POOLS.clear()
+
+
+app = FastAPI(title="CurlyOS API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Server-side clients (Next.js proxy, voice, hermes) ignore CORS; this only
+    # gates direct browser access. Local dev ports + the prod webapp origin.
+    allow_origins=[
+        "http://localhost:3000", "http://127.0.0.1:3000",
+        "http://localhost:3100", "http://127.0.0.1:3100",
+        "https://os.curlybrackets.art",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
 def get_conn():
+    """Synchronous connection for the simple CRUD endpoints (which are plain
+    `def` routes — FastAPI runs them in its threadpool, so connecting here
+    never blocks the event loop). Use as a context manager: closes on exit,
+    including on exceptions."""
     return psycopg.connect(DSN, row_factory=psycopg.rows.dict_row, autocommit=True)
 
 
@@ -41,19 +86,120 @@ def now_iso() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Request models (validated bodies for the write endpoints)
+# ---------------------------------------------------------------------------
+
+class AddMemoryRequest(BaseModel):
+    statement: str = Field(min_length=1, max_length=8000)
+    source_episode_id: str = Field(min_length=1)
+    kind: str = "fact"
+    epistemic_status: str = "canonical"
+
+
+class InvalidateRequest(BaseModel):
+    reason: str = ""
+
+
+class ProposeIdentityRequest(BaseModel):
+    predicate: str = Field(min_length=1, max_length=200)
+    object: str = Field(min_length=1, max_length=2000)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    source_episode_id: str = ""
+
+
+class RecallRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=2000)
+    scope: str = SCOPE
+    mode: Literal["fast", "deep", "divergent"] = "fast"
+    k: int = Field(default=6, ge=1, le=20)
+
+
+class ComposeNarrativeRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=2000)
+    since: str | None = None
+    domain: str | None = None
+
+
+class CreateStudioRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=500)
+    properties: dict = Field(default_factory=dict)
+
+
+class CreateSketchRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=20000)
+    kind: str = "text"
+    properties: dict = Field(default_factory=dict)
+
+
+class CreateSimulationRunRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+    world_model_id: str | None = None
+    parameters: dict = Field(default_factory=dict)
+
+
+class CreateWorkspaceRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=500)
+    kind: str = "project"
+    properties: dict = Field(default_factory=dict)
+
+
+class CreateProjectRequest(BaseModel):
+    workspace_id: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=500)
+    properties: dict = Field(default_factory=dict)
+
+
+class IngestRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=100_000)
+    source_ref: str = "web:capture"
+    scope: str = SCOPE
+    add_memory: bool = True
+    extract_knowledge: bool = True
+
+
+class ConsolidationRunRequest(BaseModel):
+    mode: Literal["fast", "deep"] = "fast"
+    scope: str = SCOPE
+
+
+class ReflectionRequest(BaseModel):
+    scope: str = SCOPE
+    window_days: int = Field(default=7, ge=1, le=90)
+
+
+class MetaAuditRequest(BaseModel):
+    scope: str = SCOPE
+    window_days: int = Field(default=30, ge=1, le=365)
+
+
+class MetaDistillRequest(BaseModel):
+    scope: str = SCOPE
+    min_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+
+
+class NarrativeGenerateRequest(BaseModel):
+    scope: str = SCOPE
+    min_frequency: int = Field(default=3, ge=1)
+
+
+class AttentionScanRequest(BaseModel):
+    scope: str = SCOPE
+    window_days: int = Field(default=14, ge=1, le=365)
+
+
+# ---------------------------------------------------------------------------
 # Health + Stats
 # ---------------------------------------------------------------------------
 
 @app.get("/api/health")
-async def health():
+def health():
     result = {"timestamp": now_iso(), "postgres": {}, "redis": {}, "embedder": {}}
 
     # Postgres
     try:
-        conn = get_conn()
-        ver = conn.execute("SELECT version() AS v").fetchone()["v"]
-        has_vec = conn.execute("SELECT 1 FROM pg_extension WHERE extname='vector'").fetchone()
-        conn.close()
+        with get_conn() as conn:
+            ver = conn.execute("SELECT version() AS v").fetchone()["v"]
+            has_vec = conn.execute("SELECT 1 FROM pg_extension WHERE extname='vector'").fetchone()
         result["postgres"] = {
             "ok": True,
             "version": ver[:60],
@@ -86,16 +232,20 @@ async def health():
     return result
 
 
+# Fixed allowlist of tables /api/stats may count — table names are interpolated
+# into SQL, so they must only ever come from this literal tuple.
+_COUNT_TABLES = ("episodes", "memories", "identity_facts", "knowledge_entities", "knowledge_edges")
+
+
 @app.get("/api/stats")
-async def stats():
-    conn = get_conn()
+def stats():
     counts = {}
-    for t in ["episodes", "memories", "identity_facts", "knowledge_entities", "knowledge_edges"]:
-        try:
-            counts[t] = conn.execute(f"SELECT count(*) AS n FROM {t}").fetchone()["n"]
-        except Exception:
-            counts[t] = 0
-    conn.close()
+    with get_conn() as conn:
+        for t in _COUNT_TABLES:
+            try:
+                counts[t] = conn.execute(f"SELECT count(*) AS n FROM {t}").fetchone()["n"]
+            except Exception:
+                counts[t] = 0
     return counts
 
 
@@ -104,7 +254,7 @@ async def stats():
 # ---------------------------------------------------------------------------
 
 @app.get("/api/memories")
-async def list_memories(
+def list_memories(
     scope: str = SCOPE,
     kind: str | None = None,
     epistemic_status: str | None = None,
@@ -113,7 +263,6 @@ async def list_memories(
     offset: int = 0,
     q: str | None = None,
 ):
-    conn = get_conn()
     conditions = ["scope = %s"]
     params: list[Any] = [scope]
 
@@ -132,78 +281,57 @@ async def list_memories(
         params.append(q)
 
     where = " AND ".join(conditions)
-    rows = conn.execute(
-        f"SELECT * FROM memories WHERE {where} ORDER BY created_at DESC LIMIT %s OFFSET %s",
-        params + [limit, offset],
-    ).fetchall()
-    conn.close()
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM memories WHERE {where} ORDER BY created_at DESC LIMIT %s OFFSET %s",
+            params + [limit, offset],
+        ).fetchall()
     return {"items": rows, "count": len(rows)}
 
 
 @app.get("/api/memories/{mem_id}")
-async def get_memory(mem_id: str):
-    conn = get_conn()
-    row = conn.execute("SELECT * FROM memories WHERE id = %s", [mem_id]).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(404, "Memory not found")
-    # Get source episode
-    epi = conn.execute("SELECT * FROM episodes WHERE id = %s", [row["source_episode_id"]]).fetchone()
-    # Get superseded_by memory if any
-    sup = None
-    if row.get("superseded_by"):
-        sup = conn.execute("SELECT id, statement FROM memories WHERE id = %s", [row["superseded_by"]]).fetchone()
-    conn.close()
+def get_memory(mem_id: str):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM memories WHERE id = %s", [mem_id]).fetchone()
+        if not row:
+            raise HTTPException(404, "Memory not found")
+        # Get source episode
+        epi = conn.execute("SELECT * FROM episodes WHERE id = %s", [row["source_episode_id"]]).fetchone()
+        # Get superseded_by memory if any
+        sup = None
+        if row.get("superseded_by"):
+            sup = conn.execute("SELECT id, statement FROM memories WHERE id = %s", [row["superseded_by"]]).fetchone()
     return {"memory": row, "source_episode": epi, "superseded_by": sup}
 
 
 @app.post("/api/memories")
-async def add_memory(request: Request):
-    body = await request.json()
-    statement = body.get("statement", "")
-    source_episode_id = body.get("source_episode_id", "")
-    kind = body.get("kind", "fact")
-    epistemic_status = body.get("epistemic_status", "canonical")
-
-    if not statement:
-        raise HTTPException(400, "statement is required")
-    if not source_episode_id:
-        raise HTTPException(400, "source_episode_id is required")
-
-    conn = get_conn()
+def add_memory(body: AddMemoryRequest):
     try:
-        row = conn.execute(
-            "INSERT INTO memories (id, scope, statement, statement_key, kind, tier, "
-            "epistemic_status, valid_from, ingested_at, source_episode_id) "
-            "VALUES (gen_random_uuid()::text, %s, %s, %s, %s, 'semantic', %s, now(), now(), %s) "
-            "RETURNING id, created_at",
-            [SCOPE, statement, statement.lower().strip(), kind,
-             epistemic_status, source_episode_id],
-        ).fetchone()
-        conn.close()
+        with get_conn() as conn:
+            row = conn.execute(
+                "INSERT INTO memories (id, scope, statement, statement_key, kind, tier, "
+                "epistemic_status, valid_from, ingested_at, source_episode_id) "
+                "VALUES (gen_random_uuid()::text, %s, %s, %s, %s, 'semantic', %s, now(), now(), %s) "
+                "RETURNING id, created_at",
+                [SCOPE, body.statement, body.statement.lower().strip(), body.kind,
+                 body.epistemic_status, body.source_episode_id],
+            ).fetchone()
         return {"id": row["id"], "created_at": row["created_at"].isoformat() if row else None}
     except Exception as e:
-        conn.close()
         if "23503" in str(e):
-            raise HTTPException(400, f"source_episode_id not found: {source_episode_id}")
+            raise HTTPException(400, f"source_episode_id not found: {body.source_episode_id}")
         raise HTTPException(500, str(e))
 
 
 @app.post("/api/memories/{mem_id}/invalidate")
-async def invalidate_memory(mem_id: str, request: Request):
-    body = await request.json() if await request.body() else {}
-    reason = body.get("reason", "")
-
-    conn = get_conn()
-    row = conn.execute("SELECT valid_to FROM memories WHERE id = %s", [mem_id]).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(404, "Memory not found")
-    if row["valid_to"] is not None:
-        conn.close()
-        raise HTTPException(409, "Already invalidated")
-    conn.execute("UPDATE memories SET valid_to = now() WHERE id = %s", [mem_id])
-    conn.close()
+def invalidate_memory(mem_id: str, body: InvalidateRequest | None = None):
+    with get_conn() as conn:
+        row = conn.execute("SELECT valid_to FROM memories WHERE id = %s", [mem_id]).fetchone()
+        if not row:
+            raise HTTPException(404, "Memory not found")
+        if row["valid_to"] is not None:
+            raise HTTPException(409, "Already invalidated")
+        conn.execute("UPDATE memories SET valid_to = now() WHERE id = %s", [mem_id])
     return {"id": mem_id, "valid_to": now_iso(), "deleted": False}
 
 
@@ -212,32 +340,29 @@ async def invalidate_memory(mem_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/episodes")
-async def list_episodes(
+def list_episodes(
     scope: str = SCOPE,
     limit: int = Query(default=50, le=200),
     offset: int = 0,
 ):
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM episodes WHERE scope = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
-        [scope, limit, offset],
-    ).fetchall()
-    conn.close()
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM episodes WHERE scope = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
+            [scope, limit, offset],
+        ).fetchall()
     return {"items": rows, "count": len(rows)}
 
 
 @app.get("/api/episodes/{epi_id}")
-async def get_episode(epi_id: str):
-    conn = get_conn()
-    epi = conn.execute("SELECT * FROM episodes WHERE id = %s", [epi_id]).fetchone()
-    if not epi:
-        conn.close()
-        raise HTTPException(404, "Episode not found")
-    mems = conn.execute(
-        "SELECT id, statement, epistemic_status, valid_from, valid_to FROM memories WHERE source_episode_id = %s",
-        [epi_id],
-    ).fetchall()
-    conn.close()
+def get_episode(epi_id: str):
+    with get_conn() as conn:
+        epi = conn.execute("SELECT * FROM episodes WHERE id = %s", [epi_id]).fetchone()
+        if not epi:
+            raise HTTPException(404, "Episode not found")
+        mems = conn.execute(
+            "SELECT id, statement, epistemic_status, valid_from, valid_to FROM memories WHERE source_episode_id = %s",
+            [epi_id],
+        ).fetchall()
     return {"episode": epi, "memories": mems}
 
 
@@ -246,51 +371,37 @@ async def get_episode(epi_id: str):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/identity")
-async def list_identity(scope: str = SCOPE, predicates: str | None = None):
-    conn = get_conn()
-    if predicates:
-        preds = [p.strip() for p in predicates.split(",")]
-        rows = conn.execute(
-            "SELECT * FROM identity_facts WHERE scope = %s AND predicate = ANY(%s) AND valid_to IS NULL ORDER BY confidence DESC",
-            [scope, preds],
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM identity_facts WHERE scope = %s AND valid_to IS NULL ORDER BY confidence DESC",
-            [scope],
-        ).fetchall()
-    conn.close()
+def list_identity(scope: str = SCOPE, predicates: str | None = None):
+    with get_conn() as conn:
+        if predicates:
+            preds = [p.strip() for p in predicates.split(",")]
+            rows = conn.execute(
+                "SELECT * FROM identity_facts WHERE scope = %s AND predicate = ANY(%s) AND valid_to IS NULL ORDER BY confidence DESC",
+                [scope, preds],
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM identity_facts WHERE scope = %s AND valid_to IS NULL ORDER BY confidence DESC",
+                [scope],
+            ).fetchall()
     return {"items": rows, "count": len(rows)}
 
 
 @app.post("/api/identity")
-async def propose_identity(request: Request):
-    body = await request.json()
-    predicate = body.get("predicate", "")
-    obj = body.get("object", "")
-    confidence = float(body.get("confidence", 0.5))
-    source_episode_id = body.get("source_episode_id", "")
-
-    if not predicate:
-        raise HTTPException(400, "predicate is required")
-    if not obj:
-        raise HTTPException(400, "object is required")
-
-    conn = get_conn()
+def propose_identity(body: ProposeIdentityRequest):
     try:
-        ep_status = "canonical" if confidence >= 0.75 else "hypothesis"
-        row = conn.execute(
-            "INSERT INTO identity_facts (id, scope, predicate, object, confidence, "
-            "epistemic_status, valid_from, ingested_at, source_episode_id) "
-            "VALUES (gen_random_uuid()::text, %s, %s, %s, %s, %s, now(), now(), %s) "
-            "RETURNING id",
-            [SCOPE, predicate, obj, confidence, ep_status, source_episode_id],
-        ).fetchone()
-        conn.close()
-        return {"id": row["id"], "predicate": predicate, "object": obj,
-                "confidence": confidence, "epistemic_status": ep_status}
+        ep_status = "canonical" if body.confidence >= 0.75 else "hypothesis"
+        with get_conn() as conn:
+            row = conn.execute(
+                "INSERT INTO identity_facts (id, scope, predicate, object, confidence, "
+                "epistemic_status, valid_from, ingested_at, source_episode_id) "
+                "VALUES (gen_random_uuid()::text, %s, %s, %s, %s, %s, now(), now(), %s) "
+                "RETURNING id",
+                [SCOPE, body.predicate, body.object, body.confidence, ep_status, body.source_episode_id],
+            ).fetchone()
+        return {"id": row["id"], "predicate": body.predicate, "object": body.object,
+                "confidence": body.confidence, "epistemic_status": ep_status}
     except Exception as e:
-        conn.close()
         raise HTTPException(500, str(e))
 
 
@@ -299,20 +410,19 @@ async def propose_identity(request: Request):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/graph")
-async def get_graph(scope: str = SCOPE, limit: int = Query(default=200, le=500)):
-    conn = get_conn()
-    entities = conn.execute(
-        "SELECT id, name, label, properties, epistemic_status FROM knowledge_entities WHERE scope = %s AND valid_to IS NULL ORDER BY created_at DESC LIMIT %s",
-        [scope, limit],
-    ).fetchall()
-    entity_ids = [e["id"] for e in entities]
-    edges = []
-    if entity_ids:
-        edges = conn.execute(
-            "SELECT id, src_entity_id, dst_entity_id, rel_type, properties FROM knowledge_edges WHERE src_entity_id = ANY(%s) AND valid_to IS NULL",
-            [entity_ids],
+def get_graph(scope: str = SCOPE, limit: int = Query(default=200, le=500)):
+    with get_conn() as conn:
+        entities = conn.execute(
+            "SELECT id, name, label, properties, epistemic_status FROM knowledge_entities WHERE scope = %s AND valid_to IS NULL ORDER BY created_at DESC LIMIT %s",
+            [scope, limit],
         ).fetchall()
-    conn.close()
+        entity_ids = [e["id"] for e in entities]
+        edges = []
+        if entity_ids:
+            edges = conn.execute(
+                "SELECT id, src_entity_id, dst_entity_id, rel_type, properties FROM knowledge_edges WHERE src_entity_id = ANY(%s) AND valid_to IS NULL",
+                [entity_ids],
+            ).fetchall()
 
     # Build degree map
     degree: dict[str, int] = {}
@@ -332,35 +442,34 @@ async def get_graph(scope: str = SCOPE, limit: int = Query(default=200, le=500))
 
 
 @app.get("/api/graph/{entity_id}/expand")
-async def expand_graph(entity_id: str, k: int = Query(default=1, le=3)):
-    conn = get_conn()
+def expand_graph(entity_id: str, k: int = Query(default=1, le=3)):
     visited = {entity_id}
     frontier = [entity_id]
     all_edges = []
 
-    for _ in range(k):
-        if not frontier:
-            break
-        rows = conn.execute(
-            "SELECT id, src_entity_id, dst_entity_id, rel_type FROM knowledge_edges WHERE (src_entity_id = ANY(%s) OR dst_entity_id = ANY(%s)) AND valid_to IS NULL",
-            [frontier, frontier],
-        ).fetchall()
-        next_frontier = []
-        for r in rows:
-            all_edges.append(r)
-            for nid in [r["src_entity_id"], r["dst_entity_id"]]:
-                if nid not in visited:
-                    visited.add(nid)
-                    next_frontier.append(nid)
-        frontier = next_frontier
+    with get_conn() as conn:
+        for _ in range(k):
+            if not frontier:
+                break
+            rows = conn.execute(
+                "SELECT id, src_entity_id, dst_entity_id, rel_type FROM knowledge_edges WHERE (src_entity_id = ANY(%s) OR dst_entity_id = ANY(%s)) AND valid_to IS NULL",
+                [frontier, frontier],
+            ).fetchall()
+            next_frontier = []
+            for r in rows:
+                all_edges.append(r)
+                for nid in [r["src_entity_id"], r["dst_entity_id"]]:
+                    if nid not in visited:
+                        visited.add(nid)
+                        next_frontier.append(nid)
+            frontier = next_frontier
 
-    entities = []
-    if visited:
-        entities = conn.execute(
-            "SELECT id, name, label, properties, epistemic_status FROM knowledge_entities WHERE id = ANY(%s) AND valid_to IS NULL",
-            [list(visited)],
-        ).fetchall()
-    conn.close()
+        entities = []
+        if visited:
+            entities = conn.execute(
+                "SELECT id, name, label, properties, epistemic_status FROM knowledge_entities WHERE id = ANY(%s) AND valid_to IS NULL",
+                [list(visited)],
+            ).fetchall()
     return {"entities": entities, "edges": all_edges}
 
 
@@ -369,39 +478,21 @@ async def expand_graph(entity_id: str, k: int = Query(default=1, le=3)):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/search")
-async def search(q: str, scope: str = SCOPE, limit: int = Query(default=20, le=50)):
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT id, statement, kind, valid_from, valid_to, source_episode_id, epistemic_status, "
-        "ts_rank(to_tsvector('english', statement), plainto_tsquery('english', %s)) AS score "
-        "FROM memories WHERE scope = %s AND valid_to IS NULL "
-        "AND to_tsvector('english', statement) @@ plainto_tsquery('english', %s) "
-        "ORDER BY score DESC LIMIT %s",
-        [q, scope, q, limit],
-    ).fetchall()
-    conn.close()
+def search(q: str, scope: str = SCOPE, limit: int = Query(default=20, le=50)):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, statement, kind, valid_from, valid_to, source_episode_id, epistemic_status, "
+            "ts_rank(to_tsvector('english', statement), plainto_tsquery('english', %s)) AS score "
+            "FROM memories WHERE scope = %s AND valid_to IS NULL "
+            "AND to_tsvector('english', statement) @@ plainto_tsquery('english', %s) "
+            "ORDER BY score DESC LIMIT %s",
+            [q, scope, q, limit],
+        ).fetchall()
     return {"query": q, "items": rows, "count": len(rows)}
 
 
-# Cached warm embedder for semantic recall (avoids reloading bge-m3 per request).
-_RECALL_EMBEDDER = None
-
-
-async def _get_recall_embedder():
-    """Return a process-cached LocalBgeM3 (warm). Requires sentence_transformers,
-    which is present in the curlyos-core venv this API runs in."""
-    global _RECALL_EMBEDDER
-    if _RECALL_EMBEDDER is None:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from shared.embeddings.implementations import LocalBgeM3
-        emb = LocalBgeM3()
-        await emb.embed(["warmup"])
-        _RECALL_EMBEDDER = emb
-    return _RECALL_EMBEDDER
-
-
 @app.post("/api/recall")
-async def recall(request: Request):
+async def recall(body: RecallRequest):
     """Semantic + graph retrieval (dense pgvector + sparse + entity + graph + rerank).
 
     This is the authoritative recall path for the Hermes `curlyos` plugin, which
@@ -410,13 +501,7 @@ async def recall(request: Request):
 
     Body: {"query": "...", "scope": "user:usr_hiten", "mode": "fast"|"deep"|"divergent", "k": 6}
     """
-    body = await request.json()
-    query = body.get("query", "")
-    scope = body.get("scope", SCOPE)
-    mode = body.get("mode", "fast")
-    k = min(int(body.get("k", 6)), 20)
-    if not query:
-        raise HTTPException(400, "query is required")
+    query, scope, mode, k = body.query, body.scope, body.mode, body.k
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from memory.retrieval import retrieve
@@ -426,7 +511,7 @@ async def recall(request: Request):
     # memory.retrieval uses positional/tuple row access → tuple_row (see consolidation).
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
     try:
-        emb = await _get_recall_embedder()
+        emb = await get_shared_embedder()
         # Large token_budget so retrieve() returns its full candidate pool — its
         # assembler otherwise truncates by budget and can drop dense-strong items
         # that RRF rank-fusion ranked low. We re-rank the pool ourselves below;
@@ -462,10 +547,8 @@ async def recall(request: Request):
         ]
         return {"results": items, "count": len(items)}
     except Exception as e:
-        import traceback
-        return {"error": str(e), "traceback": traceback.format_exc(), "results": [], "count": 0}
-    finally:
-        await pool.close()
+        logger.exception("recall failed query=%r", query[:80])
+        return {"error": str(e), "results": [], "count": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -473,23 +556,22 @@ async def recall(request: Request):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/cognition/meta")
-async def cognition_meta(scope: str = SCOPE):
-    conn = get_conn()
-    principles = conn.execute(
-        "SELECT id, statement, domain, epistemic_status FROM principles "
-        "WHERE scope = %s AND valid_to IS NULL ORDER BY created_at DESC",
-        [scope],
-    ).fetchall()
-    assumptions = conn.execute(
-        "SELECT id, statement, domain, confidence, epistemic_status FROM assumptions WHERE scope = %s AND valid_to IS NULL ORDER BY confidence DESC",
-        [scope],
-    ).fetchall()
-    decision_audits = conn.execute(
-        "SELECT id, decision, domain, quality_score, created_at FROM decision_audits "
-        "WHERE scope = %s ORDER BY created_at DESC LIMIT 50",
-        [scope],
-    ).fetchall()
-    conn.close()
+def cognition_meta(scope: str = SCOPE):
+    with get_conn() as conn:
+        principles = conn.execute(
+            "SELECT id, statement, domain, epistemic_status FROM principles "
+            "WHERE scope = %s AND valid_to IS NULL ORDER BY created_at DESC",
+            [scope],
+        ).fetchall()
+        assumptions = conn.execute(
+            "SELECT id, statement, domain, confidence, epistemic_status FROM assumptions WHERE scope = %s AND valid_to IS NULL ORDER BY confidence DESC",
+            [scope],
+        ).fetchall()
+        decision_audits = conn.execute(
+            "SELECT id, decision, domain, quality_score, created_at FROM decision_audits "
+            "WHERE scope = %s ORDER BY created_at DESC LIMIT 50",
+            [scope],
+        ).fetchall()
     return {
         "principles": principles,
         "assumptions": assumptions,
@@ -498,24 +580,25 @@ async def cognition_meta(scope: str = SCOPE):
 
 
 @app.get("/api/cognition/reflection")
-async def cognition_reflection(scope: str = SCOPE):
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM reflection_reports WHERE scope = %s ORDER BY created_at DESC LIMIT 10",
-        [scope],
-    ).fetchall()
-    conn.close()
+def cognition_reflection(scope: str = SCOPE):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM reflection_reports WHERE scope = %s ORDER BY created_at DESC LIMIT 10",
+            [scope],
+        ).fetchall()
     return {"reports": rows}
 
 
 @app.get("/api/cognition/attention")
 async def cognition_attention(scope: str = SCOPE, window_days: int = 7):
-    conn = get_conn()
-    gaps = conn.execute(
-        "SELECT id, signal_type, description, severity, epistemic_status FROM alignment_signals WHERE scope = %s AND valid_to IS NULL ORDER BY severity DESC",
-        [scope],
-    ).fetchall()
-    conn.close()
+    def _fetch_gaps():
+        with get_conn() as conn:
+            return conn.execute(
+                "SELECT id, signal_type, description, severity, epistemic_status FROM alignment_signals WHERE scope = %s AND valid_to IS NULL ORDER BY severity DESC",
+                [scope],
+            ).fetchall()
+
+    gaps = await asyncio.to_thread(_fetch_gaps)
 
     # Allocation (time-by-category + trend) and cognitive load are computed
     # read-only — no LLM, no writes — so the GET can surface them live for the
@@ -527,71 +610,65 @@ async def cognition_attention(scope: str = SCOPE, window_days: int = 7):
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from cognition.attention import get_allocation, estimate_cognitive_load
         pool = await _get_async_pool()
-        try:
-            allocation = await get_allocation(pool=pool, scope=scope, window_days=window_days)
-            cognitive_load = await estimate_cognitive_load(pool=pool, scope=scope, window_days=14)
-        finally:
-            await pool.close()
+        allocation = await get_allocation(pool=pool, scope=scope, window_days=window_days)
+        cognitive_load = await estimate_cognitive_load(pool=pool, scope=scope, window_days=14)
     except Exception:
         # Allocation/load are best-effort enrichment; gaps still render without them.
-        pass
+        logger.warning("attention allocation/load enrichment failed", exc_info=True)
 
     return {"alignment_gaps": gaps, "allocation": allocation, "cognitive_load": cognitive_load}
 
 
 @app.get("/api/cognition/narrative")
-async def cognition_narrative(scope: str = SCOPE):
-    conn = get_conn()
-    chapters = conn.execute(
-        "SELECT id, title, summary, start_date, end_date, epistemic_status FROM life_chapters WHERE scope = %s ORDER BY start_date DESC",
-        [scope],
-    ).fetchall()
-    themes = conn.execute(
-        "SELECT id, name, description, frequency, epistemic_status FROM themes WHERE scope = %s ORDER BY frequency DESC",
-        [scope],
-    ).fetchall()
-    conn.close()
+def cognition_narrative(scope: str = SCOPE):
+    with get_conn() as conn:
+        chapters = conn.execute(
+            "SELECT id, title, summary, start_date, end_date, epistemic_status FROM life_chapters WHERE scope = %s ORDER BY start_date DESC",
+            [scope],
+        ).fetchall()
+        themes = conn.execute(
+            "SELECT id, name, description, frequency, epistemic_status FROM themes WHERE scope = %s ORDER BY frequency DESC",
+            [scope],
+        ).fetchall()
     return {"chapters": chapters, "themes": themes}
 
 
 @app.post("/api/cognition/narrative/compose")
-async def compose_narrative(request: Request):
-    body = await request.json()
-    query = body.get("query", "")
-    since = body.get("since")
-    domain = body.get("domain")
-
-    if not query:
-        raise HTTPException(400, "query is required")
+async def compose_narrative(body: ComposeNarrativeRequest):
+    query, since, domain = body.query, body.since, body.domain
 
     like = f"%{query}%"
-    conn = get_conn()
-    # Material for the narrative: episodes/memories matching the query first,
-    # then recent context so there's always something to weave from.
-    if since:
-        rel_eps = conn.execute(
-            "SELECT id, content, created_at FROM episodes "
-            "WHERE scope = %s AND content ILIKE %s AND created_at >= %s "
-            "ORDER BY created_at DESC LIMIT 20",
-            [SCOPE, like, since],
-        ).fetchall()
-    else:
-        rel_eps = conn.execute(
-            "SELECT id, content, created_at FROM episodes "
-            "WHERE scope = %s AND content ILIKE %s ORDER BY created_at DESC LIMIT 20",
-            [SCOPE, like],
-        ).fetchall()
-    recent_eps = conn.execute(
-        "SELECT id, content, created_at FROM episodes WHERE scope = %s ORDER BY created_at DESC LIMIT 12",
-        [SCOPE],
-    ).fetchall()
-    memories = conn.execute(
-        "SELECT id, statement, created_at FROM memories "
-        "WHERE scope = %s AND valid_to IS NULL AND statement ILIKE %s "
-        "ORDER BY created_at DESC LIMIT 20",
-        [SCOPE, like],
-    ).fetchall()
-    conn.close()
+
+    def _fetch_material():
+        # Material for the narrative: episodes/memories matching the query first,
+        # then recent context so there's always something to weave from.
+        with get_conn() as conn:
+            if since:
+                rel = conn.execute(
+                    "SELECT id, content, created_at FROM episodes "
+                    "WHERE scope = %s AND content ILIKE %s AND created_at >= %s "
+                    "ORDER BY created_at DESC LIMIT 20",
+                    [SCOPE, like, since],
+                ).fetchall()
+            else:
+                rel = conn.execute(
+                    "SELECT id, content, created_at FROM episodes "
+                    "WHERE scope = %s AND content ILIKE %s ORDER BY created_at DESC LIMIT 20",
+                    [SCOPE, like],
+                ).fetchall()
+            recent = conn.execute(
+                "SELECT id, content, created_at FROM episodes WHERE scope = %s ORDER BY created_at DESC LIMIT 12",
+                [SCOPE],
+            ).fetchall()
+            mems = conn.execute(
+                "SELECT id, statement, created_at FROM memories "
+                "WHERE scope = %s AND valid_to IS NULL AND statement ILIKE %s "
+                "ORDER BY created_at DESC LIMIT 20",
+                [SCOPE, like],
+            ).fetchall()
+        return rel, recent, mems
+
+    rel_eps, recent_eps, memories = await asyncio.to_thread(_fetch_material)
 
     # Merge relevant + recent episodes, de-duped, relevant first.
     seen: set = set()
@@ -632,6 +709,7 @@ async def compose_narrative(request: Request):
             )
             narrative = (resp.choices[0].message.content or "").strip()
         except Exception:
+            logger.warning("narrative LLM compose failed, using heuristic", exc_info=True)
             narrative = ""
     if not narrative:
         narrative = _heuristic_narrative()
@@ -650,17 +728,16 @@ async def compose_narrative(request: Request):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/events")
-async def list_events(
+def list_events(
     scope: str = SCOPE,
     limit: int = Query(default=50, le=100),
     offset: int = 0,
 ):
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT id, type, subject, scope, data, seq, created_at FROM events WHERE scope = %s ORDER BY seq DESC LIMIT %s OFFSET %s",
-        [scope, limit, offset],
-    ).fetchall()
-    conn.close()
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, type, subject, scope, data, seq, created_at FROM events WHERE scope = %s ORDER BY seq DESC LIMIT %s OFFSET %s",
+            [scope, limit, offset],
+        ).fetchall()
     return {"items": rows, "count": len(rows)}
 
 
@@ -669,83 +746,62 @@ async def list_events(
 # ---------------------------------------------------------------------------
 
 @app.get("/api/studio")
-async def list_studios(scope: str = SCOPE):
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT id, scope, title, status, properties, created_at, updated_at FROM studios WHERE scope = %s ORDER BY updated_at DESC",
-        [scope],
-    ).fetchall()
-    conn.close()
+def list_studios(scope: str = SCOPE):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, scope, title, status, properties, created_at, updated_at FROM studios WHERE scope = %s ORDER BY updated_at DESC",
+            [scope],
+        ).fetchall()
     return {"items": rows, "count": len(rows)}
 
 
 @app.post("/api/studio")
-async def create_studio(request: Request):
-    body = await request.json()
-    title = body.get("title", "")
-    properties = body.get("properties", {})
-
-    if not title:
-        raise HTTPException(400, "title is required")
-
-    conn = get_conn()
-    row = conn.execute(
-        "INSERT INTO studios (id, scope, title, status, properties) "
-        "VALUES (gen_random_uuid()::text, %s, %s, 'active', %s) "
-        "RETURNING id, created_at",
-        [SCOPE, title, json.dumps(properties)],
-    ).fetchone()
-    conn.close()
-    return {"id": row["id"], "title": title, "status": "active",
+def create_studio(body: CreateStudioRequest):
+    with get_conn() as conn:
+        row = conn.execute(
+            "INSERT INTO studios (id, scope, title, status, properties) "
+            "VALUES (gen_random_uuid()::text, %s, %s, 'active', %s) "
+            "RETURNING id, created_at",
+            [SCOPE, body.title, json.dumps(body.properties)],
+        ).fetchone()
+    return {"id": row["id"], "title": body.title, "status": "active",
             "created_at": row["created_at"].isoformat() if row else None}
 
 
 @app.get("/api/studio/{studio_id}")
-async def get_studio(studio_id: str):
-    conn = get_conn()
-    studio = conn.execute("SELECT * FROM studios WHERE id = %s", [studio_id]).fetchone()
-    if not studio:
-        conn.close()
-        raise HTTPException(404, "Studio not found")
-    sketches = conn.execute(
-        "SELECT id, studio_id, content, kind, epistemic_status, properties, created_at, updated_at "
-        "FROM studio_sketches WHERE studio_id = %s ORDER BY created_at DESC",
-        [studio_id],
-    ).fetchall()
-    links = conn.execute(
-        "SELECT id, src_sketch_id, dst_sketch_id, rel_type FROM studio_links "
-        "WHERE src_sketch_id IN (SELECT id FROM studio_sketches WHERE studio_id = %s)",
-        [studio_id],
-    ).fetchall()
-    conn.close()
+def get_studio(studio_id: str):
+    with get_conn() as conn:
+        studio = conn.execute("SELECT * FROM studios WHERE id = %s", [studio_id]).fetchone()
+        if not studio:
+            raise HTTPException(404, "Studio not found")
+        sketches = conn.execute(
+            "SELECT id, studio_id, content, kind, epistemic_status, properties, created_at, updated_at "
+            "FROM studio_sketches WHERE studio_id = %s ORDER BY created_at DESC",
+            [studio_id],
+        ).fetchall()
+        links = conn.execute(
+            "SELECT id, src_sketch_id, dst_sketch_id, rel_type FROM studio_links "
+            "WHERE src_sketch_id IN (SELECT id FROM studio_sketches WHERE studio_id = %s)",
+            [studio_id],
+        ).fetchall()
     return {"studio": studio, "sketches": sketches, "links": links}
 
 
 @app.post("/api/studio/{studio_id}/sketch")
-async def create_sketch(studio_id: str, request: Request):
-    body = await request.json()
-    content = body.get("content", "")
-    kind = body.get("kind", "text")
-    properties = body.get("properties", {})
-
-    if not content:
-        raise HTTPException(400, "content is required")
-
-    conn = get_conn()
-    # Verify studio exists
-    studio = conn.execute("SELECT id FROM studios WHERE id = %s", [studio_id]).fetchone()
-    if not studio:
-        conn.close()
-        raise HTTPException(404, "Studio not found")
-    row = conn.execute(
-        "INSERT INTO studio_sketches (id, studio_id, content, kind, epistemic_status, properties) "
-        "VALUES (gen_random_uuid()::text, %s, %s, %s, 'seed', %s) "
-        "RETURNING id, created_at",
-        [studio_id, content, kind, json.dumps(properties)],
-    ).fetchone()
-    conn.close()
-    return {"id": row["id"], "studio_id": studio_id, "content": content,
-            "kind": kind, "epistemic_status": "seed",
+def create_sketch(studio_id: str, body: CreateSketchRequest):
+    with get_conn() as conn:
+        # Verify studio exists
+        studio = conn.execute("SELECT id FROM studios WHERE id = %s", [studio_id]).fetchone()
+        if not studio:
+            raise HTTPException(404, "Studio not found")
+        row = conn.execute(
+            "INSERT INTO studio_sketches (id, studio_id, content, kind, epistemic_status, properties) "
+            "VALUES (gen_random_uuid()::text, %s, %s, %s, 'seed', %s) "
+            "RETURNING id, created_at",
+            [studio_id, body.content, body.kind, json.dumps(body.properties)],
+        ).fetchone()
+    return {"id": row["id"], "studio_id": studio_id, "content": body.content,
+            "kind": body.kind, "epistemic_status": "seed",
             "created_at": row["created_at"].isoformat() if row else None}
 
 
@@ -754,37 +810,27 @@ async def create_sketch(studio_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/simulation/runs")
-async def list_simulation_runs(scope: str = SCOPE):
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT id, scope, question, world_model_id, status, epistemic_status, "
-        "outcome_distribution, parameters, created_at, completed_at "
-        "FROM simulation_runs WHERE scope = %s ORDER BY created_at DESC",
-        [scope],
-    ).fetchall()
-    conn.close()
+def list_simulation_runs(scope: str = SCOPE):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, scope, question, world_model_id, status, epistemic_status, "
+            "outcome_distribution, parameters, created_at, completed_at "
+            "FROM simulation_runs WHERE scope = %s ORDER BY created_at DESC",
+            [scope],
+        ).fetchall()
     return {"items": rows, "count": len(rows)}
 
 
 @app.post("/api/simulation/runs")
-async def create_simulation_run(request: Request):
-    body = await request.json()
-    question = body.get("question", "")
-    world_model_id = body.get("world_model_id")
-    parameters = body.get("parameters", {})
-
-    if not question:
-        raise HTTPException(400, "question is required")
-
-    conn = get_conn()
-    row = conn.execute(
-        "INSERT INTO simulation_runs (id, scope, question, world_model_id, status, epistemic_status, parameters) "
-        "VALUES (gen_random_uuid()::text, %s, %s, %s, 'created', 'possible_world', %s) "
-        "RETURNING id, created_at",
-        [SCOPE, question, world_model_id, json.dumps(parameters)],
-    ).fetchone()
-    conn.close()
-    return {"id": row["id"], "question": question, "status": "created",
+def create_simulation_run(body: CreateSimulationRunRequest):
+    with get_conn() as conn:
+        row = conn.execute(
+            "INSERT INTO simulation_runs (id, scope, question, world_model_id, status, epistemic_status, parameters) "
+            "VALUES (gen_random_uuid()::text, %s, %s, %s, 'created', 'possible_world', %s) "
+            "RETURNING id, created_at",
+            [SCOPE, body.question, body.world_model_id, json.dumps(body.parameters)],
+        ).fetchone()
+    return {"id": row["id"], "question": body.question, "status": "created",
             "epistemic_status": "possible_world",
             "created_at": row["created_at"].isoformat() if row else None}
 
@@ -794,83 +840,60 @@ async def create_simulation_run(request: Request):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/workspaces")
-async def list_workspaces(scope: str = SCOPE):
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT id, scope, name, kind, properties, created_at, updated_at "
-        "FROM workspaces WHERE scope = %s ORDER BY updated_at DESC",
-        [scope],
-    ).fetchall()
-    conn.close()
+def list_workspaces(scope: str = SCOPE):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, scope, name, kind, properties, created_at, updated_at "
+            "FROM workspaces WHERE scope = %s ORDER BY updated_at DESC",
+            [scope],
+        ).fetchall()
     return {"items": rows, "count": len(rows)}
 
 
 @app.post("/api/workspaces")
-async def create_workspace(request: Request):
-    body = await request.json()
-    name = body.get("name", "")
-    kind = body.get("kind", "project")
-    properties = body.get("properties", {})
-
-    if not name:
-        raise HTTPException(400, "name is required")
-
-    conn = get_conn()
-    row = conn.execute(
-        "INSERT INTO workspaces (id, scope, name, kind, properties) "
-        "VALUES (gen_random_uuid()::text, %s, %s, %s, %s) "
-        "RETURNING id, created_at",
-        [SCOPE, name, kind, json.dumps(properties)],
-    ).fetchone()
-    conn.close()
-    return {"id": row["id"], "name": name, "kind": kind,
+def create_workspace(body: CreateWorkspaceRequest):
+    with get_conn() as conn:
+        row = conn.execute(
+            "INSERT INTO workspaces (id, scope, name, kind, properties) "
+            "VALUES (gen_random_uuid()::text, %s, %s, %s, %s) "
+            "RETURNING id, created_at",
+            [SCOPE, body.name, body.kind, json.dumps(body.properties)],
+        ).fetchone()
+    return {"id": row["id"], "name": body.name, "kind": body.kind,
             "created_at": row["created_at"].isoformat() if row else None}
 
 
 @app.get("/api/projects")
-async def list_projects(workspace_id: str | None = None, scope: str = SCOPE):
-    conn = get_conn()
-    if workspace_id:
-        rows = conn.execute(
-            "SELECT id, workspace_id, name, status, properties, created_at "
-            "FROM projects WHERE workspace_id = %s ORDER BY created_at DESC",
-            [workspace_id],
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT id, workspace_id, name, status, properties, created_at "
-            "FROM projects ORDER BY created_at DESC",
-        ).fetchall()
-    conn.close()
+def list_projects(workspace_id: str | None = None, scope: str = SCOPE):
+    with get_conn() as conn:
+        if workspace_id:
+            rows = conn.execute(
+                "SELECT id, workspace_id, name, status, properties, created_at "
+                "FROM projects WHERE workspace_id = %s ORDER BY created_at DESC",
+                [workspace_id],
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, workspace_id, name, status, properties, created_at "
+                "FROM projects ORDER BY created_at DESC",
+            ).fetchall()
     return {"items": rows, "count": len(rows)}
 
 
 @app.post("/api/projects")
-async def create_project(request: Request):
-    body = await request.json()
-    workspace_id = body.get("workspace_id", "")
-    name = body.get("name", "")
-    properties = body.get("properties", {})
-
-    if not workspace_id:
-        raise HTTPException(400, "workspace_id is required")
-    if not name:
-        raise HTTPException(400, "name is required")
-
-    conn = get_conn()
-    # Verify workspace exists
-    ws = conn.execute("SELECT id FROM workspaces WHERE id = %s", [workspace_id]).fetchone()
-    if not ws:
-        conn.close()
-        raise HTTPException(404, f"Workspace not found: {workspace_id}")
-    row = conn.execute(
-        "INSERT INTO projects (id, workspace_id, name, status, properties) "
-        "VALUES (gen_random_uuid()::text, %s, %s, 'active', %s) "
-        "RETURNING id, created_at",
-        [workspace_id, name, json.dumps(properties)],
-    ).fetchone()
-    conn.close()
-    return {"id": row["id"], "workspace_id": workspace_id, "name": name,
+def create_project(body: CreateProjectRequest):
+    with get_conn() as conn:
+        # Verify workspace exists
+        ws = conn.execute("SELECT id FROM workspaces WHERE id = %s", [body.workspace_id]).fetchone()
+        if not ws:
+            raise HTTPException(404, f"Workspace not found: {body.workspace_id}")
+        row = conn.execute(
+            "INSERT INTO projects (id, workspace_id, name, status, properties) "
+            "VALUES (gen_random_uuid()::text, %s, %s, 'active', %s) "
+            "RETURNING id, created_at",
+            [body.workspace_id, body.name, json.dumps(body.properties)],
+        ).fetchone()
+    return {"id": row["id"], "workspace_id": body.workspace_id, "name": body.name,
             "status": "active", "created_at": row["created_at"].isoformat() if row else None}
 
 
@@ -914,7 +937,7 @@ def _file_meta(path: str) -> dict[str, Any]:
 
 # NOTE: registered BEFORE /api/logs so the literal path is not shadowed by it.
 @app.get("/api/logs/sources")
-async def log_sources():
+def log_sources():
     """List the known log sources and their current file metadata."""
     sources = []
     for name, path in LOG_SOURCES.items():
@@ -930,7 +953,7 @@ async def log_sources():
 
 
 @app.get("/api/logs")
-async def get_logs(
+def get_logs(
     source: str = "api",
     lines: int = Query(default=200, le=2000),
 ):
@@ -970,11 +993,12 @@ async def get_logs(
 
 
 @app.get("/api/systems")
-async def systems():
+def systems():
     """Aggregate a single per-system status payload for the dashboard."""
-    # Reuse the existing health() + stats() endpoint logic.
-    health_data = await health()
-    stats_data = await stats()
+    # Reuse the existing health() + stats() endpoint logic (plain functions —
+    # this whole route runs in the threadpool).
+    health_data = health()
+    stats_data = stats()
 
     port = os.environ.get("CURLYOS_API_PORT", "8643")
     pg = health_data.get("postgres", {})
@@ -1011,7 +1035,7 @@ async def systems():
             "engines": engines,
         }
 
-    try:
+    with conn:
         for eng in SYSTEM_ENGINES:
             like = f"%{eng['keyword']}%"
             entry: dict[str, Any] = {
@@ -1060,8 +1084,6 @@ async def systems():
             except Exception as e:
                 entry = {"name": eng["name"], "label": eng["label"], "error": str(e)}
             engines.append(entry)
-    finally:
-        conn.close()
 
     return {
         "timestamp": now_iso(),
@@ -1085,25 +1107,42 @@ if __name__ == "__main__":
 # Autonomous Cognition Endpoints (triggered by Hermes cron)
 # ---------------------------------------------------------------------------
 
+# App-lifetime connection pools, one per row factory, created lazily on first
+# use and closed by the lifespan shutdown hook. Callers must NOT close them.
+_POOLS: dict[str, Any] = {}
+_POOLS_LOCK = asyncio.Lock()
+
+
 async def _get_async_pool(row_factory=None):
-    """Create an AsyncConnectionPool for the cognition endpoints.
+    """Return the shared app-lifetime AsyncConnectionPool for `row_factory`.
 
     Defaults to tuple_row: the entire curlyos-core stack (governance,
     retrieval, identity, consolidation, meta, reflection) uses positional
     row access (r[0]/r[1] and tuple unpacking). Endpoints that genuinely
     need column-by-name access can pass row_factory=psycopg.rows.dict_row.
+
+    Lazy creation (rather than eager open at startup) keeps the API up while
+    Postgres is briefly down — requests fail individually and recover.
     """
     import psycopg_pool
     if row_factory is None:
         row_factory = psycopg.rows.tuple_row
-    pool = psycopg_pool.AsyncConnectionPool(
-        DSN,
-        min_size=1,
-        max_size=3,
-        kwargs={"row_factory": row_factory},
-        open=False,
-    )
-    await pool.open()
+    key = getattr(row_factory, "__name__", str(row_factory))
+    pool = _POOLS.get(key)
+    if pool is not None:
+        return pool
+    async with _POOLS_LOCK:
+        pool = _POOLS.get(key)
+        if pool is None:
+            pool = psycopg_pool.AsyncConnectionPool(
+                DSN,
+                min_size=1,
+                max_size=3,
+                kwargs={"row_factory": row_factory},
+                open=False,
+            )
+            await pool.open()
+            _POOLS[key] = pool
     return pool
 
 
@@ -1164,12 +1203,22 @@ def _load_env_key(*names: str) -> str:
     return ""
 
 
+# Process-wide cached LLM client: the OpenRouter key is read from disk once and
+# the AsyncOpenAI client (with its httpx pool) is reused across calls.
+_LLM_CLIENT: Any = None
+_LLM_MODEL: str = ""
+
+
 def _make_llm_client():
-    """Build an OpenRouter-backed AsyncOpenAI client + model, or (None, "").
+    """Build (cached) an OpenRouter-backed AsyncOpenAI client + model, or (None, "").
 
     Returns (client, model). Returns (None, "") when no key is available or
-    the openai SDK is missing — callers must fall back to heuristics.
+    the openai SDK is missing — callers must fall back to heuristics. The
+    no-key result is NOT cached so adding a key later is picked up.
     """
+    global _LLM_CLIENT, _LLM_MODEL
+    if _LLM_CLIENT is not None:
+        return _LLM_CLIENT, _LLM_MODEL
     key = _load_env_key("OPENROUTER_API_KEY")
     if not key:
         return None, ""
@@ -1184,26 +1233,34 @@ def _make_llm_client():
         timeout=60.0,
         max_retries=2,
     )
+    _LLM_CLIENT, _LLM_MODEL = client, model
     return client, model
 
 
-_embedder_singleton: Any = None
+# Process-wide embedder singleton. bge-m3 is ~1.3GB on a RAM-tight box: it must
+# load AT MOST ONCE, hence the lock around first load (two concurrent first
+# requests would otherwise both instantiate it).
+_EMBEDDER: Any = None
+_EMBEDDER_LOCK = asyncio.Lock()
 
 
-async def _get_embedder_cached():
-    """Cached embedder so repeated ingests don't reload bge-m3 each time.
+async def get_shared_embedder():
+    """Cached embedder shared by recall, ingest, consolidation and sweeps.
 
     Caches only a real LocalBgeM3; a FakeEmbedder fallback is returned fresh
     (not cached) so a later call can still pick up a real model once available.
     """
-    global _embedder_singleton
-    if _embedder_singleton is not None:
-        return _embedder_singleton
-    emb = await _make_embedder()
-    from shared.embeddings.implementations import FakeEmbedder
-    if not isinstance(emb, FakeEmbedder):
-        _embedder_singleton = emb
-    return emb
+    global _EMBEDDER
+    if _EMBEDDER is not None:
+        return _EMBEDDER
+    async with _EMBEDDER_LOCK:
+        if _EMBEDDER is not None:
+            return _EMBEDDER
+        emb = await _make_embedder()
+        from shared.embeddings.implementations import FakeEmbedder
+        if not isinstance(emb, FakeEmbedder):
+            _EMBEDDER = emb
+        return emb
 
 
 async def _embed_row(pool: Any, table: str, row_id: str, text: str, embedder: Any) -> bool:
@@ -1224,8 +1281,7 @@ async def _embed_row(pool: Any, table: str, row_id: str, text: str, embedder: An
                 )
         return True
     except Exception:
-        import traceback
-        traceback.print_exc()
+        logger.exception("embed failed table=%s id=%s", table, row_id)
         return False
 
 
@@ -1235,35 +1291,82 @@ async def _process_episode_bg(
     """Background processing for an ingested episode. Embeds the episode + its
     memory (so both are dense-recallable immediately), then runs knowledge
     extraction (LLM → graph; regex fallback). Runs after the HTTP response so
-    capture stays snappy. Manages its own pool/embedder/LLM; best-effort.
+    capture stays snappy. Best-effort with retries; failures are logged and any
+    row still left unembedded is picked up by the startup sweep.
     """
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from knowledge.graph import extract_and_project
 
-    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
-    pub = _make_publisher_sync()
     try:
-        embedder = await _get_embedder_cached()
+        pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+        pub = _make_publisher_sync()
+        embedder = await get_shared_embedder()
+
         # Embeddings first — these make the entry dense-recallable right away.
-        await _embed_row(pool, "episodes", epi_id, text, embedder)
-        if mem_id:
-            await _embed_row(pool, "memories", mem_id, text[:4000], embedder)
+        done_epi = done_mem = False
+        for attempt in range(3):
+            done_epi = done_epi or await _embed_row(pool, "episodes", epi_id, text, embedder)
+            done_mem = done_mem or not mem_id or await _embed_row(pool, "memories", mem_id, text[:4000], embedder)
+            if done_epi and done_mem:
+                break
+            logger.warning("embedding attempt %d incomplete epi=%s", attempt + 1, epi_id)
+            await asyncio.sleep(2 ** attempt * 2)
+
         # Then knowledge-graph extraction (entities/edges).
         if extract_knowledge:
             llm_client, _ = _make_llm_client()
-            await extract_and_project(
-                pool, pub, scope, epi_id, text,
-                embedder=embedder, llm_client=llm_client,
-            )
+            for attempt in range(3):
+                try:
+                    await extract_and_project(
+                        pool, pub, scope, epi_id, text,
+                        embedder=embedder, llm_client=llm_client,
+                    )
+                    break
+                except Exception:
+                    logger.exception("knowledge extraction failed epi=%s attempt=%d", epi_id, attempt + 1)
+                    if attempt < 2:
+                        await asyncio.sleep(2 ** attempt * 2)
     except Exception:
-        import traceback
-        traceback.print_exc()
-    finally:
-        await pool.close()
+        logger.exception("background processing failed epi=%s", epi_id)
+
+
+async def _sweep_unembedded() -> None:
+    """Startup self-heal: embed recent rows left embedding-less by a crash or
+    restart that killed a background task mid-flight. Sequential and bounded
+    by design — this box swaps on big encode batches.
+    """
+    try:
+        pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT 'episodes' AS t, id, content AS txt FROM episodes "
+                    "WHERE embedding IS NULL AND content IS NOT NULL AND content <> '' "
+                    "AND created_at > now() - interval '7 days' "
+                    "UNION ALL "
+                    "SELECT 'memories' AS t, id, statement AS txt FROM memories "
+                    "WHERE embedding IS NULL AND statement IS NOT NULL AND statement <> '' "
+                    "AND created_at > now() - interval '7 days' "
+                    "LIMIT 500"
+                )
+                rows = await cur.fetchall()
+        if not rows:
+            return
+        logger.info("sweep: re-embedding %d rows left unembedded", len(rows))
+        embedder = await get_shared_embedder()
+        done = 0
+        for table, row_id, txt in rows:
+            text = txt[:4000] if table == "memories" else txt
+            done += await _embed_row(pool, table, row_id, text, embedder)
+        logger.info("sweep: embedded %d/%d rows", done, len(rows))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("unembedded sweep failed")
 
 
 @app.post("/api/ingest")
-async def ingest(request: Request, background_tasks: BackgroundTasks):
+async def ingest(body: IngestRequest, background_tasks: BackgroundTasks):
     """Record raw text as an episode in curlyos-memory and process it.
 
     Used by the web app (journal capture). Records an episode, appends a
@@ -1274,14 +1377,13 @@ async def ingest(request: Request, background_tasks: BackgroundTasks):
            "add_memory"?: bool (default true),
            "extract_knowledge"?: bool (default true)}
     """
-    body = await request.json()
-    text = (body.get("text") or "").strip()
+    text = body.text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
-    source_ref = body.get("source_ref") or "web:capture"
-    scope = body.get("scope") or SCOPE
-    add_memory = body.get("add_memory", True)
-    extract_knowledge = body.get("extract_knowledge", True)
+    source_ref = body.source_ref or "web:capture"
+    scope = body.scope or SCOPE
+    add_memory = body.add_memory
+    extract_knowledge = body.extract_knowledge
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from memory.governance import record_episode, add
@@ -1310,10 +1412,8 @@ async def ingest(request: Request, background_tasks: BackgroundTasks):
             )
             result["mem_id"] = mem.get("mem_id")
     except Exception as e:
-        import traceback
-        return {"error": str(e), "traceback": traceback.format_exc()}
-    finally:
-        await pool.close()
+        logger.exception("ingest failed source_ref=%s", source_ref)
+        return {"error": str(e)}
 
     if epi_id:
         background_tasks.add_task(
@@ -1324,17 +1424,16 @@ async def ingest(request: Request, background_tasks: BackgroundTasks):
 
 
 @app.post("/api/consolidation/run")
-async def consolidation_run(request: Request):
+async def consolidation_run(body: ConsolidationRunRequest | None = None):
     """Run consolidation passes.
 
     Body: {"mode": "fast"|"deep", "scope": "user:usr_hiten"}
       fast  = dedup + conflict_resolve
       deep  = all passes (dedup, merge_promote, conflict_resolve, summarize, decay, recombine_incubate)
     """
-    body = await request.json()
-    mode = body.get("mode", "fast")
-    scope = body.get("scope", SCOPE)
-    deep = mode == "deep"
+    body = body or ConsolidationRunRequest()
+    scope = body.scope
+    deep = body.mode == "deep"
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from memory.consolidation import run_consolidation
@@ -1346,17 +1445,16 @@ async def consolidation_run(request: Request):
         result = await run_consolidation(
             pool=pool,
             redis=redis,
-            embedder=await _make_embedder(),
+            embedder=await get_shared_embedder(),
             publisher=_make_publisher_sync(),
             scope=scope,
             deep=deep,
         )
         return result
     except Exception as e:
-        import traceback
-        return {"error": str(e), "traceback": traceback.format_exc(), "scope": scope, "deep": deep}
+        logger.exception("consolidation run failed scope=%s deep=%s", scope, deep)
+        return {"error": str(e), "scope": scope, "deep": deep}
     finally:
-        await pool.close()
         if redis:
             await redis.close()
 
@@ -1500,14 +1598,13 @@ async def _sync_principles_to_memory(pool: Any, pub: Any, embedder: Any, scope: 
 
 
 @app.post("/api/reflection/weekly")
-async def reflection_weekly(request: Request):
+async def reflection_weekly(body: ReflectionRequest | None = None):
     """Run a weekly reflection over the past 7 days.
 
     Body: {"scope": "user:usr_hiten", "window_days": 7}
     """
-    body = await request.json()
-    scope = body.get("scope", SCOPE)
-    window_days = int(body.get("window_days", 7))
+    body = body or ReflectionRequest()
+    scope, window_days = body.scope, body.window_days
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from cognition.reflection import run_weekly_reflection
@@ -1527,20 +1624,18 @@ async def reflection_weekly(request: Request):
         result.update(await _sync_identity_from_reflection(pool, _make_publisher_sync(), scope))
         return result
     except Exception as e:
-        import traceback
-        return {"error": str(e), "traceback": traceback.format_exc(), "scope": scope, "type": "weekly"}
-    finally:
-        await pool.close()
+        logger.exception("weekly reflection failed scope=%s", scope)
+        return {"error": str(e), "scope": scope, "type": "weekly"}
 
 
 @app.post("/api/reflection/monthly")
-async def reflection_monthly(request: Request):
+async def reflection_monthly(body: ReflectionRequest | None = None):
     """Run a monthly reflection over the past 30 days.
 
     Body: {"scope": "user:usr_hiten"}
     """
-    body = await request.json()
-    scope = body.get("scope", SCOPE)
+    body = body or ReflectionRequest()
+    scope = body.scope
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from cognition.reflection import run_monthly_reflection
@@ -1559,21 +1654,18 @@ async def reflection_monthly(request: Request):
         result.update(await _sync_identity_from_reflection(pool, _make_publisher_sync(), scope))
         return result
     except Exception as e:
-        import traceback
-        return {"error": str(e), "traceback": traceback.format_exc(), "scope": scope, "type": "monthly"}
-    finally:
-        await pool.close()
+        logger.exception("monthly reflection failed scope=%s", scope)
+        return {"error": str(e), "scope": scope, "type": "monthly"}
 
 
 @app.post("/api/meta/audit")
-async def meta_audit(request: Request):
+async def meta_audit(body: MetaAuditRequest | None = None):
     """Run a decision audit + principle distillation over recent episodes.
 
     Body: {"scope": "user:usr_hiten", "window_days": 30}
     """
-    body = await request.json()
-    scope = body.get("scope", SCOPE)
-    window_days = int(body.get("window_days", 30))
+    body = body or MetaAuditRequest()
+    scope, window_days = body.scope, body.window_days
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from cognition.meta import run_decision_audit, distill_principles
@@ -1597,7 +1689,7 @@ async def meta_audit(request: Request):
             llm_model=llm_model,
         )
         sync = await _sync_principles_to_memory(
-            pool, _make_publisher_sync(), await _get_embedder_cached(), scope,
+            pool, _make_publisher_sync(), await get_shared_embedder(), scope,
         )
         return {
             "audit": audit_result,
@@ -1606,21 +1698,18 @@ async def meta_audit(request: Request):
             **sync,
         }
     except Exception as e:
-        import traceback
-        return {"error": str(e), "traceback": traceback.format_exc(), "scope": scope}
-    finally:
-        await pool.close()
+        logger.exception("meta audit failed scope=%s", scope)
+        return {"error": str(e), "scope": scope}
 
 
 @app.post("/api/meta/distill")
-async def meta_distill(request: Request):
+async def meta_distill(body: MetaDistillRequest | None = None):
     """Distill principles from decision audits.
 
     Body: {"scope": "user:usr_hiten", "min_confidence": 0.7}
     """
-    body = await request.json()
-    scope = body.get("scope", SCOPE)
-    min_confidence = float(body.get("min_confidence", 0.7))
+    body = body or MetaDistillRequest()
+    scope, min_confidence = body.scope, body.min_confidence
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from cognition.meta import distill_principles
@@ -1637,27 +1726,24 @@ async def meta_distill(request: Request):
             llm_model=llm_model,
         )
         sync = await _sync_principles_to_memory(
-            pool, _make_publisher_sync(), await _get_embedder_cached(), scope,
+            pool, _make_publisher_sync(), await get_shared_embedder(), scope,
         )
         return {"principles_distilled": len(principles), "principles": principles, **sync}
     except Exception as e:
-        import traceback
-        return {"error": str(e), "traceback": traceback.format_exc(), "scope": scope}
-    finally:
-        await pool.close()
+        logger.exception("meta distill failed scope=%s", scope)
+        return {"error": str(e), "scope": scope}
 
 
 @app.post("/api/narrative/generate")
-async def narrative_generate(request: Request):
+async def narrative_generate(body: NarrativeGenerateRequest | None = None):
     """Surface themes + compose life chapters from episodes.
 
     Body: {"scope": "user:usr_hiten", "min_frequency": 3}
     Each run supersedes prior hypothesis themes/chapters (invalidate-not-delete)
     so the active set stays a fresh, bounded snapshot.
     """
-    body = await request.json()
-    scope = body.get("scope", SCOPE)
-    min_frequency = int(body.get("min_frequency", 3))
+    body = body or NarrativeGenerateRequest()
+    scope, min_frequency = body.scope, body.min_frequency
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from cognition.narrative import surface_themes, compose_chapters
@@ -1678,23 +1764,20 @@ async def narrative_generate(request: Request):
             "top_themes": [t.get("name") for t in themes[:8]],
         }
     except Exception as e:
-        import traceback
-        return {"error": str(e), "traceback": traceback.format_exc(), "scope": scope}
-    finally:
-        await pool.close()
+        logger.exception("narrative generate failed scope=%s", scope)
+        return {"error": str(e), "scope": scope}
 
 
 @app.post("/api/attention/scan")
-async def attention_scan(request: Request):
+async def attention_scan(body: AttentionScanRequest | None = None):
     """Detect value-action alignment gaps + snapshot allocation & cognitive load.
 
     Body: {"scope": "user:usr_hiten", "window_days": 14}
     Alignment gaps are written as hypothesis-status alignment_signals (each run
     supersedes prior hypothesis signals). Allocation/load are computed read-only.
     """
-    body = await request.json()
-    scope = body.get("scope", SCOPE)
-    window_days = int(body.get("window_days", 14))
+    body = body or AttentionScanRequest()
+    scope, window_days = body.scope, body.window_days
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from cognition.attention import (
@@ -1718,7 +1801,5 @@ async def attention_scan(request: Request):
             "cognitive_load": load,
         }
     except Exception as e:
-        import traceback
-        return {"error": str(e), "traceback": traceback.format_exc(), "scope": scope}
-    finally:
-        await pool.close()
+        logger.exception("attention scan failed scope=%s", scope)
+        return {"error": str(e), "scope": scope}

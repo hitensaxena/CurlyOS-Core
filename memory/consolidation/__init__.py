@@ -255,7 +255,7 @@ async def _pass_dedup(
                 await cur.execute(
                     "SELECT id, statement, embedding, created_at FROM memories "
                     "WHERE scope = %s AND valid_to IS NULL AND embedding IS NOT NULL "
-                    "ORDER BY created_at",
+                    "ORDER BY created_at DESC LIMIT 2000",
                     (scope_text,),
                 )
                 rows = await cur.fetchall()
@@ -263,18 +263,22 @@ async def _pass_dedup(
             if len(rows) < 2:
                 return result
 
-            # Find pairs with high cosine similarity using pgvector
+            # Find pairs with high cosine similarity using pgvector. Both sides
+            # of the self-join are bounded to the same most-recent-2000 set so
+            # the pass stays O(bounded²) as memories grow.
             async with conn.cursor() as cur:
                 await cur.execute(
+                    "WITH recent AS ("
+                    "  SELECT id, statement, embedding FROM memories "
+                    "  WHERE scope = %s AND valid_to IS NULL AND embedding IS NOT NULL "
+                    "  ORDER BY created_at DESC LIMIT 2000"
+                    ") "
                     "SELECT m1.id, m2.id, m1.statement, m2.statement, "
                     "1 - (m1.embedding <=> m2.embedding) AS sim "
-                    "FROM memories m1 "
-                    "JOIN memories m2 ON m1.id < m2.id "
-                    "WHERE m1.scope = %s AND m2.scope = %s "
-                    "AND m1.valid_to IS NULL AND m2.valid_to IS NULL "
-                    "AND m1.embedding IS NOT NULL AND m2.embedding IS NOT NULL "
-                    "AND 1 - (m1.embedding <=> m2.embedding) >= %s",
-                    (scope_text, scope_text, _DEDUP_SIMILARITY_THRESHOLD),
+                    "FROM recent m1 "
+                    "JOIN recent m2 ON m1.id < m2.id "
+                    "WHERE 1 - (m1.embedding <=> m2.embedding) >= %s",
+                    (scope_text, _DEDUP_SIMILARITY_THRESHOLD),
                 )
                 pairs = await cur.fetchall()
 
@@ -379,21 +383,22 @@ async def _pass_merge_promote(
                 try:
                     # Create an episode from the working memory
                     epi_id = mint("epi")
-                    async with conn.cursor() as cur:
-                        await cur.execute(
-                            "INSERT INTO episodes (id, scope, content, source_ref) "
-                            "VALUES (%s, %s, %s, %s) "
-                            "ON CONFLICT DO NOTHING",
-                            (epi_id, scope_text, statement, f"working:{mem_id}"),
-                        )
+                    async with conn.transaction():
+                        async with conn.cursor() as cur:
+                            await cur.execute(
+                                "INSERT INTO episodes (id, scope, content, source_ref) "
+                                "VALUES (%s, %s, %s, %s) "
+                                "ON CONFLICT DO NOTHING",
+                                (epi_id, scope_text, statement, f"working:{mem_id}"),
+                            )
 
-                    # Promote memory tier: working → semantic
-                    async with conn.cursor() as cur:
-                        await cur.execute(
-                            "UPDATE memories SET tier = 'semantic' "
-                            "WHERE id = %s AND tier = 'working'",
-                            (mem_id,),
-                        )
+                        # Promote memory tier: working → semantic
+                        async with conn.cursor() as cur:
+                            await cur.execute(
+                                "UPDATE memories SET tier = 'semantic' "
+                                "WHERE id = %s AND tier = 'working'",
+                                (mem_id,),
+                            )
 
                     result["promoted"] += 1
                 except Exception as e:

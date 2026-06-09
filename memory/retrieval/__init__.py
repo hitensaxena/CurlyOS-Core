@@ -62,6 +62,7 @@ async def _dense_recall(
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             # Set ef_search for this query
+            ef_search = max(10, min(int(ef_search), 400))
             await cur.execute(f"SET LOCAL hnsw.ef_search = {ef_search}")
             await cur.execute(
                 f"SELECT id, statement, kind, valid_from, valid_to, source_episode_id, "

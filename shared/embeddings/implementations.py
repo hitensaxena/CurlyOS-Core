@@ -6,7 +6,9 @@ FakeEmbedder    — zero vectors for testing (no model download)
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 from typing import Any
 
 from shared.embeddings import Embedder, Reranker
@@ -32,6 +34,8 @@ class FakeEmbedder(Embedder):
 class LocalBgeM3(Embedder):
     """BAAI/bge-m3 via sentence-transformers. 1024-dim."""
 
+    _load_lock: threading.Lock = threading.Lock()
+
     def __init__(self, device: str = "cpu"):
         self._device = device
         self._model = None
@@ -45,16 +49,20 @@ class LocalBgeM3(Embedder):
         return "BAAI/bge-m3"
 
     def _load(self):
-        if self._model is None:
-            from sentence_transformers import SentenceTransformer
-            log.info("Loading %s on %s...", self.model_name, self._device)
-            self._model = SentenceTransformer(self.model_name, device=self._device)
-            log.info("Model loaded.")
+        with self._load_lock:
+            if self._model is None:
+                from sentence_transformers import SentenceTransformer
+                log.info("Loading %s on %s...", self.model_name, self._device)
+                self._model = SentenceTransformer(self.model_name, device=self._device)
+                log.info("Model loaded.")
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
+    def _encode(self, texts: list[str]) -> list[list[float]]:
         self._load()
         vectors = self._model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
         return [v.tolist() for v in vectors]
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        return await asyncio.to_thread(self._encode, texts)
 
 
 class OpenAIAdapter(Embedder):

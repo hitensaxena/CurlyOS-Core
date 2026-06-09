@@ -83,20 +83,23 @@ async def extract_with_llm(
         else:
             return []
 
-        return [
-            ExtractedTriple(
-                subject=t["subject"],
-                predicate=t["predicate"].lower().replace(" ", "_"),
-                object=t["object"],
-                confidence=min(max(float(t.get("confidence", 0.8)), 0.0), 1.0),
-                source_episode_id=source_episode_id,
-                source_text=episode_content[:200],
-            )
-            for t in triples_data
-            if "subject" in t and "predicate" in t and "object" in t
-        ]
+        triples = []
+        for t in triples_data:
+            try:
+                triples.append(ExtractedTriple(
+                    subject=t["subject"],
+                    predicate=t["predicate"].lower().replace(" ", "_"),
+                    object=t["object"],
+                    confidence=min(max(float(t.get("confidence", 0.8)), 0.0), 1.0),
+                    source_episode_id=source_episode_id,
+                    source_text=episode_content[:200],
+                ))
+            except (KeyError, TypeError, ValueError) as e:
+                log.warning("skipping malformed triple: %s", e)
+                continue
+        return triples
     except Exception as e:
-        log.warning("LLM extraction failed: %s, falling back to patterns", e)
+        log.warning("LLM extraction failed, using regex fallback: %s", e)
         return extract_with_patterns(episode_content, source_episode_id)
 
 
