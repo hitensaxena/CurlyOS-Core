@@ -1,0 +1,65 @@
+# CurlyOS data stores — Postgres (pgvector) + Redis
+# Faithful reproduction of the original bare `docker run` containers,
+# but backed by NAMED volumes so the knowledge graph survives container removal.
+#
+# Usage:
+#   cd ~/curlyos-core/deploy
+#   docker compose up -d
+#
+# Project name is pinned to `curlyos` so volumes are named
+# `curlyos_pgdata` / `curlyos_redisdata` regardless of directory.
+name: curlyos
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: curlyos-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: curlyos
+      POSTGRES_DB: curlyos
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+      # PGDATA stays at the image default (/var/lib/postgresql/data),
+      # matching the original container so the migrated volume mounts cleanly.
+    ports:
+      - "54321:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U curlyos -d curlyos"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: curlyos-redis
+    restart: unless-stopped
+    # Default RDB snapshotting (save 3600 1 300 100 60 10000), matching the
+    # original. AOF stays off to preserve current behavior; flip on below if
+    # you want stronger durability for the consolidation queue.
+    command: ["redis-server", "--save", "3600 1", "--save", "300 100", "--save", "60 10000"]
+    # To enable append-only durability instead, use:
+    # command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  # external: true → compose references these but NEVER creates or deletes them.
+  # This is deliberate: it makes `docker compose down -v` physically unable to
+  # wipe the knowledge graph. The volumes are created/managed out-of-band
+  # (originally by migrate-to-named-volumes.sh).
+  pgdata:
+    name: curlyos_pgdata
+    external: true
+  redisdata:
+    name: curlyos_redisdata
+    external: true
