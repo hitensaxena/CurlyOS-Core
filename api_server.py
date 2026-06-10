@@ -158,9 +158,13 @@ def _include_agents_router() -> None:
     app.include_router(make_agents_router(
         pool_factory=lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row),
         scope=SCOPE,
-        publisher_factory=_make_publisher_sync,
-        redis_factory=_make_redis,
-        embedder_factory=get_shared_embedder,
+        # These factories are defined further down in this module, but this
+        # router is included at import time (above their defs), so wrap the bare
+        # names in lambdas to defer resolution to request time — same pattern as
+        # _include_goal_router(). A bare reference NameErrors at import.
+        publisher_factory=lambda: _make_publisher_sync(),
+        redis_factory=lambda: _make_redis(),
+        embedder_factory=lambda: get_shared_embedder(),
         llm_factory=_runner_llm,
     ))
 
