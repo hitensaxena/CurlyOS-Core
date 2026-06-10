@@ -44,6 +44,14 @@ EVENT_CATALOG: dict[str, str] = {
     "simulation.run.created": "EVENTS",
     "simulation.run.completed": "EVENTS",
     "simulation.run.forked": "EVENTS",
+    # ── goal OS (Phase G) ────────────────────────────────────────────────────
+    "goal.created": "EVENTS",
+    "goal.updated": "EVENTS",
+    "goal.invalidated": "EVENTS",
+    "decision.recorded": "EVENTS",
+    "decision.reviewed": "EVENTS",
+    "opportunity.detected": "EVENTS",
+    "opportunity.resolved": "EVENTS",
     # ── agent runtime (Phase A emits; lifted from build repo) ───────────────
     "agent.run.started": "AGENTS",
     "agent.run.completed": "AGENTS",

@@ -46,6 +46,8 @@ PREFIXES: dict[str, str] = {
     "simulation": "sim",
     "discovery": "dsc",
     "goal": "goal",
+    "decision": "dec",
+    "opportunity": "opp",
     # Introspection prefixes
     "assumption": "asu",
     "mental_model": "mdl",

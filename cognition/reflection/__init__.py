@@ -91,6 +91,38 @@ Respond as JSON:
 
 # ── Core reflection logic ──────────────────────────────────────────────────
 
+async def _fetch_goal_targets(pool: Any, scope: str) -> list[tuple]:
+    """Goal texts to track progress against, as (id, text, valid_from, created_at).
+
+    Prefers first-class goals (Phase-G `goals` table: title + success criteria,
+    goal_ ids) so deltas land back on real goal rows; falls back to the legacy
+    ILIKE-over-memories scan when no goal rows exist or the table is absent."""
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT id, title || COALESCE(' — ' || success_criteria, ''), "
+                    "valid_from, valid_from FROM goals "
+                    "WHERE scope = %s AND status = 'active' AND valid_to IS NULL "
+                    "ORDER BY priority DESC, valid_from",
+                    (scope,),
+                )
+                rows = await cur.fetchall()
+        if rows:
+            return rows
+    except Exception:  # noqa: BLE001 — older DBs lack the table; fall back
+        pass
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, statement, valid_from, created_at FROM memories "
+                "WHERE scope = %s AND valid_to IS NULL AND statement ILIKE %s "
+                "ORDER BY created_at",
+                (scope, "%goal%"),
+            )
+            return await cur.fetchall()
+
+
 async def run_reflection(
     pool: Any,
     publisher: Any,
@@ -330,17 +362,9 @@ async def run_weekly_reflection(
         if count >= 2 and (" " in phrase or phrase.lower() not in _ARTIFACT_WORDS)
     ][:20]
 
-    # 3. Track goal progress: memories with 'goal' in statement
+    # 3. Track goal progress: first-class goals (Phase G), legacy fallback inside
     goal_deltas: list[dict] = []
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT id, statement, valid_from, created_at FROM memories "
-                "WHERE scope = %s AND valid_to IS NULL AND statement ILIKE %s "
-                "ORDER BY created_at",
-                (scope, "%goal%"),
-            )
-            goal_rows = await cur.fetchall()
+    goal_rows = await _fetch_goal_targets(pool, scope)
 
     for gid, gstmt, gvf, gca in goal_rows:
         # Check if any recent episode mentions this goal
@@ -519,17 +543,9 @@ async def run_monthly_reflection(
             "last_updated": mm_updated.isoformat() if mm_updated else None,
         })
 
-    # 3. Track goal progress: canonical memories with 'goal' in statement
+    # 3. Track goal progress: first-class goals (Phase G), legacy fallback inside
     goal_deltas: list[dict] = []
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT id, statement, valid_from, created_at FROM memories "
-                "WHERE scope = %s AND valid_to IS NULL AND statement ILIKE %s "
-                "ORDER BY created_at",
-                (scope, "%goal%"),
-            )
-            goal_rows = await cur.fetchall()
+    goal_rows = await _fetch_goal_targets(pool, scope)
 
     for gid, gstmt, gvf, gca in goal_rows:
         goal_lower = gstmt.lower()

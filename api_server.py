@@ -89,6 +89,22 @@ app.add_middleware(
 )
 
 
+# Goal OS router (Phase G) — the first router split out of this file; new
+# endpoint groups go in <package>/api.py from here on (curlyos-final/03 §6).
+def _include_goal_router() -> None:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from goals.api import make_router
+
+    app.include_router(make_router(
+        pool_factory=lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row),
+        publisher_factory=lambda: _make_publisher_sync(),
+        scope=SCOPE,
+    ))
+
+
+_include_goal_router()
+
+
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request: Request, exc: Exception):
     logger.exception("unhandled error on %s %s", request.method, request.url.path)
@@ -1803,6 +1819,36 @@ async def _sync_identity_from_reflection(pool: Any, pub: Any, scope: str) -> dic
     return {"identity_promoted": promoted, "identity_skipped": skipped}
 
 
+async def _sync_goals_from_reflection(pool: Any, scope: str) -> dict:
+    """Land the latest reflection's goal_deltas back on first-class goal rows:
+    properties.last_reflection = the delta; a 'completed' delta drives
+    progress to 1.0 (achievement itself stays the human's call). Closes the
+    reflection→goals loop (Phase G exit criterion). Best-effort."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from goals import set_goal_reflection
+
+    synced = 0
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT goal_deltas FROM reflection_reports WHERE scope = %s "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    [scope],
+                )
+                row = await cur.fetchone()
+        deltas = (row[0] if row else None) or []
+        if isinstance(deltas, str):
+            deltas = json.loads(deltas)
+        for d in deltas:
+            if isinstance(d, dict) and str(d.get("goal_id", "")).startswith("goal_"):
+                if await set_goal_reflection(pool, d["goal_id"], scope, d):
+                    synced += 1
+    except Exception:
+        logger.exception("goal sync from reflection failed scope=%s", scope)
+    return {"goals_synced": synced}
+
+
 async def _sync_principles_to_memory(pool: Any, pub: Any, embedder: Any, scope: str) -> dict:
     """Mirror distilled principles into recallable memories.
 
@@ -1888,6 +1934,7 @@ async def reflection_weekly(body: ReflectionRequest | None = None):
         )
         result["llm"] = bool(llm_client)
         result.update(await _sync_identity_from_reflection(pool, _make_publisher_sync(), scope))
+        result.update(await _sync_goals_from_reflection(pool, scope))
         return result
     except Exception as e:
         logger.exception("weekly reflection failed scope=%s", scope)
@@ -1918,6 +1965,7 @@ async def reflection_monthly(body: ReflectionRequest | None = None):
         )
         result["llm"] = bool(llm_client)
         result.update(await _sync_identity_from_reflection(pool, _make_publisher_sync(), scope))
+        result.update(await _sync_goals_from_reflection(pool, scope))
         return result
     except Exception as e:
         logger.exception("monthly reflection failed scope=%s", scope)
@@ -2177,10 +2225,29 @@ async def _approval_silence_job() -> dict:
     return {"expired": len(expired_rows), "reminded": reminded}
 
 
+async def _decision_review_nudge_job() -> dict:
+    """Daily: surface decisions whose review_at has passed without an outcome.
+    One notification naming up to 5; the /decisions page shows the full list."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from goals import list_decisions
+    from shared.notify import get_notifier
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    due = await list_decisions(pool, SCOPE, due_for_review=True)
+    if due:
+        titles = "; ".join(d["title"][:60] for d in due[:5])
+        await get_notifier().notify(
+            f"{len(due)} decision(s) due for outcome review: {titles}"
+            + (" …" if len(due) > 5 else ""),
+        )
+    return {"due_for_review": len(due)}
+
+
 def _scheduler_jobs():
     from orchestration.scheduler import DailyAt, Every, Job, MonthlyAt, WeeklyAt
 
     return [
+        Job("decision_review_nudge", DailyAt("09:00"), _decision_review_nudge_job),
         # consolidation is internally locked per scope — overlap-safe at any cadence
         Job("consolidation_fast", Every(15),
             lambda: consolidation_run(ConsolidationRunRequest(mode="fast"))),
