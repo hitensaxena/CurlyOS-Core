@@ -43,7 +43,29 @@ logger = logging.getLogger("curlyos.api")
 async def lifespan(app: FastAPI):
     # Self-heal: re-embed anything a crash/restart left without embeddings.
     sweep = asyncio.create_task(_sweep_unembedded())
+
+    # The cognitive heartbeat (curlyos-final/06 §3) — replaces Hermes cron.
+    # CURLYOS_SCHEDULER=0 disables (tests, one-off scripts).
+    scheduler = None
+    if os.environ.get("CURLYOS_SCHEDULER", "1").lower() not in ("0", "false", "off"):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from orchestration.scheduler import Scheduler
+        from shared.notify import get_notifier
+
+        scheduler = Scheduler(
+            _scheduler_jobs(),
+            scope=SCOPE,
+            pool_factory=lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row),
+            publisher_factory=_make_publisher_sync,
+            redis_factory=_make_redis,
+            notifier=get_notifier(),
+        )
+        scheduler.start()
+    app.state.scheduler = scheduler
+
     yield
+    if scheduler is not None:
+        await scheduler.stop()
     sweep.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await sweep
@@ -1222,8 +1244,21 @@ def get_logs(
     return out
 
 
+def _scheduler_summary(request: Request) -> dict:
+    sched = getattr(request.app.state, "scheduler", None)
+    if sched is None:
+        return {"running": False, "jobs": 0, "failing": []}
+    snap = sched.snapshot()
+    return {
+        "running": snap["running"],
+        "jobs": len(snap["jobs"]),
+        "failing": [j["name"] for j in snap["jobs"] if j["consecutive_failures"] > 0],
+        "next_due": min((j["next_due"] for j in snap["jobs"] if j["next_due"]), default=None),
+    }
+
+
 @app.get("/api/systems")
-def systems():
+def systems(request: Request):
     """Aggregate a single per-system status payload for the dashboard."""
     # Reuse the existing health() + stats() endpoint logic (plain functions —
     # this whole route runs in the threadpool).
@@ -1263,6 +1298,7 @@ def systems():
             "infrastructure": infrastructure,
             "stats": stats_data,
             "engines": engines,
+            "scheduler": _scheduler_summary(request),
         }
 
     with conn:
@@ -1320,6 +1356,7 @@ def systems():
         "infrastructure": infrastructure,
         "stats": stats_data,
         "engines": engines,
+        "scheduler": _scheduler_summary(request),
     }
 
 
@@ -1409,16 +1446,15 @@ async def _make_embedder():
 
 
 def _load_env_key(*names: str) -> str:
-    """Resolve an API key from the process env, falling back to ~/.hermes/.env.
-
-    The API server is started as a subprocess that does not inherit the
-    Hermes .env, so credentials like OPENROUTER_API_KEY live only in the file.
+    """Resolve an API key from the process env, falling back to CORE's own
+    .env file. (Previously fell back to ~/.hermes/.env — a hidden Hermes
+    coupling removed in Phase C; core must boot with Hermes deleted, P1.)
     """
     for n in names:
         v = os.environ.get(n, "")
         if v:
             return v
-    env_path = os.path.join(os.path.expanduser("~"), ".hermes", ".env")
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     try:
         with open(env_path, "r") as f:
             for line in f:
@@ -2036,3 +2072,144 @@ async def attention_scan(body: AttentionScanRequest | None = None):
     except Exception as e:
         logger.exception("attention scan failed scope=%s", scope)
         return {"error": str(e), "scope": scope}
+
+
+# ---------------------------------------------------------------------------
+# Scheduler job table — the OS's complete background behavior, in one place
+# (curlyos-final/06 §3). Cadences mirror the Hermes cron entries they replace,
+# offset +20min so during the one-week overlap Hermes fires first and the
+# output-based period guards make the scheduler's firing a no-op.
+# ---------------------------------------------------------------------------
+
+def _table_period_guard(table: str, trunc: str):
+    """True when `table` already has a row for the current date_trunc period
+    (catches Hermes-triggered and manual runs too — the guard is on OUTPUT)."""
+    async def guard() -> bool:
+        pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    f"SELECT 1 FROM {table} WHERE scope = %s "
+                    "AND created_at >= date_trunc(%s, now()) LIMIT 1",
+                    (SCOPE, trunc),
+                )
+                return bool(await cur.fetchone())
+    guard.__name__ = f"guard_{table}_{trunc}"
+    return guard
+
+
+def _reflection_period_guard(report_type: str, trunc: str):
+    async def guard() -> bool:
+        pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT 1 FROM reflection_reports WHERE scope = %s "
+                    "AND report_type = %s AND created_at >= date_trunc(%s, now()) LIMIT 1",
+                    (SCOPE, report_type, trunc),
+                )
+                return bool(await cur.fetchone())
+    guard.__name__ = f"guard_reflection_{report_type}"
+    return guard
+
+
+async def _approval_silence_job() -> dict:
+    """Approval housekeeping: expire overdue approvals (event each) and remind
+    once (per approval) about pending ones older than 6h. The 72h default-action
+    ladder arrives with the Phase-A runner (deny needs a parked run to degrade)."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from agent.pdp_gate import scope_parts
+    from shared.events import build_event
+    from shared.notify import get_notifier
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    pub = _make_publisher_sync()
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE approvals SET state = 'expired', decided_at = now() "
+                "WHERE state = 'pending' AND expires_at <= now() "
+                "RETURNING id, scope, action_class",
+            )
+            expired_rows = await cur.fetchall()
+        for apv_id, scope_text, action_class in expired_rows:
+            ev = build_event(
+                short_type="safety.approval.expired", subject=apv_id,
+                scope=scope_parts(scope_text),
+                data={"apv_id": apv_id, "action_class": action_class},
+                actor="system", source="curlyos-core/scheduler",
+            )
+            await pub.stage(ev, conn)
+
+    reminded = 0
+    redis = _make_redis()
+    notifier = get_notifier()
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT id, action_class FROM approvals WHERE state = 'pending' "
+                    "AND created_at <= now() - interval '6 hours'",
+                )
+                waiting = await cur.fetchall()
+        for apv_id, action_class in waiting:
+            fresh = True
+            if redis is not None:
+                try:  # remind once per approval (key outlives the 7d expiry)
+                    fresh = bool(await redis.set(f"remind:apv:{apv_id}", "1",
+                                                 nx=True, ex=7 * 24 * 3600))
+                except Exception:
+                    fresh = False  # no redis dedupe → stay quiet rather than spam hourly
+            if fresh:
+                await notifier.notify(
+                    f"Approval {apv_id} ({action_class}) has been waiting 6h+ — "
+                    "grant or deny it in Mission Control.",
+                    approval_id=apv_id,
+                )
+                reminded += 1
+    finally:
+        if redis is not None:
+            try:
+                await redis.aclose()
+            except Exception:
+                pass
+    return {"expired": len(expired_rows), "reminded": reminded}
+
+
+def _scheduler_jobs():
+    from orchestration.scheduler import DailyAt, Every, Job, MonthlyAt, WeeklyAt
+
+    return [
+        # consolidation is internally locked per scope — overlap-safe at any cadence
+        Job("consolidation_fast", Every(15),
+            lambda: consolidation_run(ConsolidationRunRequest(mode="fast"))),
+        Job("consolidation_deep", DailyAt("03:05"),
+            lambda: consolidation_run(ConsolidationRunRequest(mode="deep"))),
+        # LLM-bearing cognition: output-based period guards prevent double-spend
+        Job("reflection_weekly", WeeklyAt((0,), "06:20"),     # Hermes: Mon 06:00
+            lambda: reflection_weekly(None),
+            period_guard=_reflection_period_guard("weekly", "week")),
+        Job("reflection_monthly", MonthlyAt(1, "06:40"),      # no Hermes equivalent
+            lambda: reflection_monthly(None),
+            period_guard=_reflection_period_guard("monthly", "month")),
+        Job("meta_audit", MonthlyAt(1, "07:20"),              # Hermes: 1st 07:00
+            lambda: meta_audit(None),
+            period_guard=_table_period_guard("decision_audits", "month")),
+        Job("narrative_generate", WeeklyAt((6,), "05:20"),    # Hermes: Sun 05:00
+            lambda: narrative_generate(None),
+            period_guard=_table_period_guard("themes", "week")),
+        # heuristic, no LLM — duplicates are harmless
+        Job("attention_scan", WeeklyAt((0, 3), "08:10"),      # Hermes: Mon,Thu 08:00
+            lambda: attention_scan(None)),
+        Job("approval_silence", Every(60), _approval_silence_job),
+    ]
+
+
+@app.get("/api/scheduler")
+async def scheduler_status(request: Request):
+    """The heartbeat table: every background job, its cadence, last/next fire."""
+    sched = getattr(request.app.state, "scheduler", None)
+    if sched is None:
+        return {"running": False, "reason": "CURLYOS_SCHEDULER disabled", "jobs": []}
+    return sched.snapshot()

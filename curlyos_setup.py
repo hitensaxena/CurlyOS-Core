@@ -83,8 +83,9 @@ def apply_migrations(dsn: str) -> tuple[bool, str]:
 
 
 def _read_env_var(name: str) -> str:
-    """Read an env var from ~/.hermes/.env or os.environ."""
-    env_path = Path.home() / ".hermes" / ".env"
+    """Read an env var from curlyos-core's own .env or os.environ.
+    (No ~/.hermes/.env fallback — core config must not live inside Hermes.)"""
+    env_path = Path(__file__).resolve().parent / ".env"
     if env_path.exists():
         for line in env_path.read_text().splitlines():
             if line.startswith(f"{name}="):
@@ -189,8 +190,8 @@ def interactive_setup() -> None:
     # Save
     save_config(config)
 
-    # Set env vars in .env
-    env_path = Path.home() / ".hermes" / ".env"
+    # Set env vars in curlyos-core's own .env
+    env_path = Path(__file__).resolve().parent / ".env"
     env_lines = []
     if env_path.exists():
         env_lines = env_path.read_text().splitlines()
