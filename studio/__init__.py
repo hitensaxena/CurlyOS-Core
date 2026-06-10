@@ -250,9 +250,9 @@ async def link_sketches(
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO studio_links (id, src_id, dst_id, rel_type, created_at, updated_at) "
-                "VALUES (%s, %s, %s, %s, now(), now()) "
-                "RETURNING id, src_id, dst_id, rel_type",
+                "INSERT INTO studio_links (id, src_sketch_id, dst_sketch_id, rel_type, created_at) "
+                "VALUES (%s, %s, %s, %s, now()) "
+                "RETURNING id, src_sketch_id, dst_sketch_id, rel_type",
                 (link_id, src_id, dst_id, rel_type),
             )
             row = await cur.fetchone()
@@ -348,39 +348,50 @@ async def graduate_sketch(
     publisher: Any,
     sketch_id: str,
     target_type: str = "project",
+    scope_text: str = "user:usr_hiten",
 ) -> dict:
     """Graduate a sketch into a workspace Project.
 
-    The sketch must be at least at 'conjecture' epistemic_status.
-    Creates a workspace Project, marks the sketch as graduated,
-    stages a studio.sketch.graduated event.
+    The sketch must be at least at 'conjecture' epistemic_status and not
+    already graduated. Creates a Project in the 'Studio Graduates' workspace
+    (found or created in scope — projects.workspace_id is a real FK), marks
+    the sketch as graduated, stages a studio.sketch.graduated event.
 
     Returns {sketch_id, graduated_to_project_id}.
     """
     # Lazy import to avoid circular deps
-    from workspace import create_project  # type: ignore[import]
+    from workspace import create_project, create_workspace, list_workspaces  # type: ignore[import]
 
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                "SELECT id, studio_id, content, kind, epistemic_status "
+                "SELECT id, studio_id, content, kind, epistemic_status, properties "
                 "FROM studio_sketches WHERE id = %s",
                 (sketch_id,),
             )
             row = await cur.fetchone()
             if row is None or row[4] not in ("conjecture", "hypothesis"):
                 raise ValueError("Sketch must be at least conjecture to graduate")
+            if (row[5] or {}).get("graduated_to"):
+                raise ValueError(
+                    f"Sketch {sketch_id!r} already graduated to {row[5]['graduated_to']}"
+                )
 
-            # We already have `row`; use it directly instead of reassigning/skipping
             content = row[2]
             sketch_epistemic = row[4]
 
-        # Create the workspace project
+        # Graduation home: find-or-create the 'Studio Graduates' workspace.
+        home = next((w for w in await list_workspaces(pool, scope_text)
+                     if w["name"] == "Studio Graduates"), None)
+        if home is None:
+            home = await create_workspace(pool, publisher, scope_text, "Studio Graduates")
+
+        title = " ".join((content or "").split())[:80] or sketch_id
         project = await create_project(
             pool=pool,
             publisher=publisher,
-            workspace_id="graduated",  # default workspace scope marker
-            name=f"Graduated: {sketch_id}",
+            workspace_id=home["id"],
+            name=f"Graduated: {title}",
         )
         project_id = project["id"]
 

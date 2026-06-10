@@ -236,6 +236,15 @@ class CreateSketchRequest(BaseModel):
     properties: dict = Field(default_factory=dict)
 
 
+class UpdateSketchRequest(BaseModel):
+    content: str | None = Field(default=None, min_length=1, max_length=20000)
+    epistemic_status: Literal["conjecture", "hypothesis"] | None = None
+
+
+class GraduateSketchRequest(BaseModel):
+    target_type: str = "project"
+
+
 class CreateSimulationRunRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     world_model_id: str | None = None
@@ -260,6 +269,8 @@ class IngestRequest(BaseModel):
     scope: str = SCOPE
     add_memory: bool = True
     extract_knowledge: bool = True
+    kind: Literal["fact", "procedure", "preference"] = "fact"
+    epistemic_status: Literal["canonical", "hypothesis", "belief"] = "canonical"
 
 
 class ConsolidationRunRequest(BaseModel):
@@ -992,6 +1003,49 @@ async def create_sketch(studio_id: str, body: CreateSketchRequest):
             pool, pub, studio_id,
             content=body.content, kind=body.kind, properties=body.properties,
         )
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.patch("/api/studio/sketch/{sketch_id}")
+async def update_studio_sketch(sketch_id: str, body: UpdateSketchRequest):
+    """Edit content or promote up the epistemic ladder (seed → conjecture →
+    hypothesis). The studio module validates transitions; 'canonical' is
+    unreachable for sketches — graduation is the only way out of the studio."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import studio as studio_mod
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    pub = _make_publisher_sync()
+    try:
+        return await studio_mod.update_sketch(
+            pool, pub, sketch_id,
+            content=body.content, epistemic_status=body.epistemic_status,
+        )
+    except ValueError as e:
+        raise HTTPException(404 if "not found" in str(e) else 400, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/studio/sketch/{sketch_id}/graduate")
+async def graduate_studio_sketch(sketch_id: str, body: GraduateSketchRequest | None = None):
+    """Graduate a sketch (≥ conjecture) into a Project in the 'Studio
+    Graduates' workspace. One-way door: the sketch keeps its history and a
+    properties.graduated_to pointer."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import studio as studio_mod
+
+    body = body or GraduateSketchRequest()
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    pub = _make_publisher_sync()
+    try:
+        return await studio_mod.graduate_sketch(
+            pool, pub, sketch_id,
+            target_type=body.target_type, scope_text=SCOPE,
+        )
+    except ValueError as e:
+        raise HTTPException(404 if "not found" in str(e) else 400, str(e))
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -1743,7 +1797,9 @@ async def ingest(body: IngestRequest, background_tasks: BackgroundTasks):
 
     Body: {"text": str, "source_ref"?: str, "scope"?: str,
            "add_memory"?: bool (default true),
-           "extract_knowledge"?: bool (default true)}
+           "extract_knowledge"?: bool (default true),
+           "kind"?: "fact"|"procedure"|"preference" (default "fact"),
+           "epistemic_status"?: "canonical"|"hypothesis"|"belief" (default "canonical")}
     """
     text = body.text.strip()
     if not text:
@@ -1771,12 +1827,12 @@ async def ingest(body: IngestRequest, background_tasks: BackgroundTasks):
                 pool, pub, scope,
                 statement=text[:4000],
                 source_episode_id=epi_id,
-                kind="fact",
-                # canonical so it's recallable: fast/deep recall filter to
-                # epistemic_status='canonical' only ("belief" is in no mode's
-                # filter, so belief memories never surface). A journal/voice
-                # capture is a first-person record, so canonical is apt.
-                epistemic_status="canonical",
+                kind=body.kind,
+                # canonical (default) so it's recallable: fast/deep recall
+                # filter to epistemic_status='canonical' only ("belief" is in
+                # no mode's filter, so belief memories never surface). Callers
+                # that want non-recallable drafts pass "hypothesis".
+                epistemic_status=body.epistemic_status,
             )
             result["mem_id"] = mem.get("mem_id")
     except Exception as e:
