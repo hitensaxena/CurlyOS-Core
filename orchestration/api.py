@@ -25,12 +25,74 @@ class InboundRequest(BaseModel):
     session_ref: str | None = Field(default=None, max_length=200)
 
 
+class CouncilRequest(BaseModel):
+    pass  # no body — the decision row is the input
+
+
+class DenyReason(BaseModel):
+    reason: str = Field(default="", max_length=500)
+
+
 def make_router(
     *,
     pool_factory: Callable[[], Awaitable[Any]],
     scope: str,
+    publisher_factory: Callable[[], Any] | None = None,
+    redis_factory: Callable[[], Any] | None = None,
+    embedder_factory: Callable[[], Awaitable[Any]] | None = None,
+    llm_factory: Callable[[], Any] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api")
+
+    async def _workflow_deps() -> dict:
+        return {
+            "pool": await pool_factory(),
+            "publisher": publisher_factory() if publisher_factory else None,
+            "redis": redis_factory() if redis_factory else None,
+            "embedder": (await embedder_factory()) if embedder_factory else None,
+            "llm": llm_factory() if llm_factory else None,
+            "scope": scope,
+        }
+
+    # ── exploration workflows (Phase X) ──────────────────────────────────────
+    @router.post("/discovery/scan")
+    async def discovery_scan_now():
+        """Manual trigger of the opportunity scan (also scheduled weekly)."""
+        from orchestration.workflows import discovery_scan
+
+        d = await _workflow_deps()
+        result = await discovery_scan(**d)
+        if result.get("error"):
+            raise HTTPException(503, result["error"])
+        return result
+
+    @router.post("/simulation/runs/{sim_id}/execute")
+    async def execute_simulation(sim_id: str):
+        """Run a created simulation: scenarios + possible_world memories in a
+        scenario:<id> scope (invisible to default recall, never promoted)."""
+        from orchestration.workflows import run_simulation
+
+        d = await _workflow_deps()
+        result = await run_simulation(**d, sim_id=sim_id)
+        if result.get("error"):
+            code = 404 if "not found" in result["error"] else (
+                409 if "already" in result["error"] else 503)
+            raise HTTPException(code, result["error"])
+        return result
+
+    @router.post("/decisions/{dec_id}/council")
+    async def council_decision(dec_id: str):
+        """Stress-test a decision with a 4-perspective council; the synthesis
+        lands on the decision row (properties.council)."""
+        from orchestration.workflows import council
+
+        d = await _workflow_deps()
+        result = await council(pool=d["pool"], publisher=d["publisher"],
+                               llm=d["llm"], scope=scope, dec_id=dec_id)
+        if result.get("error"):
+            raise HTTPException(404 if "not found" in result["error"] else 503,
+                                result["error"])
+        return result
 
     def _runner(request: Request):
         runner = getattr(request.app.state, "runner", None)

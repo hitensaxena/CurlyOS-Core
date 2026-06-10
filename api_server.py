@@ -158,6 +158,10 @@ def _include_agents_router() -> None:
     app.include_router(make_agents_router(
         pool_factory=lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row),
         scope=SCOPE,
+        publisher_factory=_make_publisher_sync,
+        redis_factory=_make_redis,
+        embedder_factory=get_shared_embedder,
+        llm_factory=_runner_llm,
     ))
 
 
@@ -2324,8 +2328,21 @@ async def _decision_review_nudge_job() -> dict:
 def _scheduler_jobs():
     from orchestration.scheduler import DailyAt, Every, Job, MonthlyAt, WeeklyAt
 
+    async def _discovery_scan_job() -> dict:
+        from orchestration.workflows import discovery_scan
+
+        return await discovery_scan(
+            pool=await _get_async_pool(row_factory=psycopg.rows.tuple_row),
+            publisher=_make_publisher_sync(),
+            embedder=await get_shared_embedder(),
+            redis=_make_redis(),
+            llm=_runner_llm(),
+            scope=SCOPE,
+        )
+
     return [
         Job("decision_review_nudge", DailyAt("09:00"), _decision_review_nudge_job),
+        Job("discovery_scan", WeeklyAt((2,), "20:00"), _discovery_scan_job),
         # consolidation is internally locked per scope — overlap-safe at any cadence
         Job("consolidation_fast", Every(15),
             lambda: consolidation_run(ConsolidationRunRequest(mode="fast"))),

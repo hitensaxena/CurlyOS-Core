@@ -97,7 +97,7 @@ async def create_simulation_run(
     Returns {id, scope, question, status, epistemic_status}.
     """
     sim_id = mint("sim")
-    params_json = json.dumps(parameters) if parameters else None
+    params_json = json.dumps(parameters or {})  # column is NOT NULL DEFAULT '{}'
 
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
