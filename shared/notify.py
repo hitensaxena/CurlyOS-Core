@@ -67,9 +67,23 @@ class HermesNotifier(Notifier):
     """Delivery via `hermes send` — Telegram (or any platform Hermes has
     credentials for). Core never touches the platform credentials (P1)."""
 
-    def __init__(self, target: str | None = None, binary: str = "hermes") -> None:
+    def __init__(self, target: str | None = None, binary: str | None = None) -> None:
         self.target = target or _env("CURLYOS_NOTIFY_TARGET", "telegram")
-        self.binary = binary
+        self.binary = binary or self._resolve_binary()
+
+    @staticmethod
+    def _resolve_binary() -> str:
+        """systemd services get a minimal PATH without ~/.local/bin — resolve
+        the hermes CLI explicitly so notifications work under the unit."""
+        import shutil
+
+        found = shutil.which("hermes")
+        if found:
+            return found
+        candidate = os.path.expanduser("~/.local/bin/hermes")
+        if os.path.exists(candidate):
+            return candidate
+        return "hermes"  # last resort; notify() logs FileNotFoundError
 
     async def notify(self, text: str, *, approval_id: str | None = None,
                      run_id: str | None = None) -> bool:

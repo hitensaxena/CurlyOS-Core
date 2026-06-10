@@ -204,9 +204,26 @@ def make_graph(get_deps: DepsFn, llm: LLMFn | None, checkpointer: Any):
                 apv_id, apv_state = row
 
             if apv_state == "pending":
-                interrupt({"reason": "approval_required", "apv_id": apv_id,
-                           "tool": tool.name, "action_class": tool.action_class,
-                           "cursor": cursor})
+                park_payload = {"reason": "approval_required", "apv_id": apv_id,
+                                "tool": tool.name, "action_class": tool.action_class,
+                                "cursor": cursor}
+                # interrupt() RETURNS (with the resume value) when the run is
+                # resumed — it only raises on first execution. Grant/deny
+                # resumes see the decided state in the SELECT above; a BARE
+                # resume (run-page button, no decision) lands here with the
+                # approval still pending — re-read, and re-park until a human
+                # actually decides. Each loop iteration consumes one resume.
+                while True:
+                    interrupt(park_payload)
+                    async with deps.pool.connection() as conn:
+                        async with conn.cursor() as cur:
+                            await cur.execute(
+                                "SELECT state FROM approvals WHERE id = %s", (apv_id,),
+                            )
+                            row2 = await cur.fetchone()
+                    apv_state = row2[0] if row2 else "expired"
+                    if apv_state != "pending":
+                        break
             if apv_state == "granted":
                 decision = await evaluate(
                     pool=deps.pool, redis=deps.redis, publisher=deps.publisher,
