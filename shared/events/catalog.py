@@ -59,6 +59,11 @@ EVENT_CATALOG: dict[str, str] = {
     "runtime.action.executed": "AGENTS",
     "runtime.observation.recorded": "AGENTS",
     "tool.call.invoked": "AGENTS",
+    # ── evolution (Phase E) ──────────────────────────────────────────────────
+    "evolution.candidate.proposed": "EVOLUTION",
+    "evolution.eval.completed": "EVOLUTION",
+    "evolution.candidate.held": "EVOLUTION",
+    "evolution.prompt.activated": "EVOLUTION",
     # ── safety (lifted from build repo) ──────────────────────────────────────
     "safety.approval.requested": "SAFETY",
     "safety.approval.granted": "SAFETY",

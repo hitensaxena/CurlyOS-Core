@@ -25,8 +25,14 @@ class InboundRequest(BaseModel):
     session_ref: str | None = Field(default=None, max_length=200)
 
 
-class CouncilRequest(BaseModel):
-    pass  # no body — the decision row is the input
+class ProposePromptRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    content: str = Field(min_length=20, max_length=20_000)
+    notes: str = Field(default="", max_length=1000)
+
+
+class ActivatePromptRequest(BaseModel):
+    approval_id: str = Field(min_length=5, max_length=60)
 
 
 class DenyReason(BaseModel):
@@ -99,6 +105,75 @@ def make_router(
         if runner is None:
             raise HTTPException(503, "runner disabled (CURLYOS_RUNNER=0 or failed to start)")
         return runner
+
+    # ── evolution (Phase E) ──────────────────────────────────────────────────
+    @router.get("/evolution/prompts")
+    async def evolution_prompts(name: str | None = None):
+        from orchestration.evolution import list_prompt_versions
+
+        pool = await pool_factory()
+        items = await list_prompt_versions(pool, scope, name)
+        return {"items": items, "count": len(items)}
+
+    @router.post("/evolution/prompts")
+    async def evolution_propose(body: ProposePromptRequest):
+        from orchestration.evolution import propose_prompt
+
+        pool = await pool_factory()
+        return await propose_prompt(
+            pool, publisher_factory() if publisher_factory else None, scope,
+            name=body.name, content=body.content, notes=body.notes,
+            proposed_by="manual",
+        )
+
+    @router.post("/evolution/prompts/{pmt_id}/evaluate")
+    async def evolution_evaluate(pmt_id: str):
+        from orchestration.evolution import evaluate_prompt
+
+        pool = await pool_factory()
+        result = await evaluate_prompt(
+            pool, publisher_factory() if publisher_factory else None, scope,
+            pmt_id=pmt_id, llm=llm_factory() if llm_factory else None,
+        )
+        if result.get("error"):
+            raise HTTPException(404 if "not found" in result["error"] else 503,
+                                result["error"])
+        return result
+
+    @router.post("/evolution/prompts/{pmt_id}/activate")
+    async def evolution_activate(pmt_id: str, body: ActivatePromptRequest):
+        """Both gates via the real PDP: eval pass AND granted self_modify
+        approval (create one via POST /api/approvals, grant it, pass its id)."""
+        from orchestration.evolution import activate_prompt
+
+        pool = await pool_factory()
+        result = await activate_prompt(
+            pool, publisher_factory() if publisher_factory else None,
+            redis_factory() if redis_factory else None, scope,
+            pmt_id=pmt_id, approval_id=body.approval_id,
+        )
+        if result.get("error"):
+            raise HTTPException(404 if "not found" in result["error"] else 409,
+                                result["error"])
+        return result
+
+    @router.get("/evolution/timeline")
+    async def evolution_timeline(limit: int = 50):
+        """The /evolution page feed: evolution.* events, newest first."""
+        pool = await pool_factory()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT seq, type, subject, data, created_at FROM events "
+                    "WHERE type LIKE %s ORDER BY seq DESC LIMIT %s",
+                    ("%curlyos.evolution.%", min(limit, 200)),
+                )
+                rows = await cur.fetchall()
+        return {"items": [
+            {"seq": r[0], "type": r[1].split("curlyos.")[-1], "subject": r[2],
+             "data": r[3], "at": r[4].isoformat() if r[4] else None}
+            for r in rows
+        ]}
 
     # ── runs ─────────────────────────────────────────────────────────────────
     @router.post("/agents/runs")

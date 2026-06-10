@@ -135,8 +135,13 @@ def make_graph(get_deps: DepsFn, llm: LLMFn | None, checkpointer: Any):
         subtasks: list[dict] | None = None
         if llm is not None:
             try:
+                from orchestration.evolution import get_active_prompt
+
+                deps = await get_deps(state["run_id"], state["scope"])
+                template = await get_active_prompt(deps.pool, state["scope"],
+                                                   "executive.plan", _PLAN_SYSTEM)
                 text = await llm(
-                    _PLAN_SYSTEM.format(tools=planner_tool_block(), max_steps=MAX_STEPS),
+                    template.format(tools=planner_tool_block(), max_steps=MAX_STEPS),
                     _PLAN_USER.format(task=state["task"], context=state.get("context", "")),
                 )
                 raw = _extract_json_array(text)

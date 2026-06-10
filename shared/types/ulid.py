@@ -65,6 +65,7 @@ PREFIXES: dict[str, str] = {
     "eval_run": "evr",
     # Self-evolution
     "self_modification": "smd",
+    "prompt_version": "pmt",
     # Reflection
     "insight_report": "rpt",
     # Infrastructure
