@@ -103,8 +103,8 @@ async def create_simulation_run(
         async with conn.cursor() as cur:
             await cur.execute(
                 "INSERT INTO simulation_runs "
-                "(id, scope, question, world_model_id, parameters, status, epistemic_status, created_at, updated_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, now(), now()) "
+                "(id, scope, question, world_model_id, parameters, status, epistemic_status, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, now()) "
                 "RETURNING id, scope, question, status, epistemic_status",
                 (sim_id, scope, question, world_model_id, params_json, "created", "possible_world"),
             )
@@ -198,7 +198,7 @@ async def execute_simulation(
         async with conn.cursor() as cur:
             await cur.execute(
                 "UPDATE simulation_runs "
-                "SET status = %s, outcome_distribution = %s, completed_at = now(), updated_at = now() "
+                "SET status = %s, outcome_distribution = %s, completed_at = now() "
                 "WHERE id = %s "
                 "RETURNING id, status",
                 ("completed", json.dumps(outcome_distribution), run_id),
@@ -267,8 +267,8 @@ async def fork_simulation(
         async with conn.cursor() as cur:
             await cur.execute(
                 "INSERT INTO simulation_runs "
-                "(id, scope, question, world_model_id, parameters, status, epistemic_status, created_at, updated_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, now(), now()) "
+                "(id, scope, question, world_model_id, parameters, status, epistemic_status, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, now()) "
                 "RETURNING id, scope, question, status, epistemic_status",
                 (
                     fork_id,

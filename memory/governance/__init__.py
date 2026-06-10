@@ -280,9 +280,12 @@ async def forget(
         # Gate 1: granted, unexpired approval for this action class in same scope
         async with conn.cursor() as cur:
             await cur.execute(
-                "SELECT 1 FROM approvals a JOIN agent_runs r ON a.run_id = r.id "
+                # approvals.scope is authoritative (0002_agent_spine): works for
+                # agent-originated rows (scope copied from the run) and
+                # human-originated rows (run_id IS NULL) alike.
+                "SELECT 1 FROM approvals a "
                 "WHERE a.id = %s AND a.state = 'granted' AND a.action_class = %s "
-                "AND a.expires_at > now() AND r.scope = %s LIMIT 1",
+                "AND a.expires_at > now() AND a.scope = %s LIMIT 1",
                 (approval_id, _FORGET_ACTION_CLASS, scope_text),
             )
             if await cur.fetchone() is None:

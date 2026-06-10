@@ -34,41 +34,49 @@ async def create_workspace(
 ) -> dict:
     """Create a workspace. Returns {id, scope, name, kind}."""
     ws_id = mint("ws")
-    await pool.execute(
-        "INSERT INTO workspaces (id, scope, name, kind) VALUES (%s, %s, %s, %s)",
-        (ws_id, scope, name, kind),
-    )
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO workspaces (id, scope, name, kind) VALUES (%s, %s, %s, %s)",
+                (ws_id, scope, name, kind),
+            )
     return {"id": ws_id, "scope": scope, "name": name, "kind": kind}
 
 
 async def get_workspace(pool: Any, workspace_id: str) -> dict | None:
     """Fetch a single workspace by id."""
-    row = await pool.fetchrow(
-        "SELECT id, scope, name, kind, properties, created_at, updated_at "
-        "FROM workspaces WHERE id = %s",
-        (workspace_id,),
-    )
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, scope, name, kind, properties, created_at, updated_at "
+                "FROM workspaces WHERE id = %s",
+                (workspace_id,),
+            )
+            row = await cur.fetchone()
     if row is None:
         return None
     return {
-        "id": row["id"],
-        "scope": row["scope"],
-        "name": row["name"],
-        "kind": row["kind"],
-        "properties": row["properties"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
+        "id": row[0],
+        "scope": row[1],
+        "name": row[2],
+        "kind": row[3],
+        "properties": row[4],
+        "created_at": row[5],
+        "updated_at": row[6],
     }
 
 
 async def list_workspaces(pool: Any, scope: str) -> list[dict]:
     """List all workspaces for a given scope."""
-    rows = await pool.fetch(
-        "SELECT id, scope, name, kind, created_at FROM workspaces WHERE scope = %s ORDER BY created_at DESC",
-        (scope,),
-    )
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, scope, name, kind, created_at FROM workspaces WHERE scope = %s ORDER BY created_at DESC",
+                (scope,),
+            )
+            rows = await cur.fetchall()
     return [
-        {"id": r["id"], "scope": r["scope"], "name": r["name"], "kind": r["kind"], "created_at": r["created_at"]}
+        {"id": r[0], "scope": r[1], "name": r[2], "kind": r[3], "created_at": r[4]}
         for r in rows
     ]
 
@@ -85,10 +93,12 @@ async def create_project(
 ) -> dict:
     """Create a project inside a workspace. Returns {id, workspace_id, name, status}."""
     prj_id = mint("prj")
-    await pool.execute(
-        "INSERT INTO projects (id, workspace_id, name, status) VALUES (%s, %s, %s, %s)",
-        (prj_id, workspace_id, name, status),
-    )
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO projects (id, workspace_id, name, status) VALUES (%s, %s, %s, %s)",
+                (prj_id, workspace_id, name, status),
+            )
     return {"id": prj_id, "workspace_id": workspace_id, "name": name, "status": status}
 
 
@@ -106,10 +116,12 @@ async def create_task(
     """Create a task inside a project. Returns {id, project_id, title, priority, status}."""
     tsk_id = mint("tsk")
     deps = json.dumps(depends_on if depends_on is not None else [])
-    await pool.execute(
-        "INSERT INTO tasks (id, project_id, title, priority, depends_on) VALUES (%s, %s, %s, %s, %s)",
-        (tsk_id, project_id, title, priority, deps),
-    )
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO tasks (id, project_id, title, priority, depends_on) VALUES (%s, %s, %s, %s, %s)",
+                (tsk_id, project_id, title, priority, deps),
+            )
     return {
         "id": tsk_id,
         "project_id": project_id,
@@ -126,30 +138,35 @@ async def update_task_status(
     status: str,
 ) -> dict:
     """Update a task's status. Returns {id, status}."""
-    await pool.execute(
-        "UPDATE tasks SET status = %s WHERE id = %s",
-        (status, task_id),
-    )
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE tasks SET status = %s WHERE id = %s",
+                (status, task_id),
+            )
     return {"id": task_id, "status": status}
 
 
 async def get_project_tasks(pool: Any, project_id: str) -> list[dict]:
     """List all tasks for a given project."""
-    rows = await pool.fetch(
-        "SELECT id, project_id, title, priority, status, depends_on, created_at, completed_at "
-        "FROM tasks WHERE project_id = %s ORDER BY created_at ASC",
-        (project_id,),
-    )
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, project_id, title, priority, status, depends_on, created_at, completed_at "
+                "FROM tasks WHERE project_id = %s ORDER BY created_at ASC",
+                (project_id,),
+            )
+            rows = await cur.fetchall()
     return [
         {
-            "id": r["id"],
-            "project_id": r["project_id"],
-            "title": r["title"],
-            "priority": r["priority"],
-            "status": r["status"],
-            "depends_on": r["depends_on"],
-            "created_at": r["created_at"],
-            "completed_at": r["completed_at"],
+            "id": r[0],
+            "project_id": r[1],
+            "title": r[2],
+            "priority": r[3],
+            "status": r[4],
+            "depends_on": r[5],
+            "created_at": r[6],
+            "completed_at": r[7],
         }
         for r in rows
     ]

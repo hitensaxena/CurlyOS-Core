@@ -18,6 +18,8 @@ See: ~/hitenos-architecture/25-studio-engine.md
 """
 from __future__ import annotations
 
+import json
+
 import logging
 from typing import Any
 
@@ -53,6 +55,7 @@ async def create_studio(
     publisher: Any,
     scope: str,
     title: str,
+    properties: dict | None = None,
 ) -> dict:
     """Create a new studio canvas.
 
@@ -66,10 +69,10 @@ async def create_studio(
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO studios (id, scope, title, status, created_at, updated_at) "
-                "VALUES (%s, %s, %s, %s, now(), now()) "
+                "INSERT INTO studios (id, scope, title, status, properties, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s, now(), now()) "
                 "RETURNING id, scope, title, status",
-                (studio_id, scope, title, "active"),
+                (studio_id, scope, title, "active", json.dumps(properties or {})),
             )
             row = await cur.fetchone()
             studio = {"id": row[0], "scope": row[1], "title": row[2], "status": row[3]}
@@ -96,6 +99,7 @@ async def create_sketch(
     studio_id: str,
     content: str,
     kind: str = "text",
+    properties: dict | None = None,
 ) -> dict:
     """Create a new sketch in a studio, seeded at epistemic_status='seed'.
 
@@ -110,10 +114,10 @@ async def create_sketch(
         async with conn.cursor() as cur:
             await cur.execute(
                 "INSERT INTO studio_sketches "
-                "(id, studio_id, content, kind, epistemic_status, created_at, updated_at) "
-                "VALUES (%s, %s, %s, %s, %s, now(), now()) "
+                "(id, studio_id, content, kind, epistemic_status, properties, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, now(), now()) "
                 "RETURNING id, studio_id, content, kind, epistemic_status",
-                (skt_id, studio_id, content, kind, "seed"),
+                (skt_id, studio_id, content, kind, "seed", json.dumps(properties or {})),
             )
             row = await cur.fetchone()
             sketch = {

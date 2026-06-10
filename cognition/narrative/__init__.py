@@ -330,13 +330,18 @@ async def compose_chapters(
     pool: Any,
     publisher: Any,
     scope: str,
+    llm_client: Any = None,
+    llm_model: str = "",
 ) -> list[dict]:
     """Detect turning points from episodes and INSERT life_chapters.
 
-    Orders episodes by ingested_at, detects significant topic shifts
-    as chapter boundaries. All chapters at epistemic_status='hypothesis'.
+    Orders episodes by ingested_at, detects significant topic shifts as chapter
+    boundaries, then SYNTHESIZES each chapter's title + summary (LLM when
+    available, else a clean keyword fallback) — never a raw episode/transcript
+    line. All chapters at epistemic_status='hypothesis'.
     """
     import re
+    import json as _json
     from collections import Counter
 
     async with pool.connection() as conn:
@@ -381,52 +386,73 @@ async def compose_chapters(
     for eid, content, ingested_at in episode_rows:
         episode_keywords.append((eid, content, top_keywords(content)))
 
-    # Detect turning points: significant Jaccard distance between consecutive episodes
-    chapters: list[dict] = []
-    current_start = episode_rows[0][2]  # ingested_at
-    current_episodes: list[str] = [episode_rows[0][0]]
-    current_title = episode_rows[0][1][:50]
+    # Segment episodes at topic shifts: a boundary is a significant Jaccard
+    # distance between consecutive episodes, but only once the current segment
+    # has >=3 episodes (so chapters are meaningful, not noisy singletons).
+    segments: list[dict] = []
+    cur_start = episode_rows[0][2]  # ingested_at
+    cur_ids: list[str] = [episode_rows[0][0]]
+    cur_contents: list[str] = [episode_rows[0][1]]
 
     for i in range(1, len(episode_keywords)):
         prev_kw = episode_keywords[i - 1][2]
         curr_kw = episode_keywords[i][2]
-        # Jaccard similarity
         intersection = prev_kw & curr_kw
         union = prev_kw | curr_kw
         similarity = len(intersection) / len(union) if union else 1.0
 
-        # If similarity < 0.3, it's a turning point → new chapter.
-        # Require a minimum span (>=3 episodes) so chapters are meaningful
-        # rather than one-episode singletons from noisy topic switching.
-        if similarity < 0.3 and len(current_episodes) >= 3:
-            # Close current chapter
-            cha_id = mint("cha")
-            async with pool.connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        "INSERT INTO life_chapters "
-                        "(id, scope, title, summary, start_date, epistemic_status) "
-                        "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
-                        (cha_id, scope, current_title,
-                         f"Chapter covering {len(current_episodes)} episodes",
-                         current_start, "hypothesis"),
-                    )
-                    (cid,) = await cur.fetchone()
-            chapters.append({
-                "id": cid,
-                "title": current_title,
-                "episodes_count": len(current_episodes),
-                "start_date": current_start.isoformat() if current_start else None,
-                "episodes": list(current_episodes),
-            })
-            current_start = episode_rows[i][2]
-            current_episodes = [episode_rows[i][0]]
-            current_title = episode_rows[i][1][:50]
+        if similarity < 0.3 and len(cur_ids) >= 3:
+            segments.append({"start": cur_start, "ids": cur_ids, "contents": cur_contents})
+            cur_start = episode_rows[i][2]
+            cur_ids = [episode_rows[i][0]]
+            cur_contents = [episode_rows[i][1]]
         else:
-            current_episodes.append(episode_rows[i][0])
+            cur_ids.append(episode_rows[i][0])
+            cur_contents.append(episode_rows[i][1])
 
-    # Close final chapter
-    if current_episodes:
+    if cur_ids:
+        segments.append({"start": cur_start, "ids": cur_ids, "contents": cur_contents})
+
+    # Title/summary synthesis — a chapter title is a THEME, never raw episode text.
+    def _keyword_title(contents: list[str]) -> str:
+        joined = " ".join(contents).lower()
+        words = re.findall(r"\b[a-z]{4,}\b", joined)
+        counts = Counter(w for w in words if w not in stop_words)
+        top = [w.title() for w, _ in counts.most_common(3)]
+        return ", ".join(top) if top else "Untitled chapter"
+
+    async def _synth(contents: list[str]) -> tuple[str, str]:
+        kw_title = _keyword_title(contents)
+        if not llm_client:
+            return kw_title, f"A period of {len(contents)} entries about {kw_title.lower()}."
+        sample = "\n".join(c[:200] for c in contents[:12])
+        prompt = (
+            "These are journal/conversation entries from one stretch of someone's life. "
+            'Return STRICT JSON {"title": ..., "summary": ...}. '
+            "title = a 2-6 word thematic chapter title for what this period was ABOUT "
+            "(e.g. 'Building CurlyOS', 'Health reset'). summary = one plain sentence. "
+            "Synthesize the theme; do NOT copy any entry verbatim and do NOT include "
+            "speaker tags ('User:'/'Assistant:'), '[turn ...]', timestamps, or 'Session ...'.\n\n"
+            f"Entries:\n{sample}"
+        )
+        try:
+            resp = await llm_client.chat.completions.create(
+                model=llm_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.4,
+                max_tokens=160,
+                response_format={"type": "json_object"},
+            )
+            data = _json.loads(resp.choices[0].message.content or "{}")
+            title = (str(data.get("title") or "")).strip()[:80] or kw_title
+            summary = (str(data.get("summary") or "")).strip()[:300] or f"A period about {kw_title.lower()}."
+            return title, summary
+        except Exception:
+            return kw_title, f"A period of {len(contents)} entries about {kw_title.lower()}."
+
+    chapters: list[dict] = []
+    for seg in segments:
+        title, summary = await _synth(seg["contents"])
         cha_id = mint("cha")
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -434,17 +460,15 @@ async def compose_chapters(
                     "INSERT INTO life_chapters "
                     "(id, scope, title, summary, start_date, epistemic_status) "
                     "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
-                    (cha_id, scope, current_title,
-                     f"Chapter covering {len(current_episodes)} episodes",
-                     current_start, "hypothesis"),
+                    (cha_id, scope, title, summary, seg["start"], "hypothesis"),
                 )
                 (cid,) = await cur.fetchone()
         chapters.append({
             "id": cid,
-            "title": current_title,
-            "episodes_count": len(current_episodes),
-            "start_date": current_start.isoformat() if current_start else None,
-            "episodes": list(current_episodes),
+            "title": title,
+            "episodes_count": len(seg["ids"]),
+            "start_date": seg["start"].isoformat() if seg["start"] else None,
+            "episodes": list(seg["ids"]),
         })
 
     return chapters

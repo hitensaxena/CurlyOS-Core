@@ -1,6 +1,6 @@
 """CurlyOS API server — serves memory, knowledge graph, identity, cognition data.
 
-Runs as a FastAPI app on port 8642. Called by Next.js API routes or directly.
+Runs as a FastAPI app on port 8643. Called by Next.js API routes or directly.
 """
 from __future__ import annotations
 
@@ -446,19 +446,37 @@ def list_identity(scope: str = SCOPE, predicates: str | None = None, valid: bool
 
 
 @app.post("/api/identity")
-def propose_identity(body: ProposeIdentityRequest):
+async def propose_identity(body: ProposeIdentityRequest):
+    """Propose an identity fact through the governance path — conflict
+    resolution, supersession, and confidence gating live in the identity
+    module, not here. A missing source_episode_id gets a provenance episode
+    recorded first (every derived fact traces to an episode)."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from identity import propose_identity_fact
+    from memory.governance import record_episode
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    pub = _make_publisher_sync()
     try:
-        ep_status = "canonical" if body.confidence >= 0.75 else "hypothesis"
-        with get_conn() as conn:
-            row = conn.execute(
-                "INSERT INTO identity_facts (id, scope, predicate, object, confidence, "
-                "epistemic_status, valid_from, ingested_at, source_episode_id) "
-                "VALUES (gen_random_uuid()::text, %s, %s, %s, %s, %s, now(), now(), %s) "
-                "RETURNING id",
-                [SCOPE, body.predicate, body.object, body.confidence, ep_status, body.source_episode_id],
-            ).fetchone()
-        return {"id": row["id"], "predicate": body.predicate, "object": body.object,
-                "confidence": body.confidence, "epistemic_status": ep_status}
+        source_episode_id = body.source_episode_id
+        if not source_episode_id:
+            epi = await record_episode(
+                pool, pub, SCOPE,
+                content=f"Manual identity entry: {body.predicate} = {body.object}",
+                source_ref="web:identity",
+            )
+            source_episode_id = epi["epi_id"]
+        result = await propose_identity_fact(
+            pool, pub, SCOPE,
+            predicate=body.predicate,
+            object=body.object,
+            confidence=body.confidence,
+            source_episode_id=source_episode_id,
+        )
+        result["id"] = result.get("idf_id")  # legacy response-shape alias
+        return result
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -681,11 +699,13 @@ async def cognition_attention(scope: str = SCOPE, window_days: int = 7):
 def cognition_narrative(scope: str = SCOPE):
     with get_conn() as conn:
         chapters = conn.execute(
-            "SELECT id, title, summary, start_date, end_date, epistemic_status FROM life_chapters WHERE scope = %s ORDER BY start_date DESC",
+            "SELECT id, title, summary, start_date, end_date, epistemic_status FROM life_chapters "
+            "WHERE scope = %s AND valid_to IS NULL ORDER BY start_date DESC",
             [scope],
         ).fetchall()
         themes = conn.execute(
-            "SELECT id, name, description, frequency, epistemic_status FROM themes WHERE scope = %s ORDER BY frequency DESC",
+            "SELECT id, name, description, frequency, epistemic_status FROM themes "
+            "WHERE scope = %s AND valid_to IS NULL ORDER BY frequency DESC",
             [scope],
         ).fetchall()
     return {"chapters": chapters, "themes": themes}
@@ -814,16 +834,21 @@ def list_studios(scope: str = SCOPE):
 
 
 @app.post("/api/studio")
-def create_studio(body: CreateStudioRequest):
-    with get_conn() as conn:
-        row = conn.execute(
-            "INSERT INTO studios (id, scope, title, status, properties) "
-            "VALUES (gen_random_uuid()::text, %s, %s, 'active', %s) "
-            "RETURNING id, created_at",
-            [SCOPE, body.title, json.dumps(body.properties)],
-        ).fetchone()
-    return {"id": row["id"], "title": body.title, "status": "active",
-            "created_at": row["created_at"].isoformat() if row else None}
+async def create_studio(body: CreateStudioRequest):
+    """Single write path: studio module mints the stu_ ULID and stages the
+    studio.created event — the inline-SQL bypass (gen_random_uuid ids, no
+    events) is gone."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import studio as studio_mod
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    pub = _make_publisher_sync()
+    try:
+        return await studio_mod.create_studio(
+            pool, pub, SCOPE, title=body.title, properties=body.properties,
+        )
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
 @app.get("/api/studio/{studio_id}")
@@ -846,21 +871,24 @@ def get_studio(studio_id: str):
 
 
 @app.post("/api/studio/{studio_id}/sketch")
-def create_sketch(studio_id: str, body: CreateSketchRequest):
+async def create_sketch(studio_id: str, body: CreateSketchRequest):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import studio as studio_mod
+
     with get_conn() as conn:
-        # Verify studio exists
-        studio = conn.execute("SELECT id FROM studios WHERE id = %s", [studio_id]).fetchone()
-        if not studio:
+        exists = conn.execute("SELECT id FROM studios WHERE id = %s", [studio_id]).fetchone()
+        if not exists:
             raise HTTPException(404, "Studio not found")
-        row = conn.execute(
-            "INSERT INTO studio_sketches (id, studio_id, content, kind, epistemic_status, properties) "
-            "VALUES (gen_random_uuid()::text, %s, %s, %s, 'seed', %s) "
-            "RETURNING id, created_at",
-            [studio_id, body.content, body.kind, json.dumps(body.properties)],
-        ).fetchone()
-    return {"id": row["id"], "studio_id": studio_id, "content": body.content,
-            "kind": body.kind, "epistemic_status": "seed",
-            "created_at": row["created_at"].isoformat() if row else None}
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    pub = _make_publisher_sync()
+    try:
+        return await studio_mod.create_sketch(
+            pool, pub, studio_id,
+            content=body.content, kind=body.kind, properties=body.properties,
+        )
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -880,17 +908,21 @@ def list_simulation_runs(scope: str = SCOPE):
 
 
 @app.post("/api/simulation/runs")
-def create_simulation_run(body: CreateSimulationRunRequest):
-    with get_conn() as conn:
-        row = conn.execute(
-            "INSERT INTO simulation_runs (id, scope, question, world_model_id, status, epistemic_status, parameters) "
-            "VALUES (gen_random_uuid()::text, %s, %s, %s, 'created', 'possible_world', %s) "
-            "RETURNING id, created_at",
-            [SCOPE, body.question, body.world_model_id, json.dumps(body.parameters)],
-        ).fetchone()
-    return {"id": row["id"], "question": body.question, "status": "created",
-            "epistemic_status": "possible_world",
-            "created_at": row["created_at"].isoformat() if row else None}
+async def create_simulation_run(body: CreateSimulationRunRequest):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from simulation import create_simulation_run as create_sim
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    pub = _make_publisher_sync()
+    try:
+        return await create_sim(
+            pool, pub, SCOPE,
+            question=body.question,
+            world_model_id=body.world_model_id,
+            parameters=body.parameters,
+        )
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -1807,6 +1839,7 @@ async def narrative_generate(body: NarrativeGenerateRequest | None = None):
     from cognition.narrative import surface_themes, compose_chapters
 
     pool = await _get_async_pool()
+    llm_client, llm_model = _make_llm_client()
     try:
         themes = await surface_themes(
             pool=pool, publisher=_make_publisher_sync(),
@@ -1814,12 +1847,14 @@ async def narrative_generate(body: NarrativeGenerateRequest | None = None):
         )
         chapters = await compose_chapters(
             pool=pool, publisher=_make_publisher_sync(), scope=scope,
+            llm_client=llm_client, llm_model=llm_model,
         )
         return {
             "scope": scope,
             "themes_surfaced": len(themes),
             "chapters_composed": len(chapters),
             "top_themes": [t.get("name") for t in themes[:8]],
+            "llm": bool(llm_client),
         }
     except Exception as e:
         logger.exception("narrative generate failed scope=%s", scope)

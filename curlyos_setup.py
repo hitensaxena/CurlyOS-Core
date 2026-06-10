@@ -65,30 +65,19 @@ def check_redis(url: str) -> tuple[bool, str]:
 
 
 def apply_migrations(dsn: str) -> tuple[bool, str]:
-    """Apply all DDL migrations."""
+    """Apply all DDL migrations via the single authoritative runner (migrate.py)."""
     try:
-        from memory.stores import ALL_DDL
-        from knowledge.graph import GRAPH_DDL
-        from cognition.reflection import REFLECTION_DDL
-        from cognition.meta import METACOG_DDL
-        from cognition.attention import ATTENTION_DDL
-        from cognition.narrative import NARRATIVE_DDL
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from migrate import run_migrations
 
+        applied = run_migrations(dsn)
         conn = psycopg.connect(dsn, autocommit=True)
-        conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        conn.execute(ALL_DDL)
-        conn.execute(GRAPH_DDL)
-        conn.execute(REFLECTION_DDL)
-        conn.execute(METACOG_DDL)
-        conn.execute(ATTENTION_DDL)
-        conn.execute(NARRATIVE_DDL)
-
-        # Count tables
         tables = conn.execute(
             "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'"
         ).fetchone()[0]
         conn.close()
-        return True, f"Migrations applied. {tables} tables in public schema."
+        what = ", ".join(applied) if applied else "nothing pending"
+        return True, f"Migrations applied ({what}). {tables} tables in public schema."
     except Exception as e:
         return False, f"Migration failed: {e}"
 

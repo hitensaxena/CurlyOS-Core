@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS knowledge_edges (
 CREATE INDEX IF NOT EXISTS idx_ke_scope_label ON knowledge_entities (scope, label) WHERE valid_to IS NULL;
 CREATE INDEX IF NOT EXISTS idx_ke_name ON knowledge_entities (name) WHERE valid_to IS NULL;
 CREATE INDEX IF NOT EXISTS idx_ke_hnsw ON knowledge_entities
-  USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=64);
+  USING hnsw (embedding vector_cosine_ops) WITH (m=32, ef_construction=200);
 CREATE INDEX IF NOT EXISTS idx_kedge_src ON knowledge_edges (src_entity_id) WHERE valid_to IS NULL;
 CREATE INDEX IF NOT EXISTS idx_kedge_dst ON knowledge_edges (dst_entity_id) WHERE valid_to IS NULL;
 CREATE INDEX IF NOT EXISTS idx_kedge_rel ON knowledge_edges (rel_type) WHERE valid_to IS NULL;

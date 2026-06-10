@@ -76,3 +76,24 @@ docker volume rm <old-anon-pg-hash> <old-anon-redis-hash>   # script prints thes
   Compose binds the same host port the app already expects; if you ever hit a
   bind conflict on reboot, that's the cause — remap the host side here, not the
   app's `CURLYOS_REDIS_URL`, unless you update both.
+
+## Restore drill log
+
+Drill procedure (run after any schema change; last run 2026-06-10, PASSED):
+1. `CREATE DATABASE curlyos_scratch` (drop first if present).
+2. `gunzip -c deploy/backups/daily/curlyos-<date>.sql.gz | psql "$SCRATCH_DSN"`
+   — a single `ERROR: unrecognized configuration parameter "transaction_timeout"`
+   is expected noise (pg17 client dump preamble vs pg16 server) and harmless.
+3. `.venv/bin/python3 migrate.py --dsn "$SCRATCH_DSN"` — must bring the restored
+   schema current (applies anything the dump predates; no-ops the rest).
+4. Sanity: row counts on memories/episodes, `schema_migrations` lists all
+   migrations, smoketests pass against the scratch DSN.
+5. `DROP DATABASE curlyos_scratch`.
+
+2026-06-10 result: 03:30 dump (501 memories) restored; migrate applied
+0001–0003; 35 tables; approvals present; PASS. Pre-agent-spine anchor kept at
+`backups/weekly/curlyos-2026-06-10-pre-agent-spine.sql.gz`.
+
+OPEN (Hiten decision): off-VPS encrypted backup copy — all backups currently
+share the database's disk. Pick a destination (e.g. restic/age to S3 or a
+second box) and add a push step here.

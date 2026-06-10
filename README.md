@@ -152,7 +152,7 @@ python3 curlyos_setup.py
 This interactive wizard will:
 1. Test your PostgreSQL connection
 2. Test your Redis connection
-3. Apply all DDL migrations (creates tables, extensions, indexes)
+3. Apply all DDL migrations via `python3 migrate.py` — an ordered runner that applies `migrations/*.sql` files and tracks each one in a `schema_migrations` ledger; `curlyos_setup.py --migrate` calls the same runner
 4. Configure your embedder (fake for testing, bge-m3 for local, OpenAI for API)
 5. Write `~/.hermes/curlyos.yaml` and update `~/.hermes/.env`
 
@@ -285,9 +285,10 @@ hermes
 | `/api/episodes` | GET | List episodes (paginated) |
 | `/api/episodes` | POST | Record a new episode |
 | `/api/memories` | GET | List memories (paginated) |
-| `/api/memories/search` | GET | Hybrid search (BM25 + vector + graph) |
+| `/api/search?q=&mode=&limit=` | GET | Full-text search over memories (BM25) |
+| `/api/recall` | POST | Hybrid recall (BM25 + vector + graph) |
 | `/api/memories` | POST | Store a new memory/fact |
-| `/api/memories/{id}` | DELETE | Invalidate a memory (not deleted) |
+| `/api/memories/{id}/invalidate` | POST | Invalidate a memory (soft-invalidation; records are never deleted) |
 
 ### Identity
 
@@ -300,9 +301,8 @@ hermes
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/entities` | GET | List knowledge entities |
-| `/api/entities` | POST | Create/update entity |
-| `/api/edges` | GET | List knowledge edges (relationships) |
+| `/api/graph` | GET | List knowledge graph entities |
+| `/api/graph/{id}/expand?k=` | GET | Expand a node's neighbourhood (k hops) |
 
 ## Configuration
 

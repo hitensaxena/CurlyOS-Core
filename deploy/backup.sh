@@ -38,6 +38,26 @@ tar czf "$MIND_OUT.tmp" --warning=no-file-changed \
     -C "$(dirname "$MIND_DIR")" "$(basename "$MIND_DIR")" || [ $? -eq 1 ]
 mv "$MIND_OUT.tmp" "$MIND_OUT"
 
+# --- CurlyOS artifacts (content-addressed blobs; populated from Phase A) ---
+ART_DIR="/home/hiten/curlyos-data/artifacts"
+if [ -d "$ART_DIR" ]; then
+    ART_OUT="$BACKUP_DIR/daily/artifacts-$DATE.tgz"
+    tar czf "$ART_OUT.tmp" --warning=no-file-changed \
+        -C "$(dirname "$ART_DIR")" "$(basename "$ART_DIR")" || [ $? -eq 1 ]
+    mv "$ART_OUT.tmp" "$ART_OUT"
+fi
+
+# --- Hermes-side CurlyOS config + deployed plugin (small, drift-prone) ---
+HERMES_PARTS=""
+[ -f "$HOME/.hermes/curlyos.yaml" ] && HERMES_PARTS=".hermes/curlyos.yaml"
+[ -d "$HOME/.hermes/plugins/curlyos" ] && HERMES_PARTS="$HERMES_PARTS .hermes/plugins/curlyos"
+if [ -n "$HERMES_PARTS" ]; then
+    HERMES_OUT="$BACKUP_DIR/daily/hermes-curlyos-$DATE.tgz"
+    # shellcheck disable=SC2086  # word-splitting of the parts list is intended
+    tar czf "$HERMES_OUT.tmp" --warning=no-file-changed -C "$HOME" $HERMES_PARTS || [ $? -eq 1 ]
+    mv "$HERMES_OUT.tmp" "$HERMES_OUT"
+fi
+
 # --- Sunday → weekly copies ---
 if [ "$DOW" = "7" ]; then
     cp -f "$PG_OUT" "$BACKUP_DIR/weekly/"

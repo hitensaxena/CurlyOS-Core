@@ -39,6 +39,7 @@ PREFIXES: dict[str, str] = {
     "session": "ses",
     "user": "usr",
     # Creative cognition prefixes
+    "studio": "stu",
     "sketch": "skt",
     "concept": "cpt",
     "world_model": "wld",

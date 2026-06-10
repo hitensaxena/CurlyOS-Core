@@ -51,38 +51,46 @@ async def create_golden_dataset(
     content_hash = _compute_content_hash(data)
     meta = json.dumps(metadata if metadata is not None else {})
 
-    await pool.execute(
-        "INSERT INTO golden_datasets (id, name, content_hash, data, metadata) "
-        "VALUES (%s, %s, %s, %s, %s)",
-        (ds_id, name, content_hash, json.dumps(data), meta),
-    )
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO golden_datasets (id, name, content_hash, data, metadata) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (ds_id, name, content_hash, json.dumps(data), meta),
+            )
     return {"id": ds_id, "name": name, "content_hash": content_hash}
 
 
 async def get_golden_dataset(pool: Any, dataset_id: str) -> dict | None:
     """Fetch a single golden dataset by id."""
-    row = await pool.fetchrow(
-        "SELECT id, name, content_hash, data, metadata FROM golden_datasets WHERE id = %s",
-        (dataset_id,),
-    )
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, name, content_hash, data, metadata FROM golden_datasets WHERE id = %s",
+                (dataset_id,),
+            )
+            row = await cur.fetchone()
     if row is None:
         return None
     return {
-        "id": row["id"],
-        "name": row["name"],
-        "content_hash": row["content_hash"],
-        "data": row["data"],
-        "metadata": row["metadata"],
+        "id": row[0],
+        "name": row[1],
+        "content_hash": row[2],
+        "data": row[3],
+        "metadata": row[4],
     }
 
 
 async def list_golden_datasets(pool: Any) -> list[dict]:
     """List all golden datasets."""
-    rows = await pool.fetch(
-        "SELECT id, name, content_hash, created_at FROM golden_datasets ORDER BY created_at DESC",
-    )
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, name, content_hash, created_at FROM golden_datasets ORDER BY created_at DESC",
+            )
+            rows = await cur.fetchall()
     return [
-        {"id": r["id"], "name": r["name"], "content_hash": r["content_hash"], "created_at": r["created_at"]}
+        {"id": r[0], "name": r[1], "content_hash": r[2], "created_at": r[3]}
         for r in rows
     ]
 
@@ -196,14 +204,17 @@ async def run_scorer(
 
     Returns {score: 0-1, details: {}}.
     """
-    row = await pool.fetchrow(
-        "SELECT id, name, content_hash, data FROM golden_datasets WHERE id = %s",
-        (dataset_id, ),
-    )
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, name, content_hash, data FROM golden_datasets WHERE id = %s",
+                (dataset_id,),
+            )
+            row = await cur.fetchone()
     if row is None:
         raise ValueError(f"Golden dataset {dataset_id!r} not found")
 
-    data = row["data"]
+    data = row[3]
     if isinstance(data, str):
         data = json.loads(data)
 
@@ -317,12 +328,14 @@ async def evaluate_candidate(
         reason = f"pass_rate={pass_rate:.2f} below 0.5 minimum"
 
     # Persist evaluation run
-    await pool.execute(
-        "INSERT INTO evaluation_runs "
-        "(id, candidate_ref, dataset_ids, scorers, pass_rate, decision) "
-        "VALUES (%s, %s, %s, %s, %s, %s)",
-        (evr_id, candidate_ref, json.dumps(dataset_ids), json.dumps(scorers), pass_rate, decision.value),
-    )
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO evaluation_runs "
+                "(id, candidate_ref, dataset_ids, scorers, pass_rate, decision) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (evr_id, candidate_ref, json.dumps(dataset_ids), json.dumps(scorers), pass_rate, decision.value),
+            )
 
     return {
         "evr_id": evr_id,

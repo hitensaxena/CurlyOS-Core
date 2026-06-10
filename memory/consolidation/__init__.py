@@ -888,7 +888,7 @@ async def run_consolidation(
         try:
             async with pool.connection() as conn:
                 async with conn.cursor() as cur:
-                    await cur.execute("SELECT DISTINCT scope FROM memories ORDER BY rows")
+                    await cur.execute("SELECT DISTINCT scope FROM memories ORDER BY scope")
                     mem_scopes = [r[0] for r in (await cur.fetchall()) or []]
                     # Add scopes not already in list
                     for s in mem_scopes:
