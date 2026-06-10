@@ -928,6 +928,146 @@ async def create_simulation_run(body: CreateSimulationRunRequest):
 # ---------------------------------------------------------------------------
 # Workspaces + Projects
 # ---------------------------------------------------------------------------
+# Safety & Approvals (Phase F.3 spine — lifted PDP substrate)
+# ---------------------------------------------------------------------------
+
+class CreateApprovalRequest(BaseModel):
+    action_class: str = Field(min_length=1, max_length=50)
+    payload: dict = Field(default_factory=dict)
+    ttl_seconds: int | None = Field(default=None, ge=60, le=30 * 24 * 3600)
+
+
+class DenyApprovalRequest(BaseModel):
+    reason: str = Field(default="user_denied", max_length=500)
+
+
+class KillRequest(BaseModel):
+    agent: str | None = None
+
+
+def _approval_errors():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from agent.approval_service import ApprovalNotActionable, ApprovalNotFound
+    return ApprovalNotFound, ApprovalNotActionable
+
+
+@app.get("/api/approvals")
+async def approvals_pending():
+    """The approval-card queue: pending, unexpired approvals in scope."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from agent.approval_service import list_pending
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    items = await list_pending(pool, SCOPE)
+    return {"items": items, "count": len(items)}
+
+
+@app.post("/api/approvals")
+async def create_human_approval(body: CreateApprovalRequest):
+    """Create a HUMAN-originated approval (run_id NULL) — e.g. the webapp's
+    hard-forget flow: create here, grant explicitly, then call the gated action
+    with the approval_id. Deliberate two-step friction for irreversible ops."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from agent.pdp_gate import approval_ttl_seconds, scope_parts
+    from shared.events import build_event
+    from shared.types.ulid import mint
+    from psycopg.types.json import Jsonb
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    pub = _make_publisher_sync()
+    apv_id = mint("apv")
+    ttl = body.ttl_seconds or approval_ttl_seconds()
+    parts = scope_parts(SCOPE)
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO approvals (id, run_id, origin, scope, action_class, payload, state, expires_at) "
+                "VALUES (%s, NULL, 'human', %s, %s, %s, 'pending', now() + make_interval(secs => %s))",
+                (apv_id, SCOPE, body.action_class, Jsonb(body.payload), ttl),
+            )
+        ev = build_event(
+            short_type="safety.approval.requested", subject=apv_id, scope=parts,
+            data={"apv_id": apv_id, "run_id": None, "action_class": body.action_class,
+                  "origin": "human"},
+            actor=f"user:{parts['user_id']}", source="curlyos-core/safety",
+        )
+        _id, subject, stamped = await pub.stage(ev, conn)
+    return {"apv_id": apv_id, "state": "pending", "origin": "human",
+            "action_class": body.action_class, "ttl_seconds": ttl}
+
+
+@app.post("/api/approvals/{apv_id}/grant")
+async def grant_approval(apv_id: str):
+    """Grant a pending approval. (Phase A: the runner resumes any parked run_id.)"""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from agent.approval_service import grant
+
+    ApprovalNotFound, ApprovalNotActionable = _approval_errors()
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    try:
+        return await grant(pool, _make_publisher_sync(), SCOPE, apv_id)
+    except ApprovalNotFound as e:
+        raise HTTPException(404, str(e))
+    except ApprovalNotActionable as e:
+        raise HTTPException(409, str(e))
+
+
+@app.post("/api/approvals/{apv_id}/deny")
+async def deny_approval(apv_id: str, body: DenyApprovalRequest | None = None):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from agent.approval_service import deny
+
+    ApprovalNotFound, ApprovalNotActionable = _approval_errors()
+    body = body or DenyApprovalRequest()
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    try:
+        return await deny(pool, _make_publisher_sync(), SCOPE, apv_id, reason=body.reason)
+    except ApprovalNotFound as e:
+        raise HTTPException(404, str(e))
+    except ApprovalNotActionable as e:
+        raise HTTPException(409, str(e))
+
+
+@app.get("/api/safety/kill")
+async def safety_kill_status(agent: str | None = None):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from safety.killswitch import kill_status
+
+    return await kill_status(_make_redis(), agent)
+
+
+@app.post("/api/safety/kill")
+async def safety_kill_engage(body: KillRequest | None = None):
+    """The panic button: kills all (or one agent's) side-effecting actions.
+    Fail-closed by design — with the flag set, every PDP verdict above read is DENY."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from agent.pdp_gate import scope_parts
+    from safety.killswitch import set_kill
+
+    body = body or KillRequest()
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    parts = scope_parts(SCOPE)
+    try:
+        return await set_kill(
+            _make_redis(), pool, _make_publisher_sync(),
+            scope_text=SCOPE, agent=body.agent, set_by=f"user:{parts['user_id']}",
+        )
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+
+
+@app.delete("/api/safety/kill")
+async def safety_kill_clear(agent: str | None = None):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from safety.killswitch import clear_kill
+
+    try:
+        return await clear_kill(_make_redis(), agent=agent)
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+
+
+# ---------------------------------------------------------------------------
 
 @app.get("/api/workspaces")
 def list_workspaces(scope: str = SCOPE):

@@ -3,11 +3,14 @@
 LocalBgeM3      — sentence-transformers BAAI/bge-m3 (1024-dim)
 OpenAIAdapter   — OpenAI embeddings API fallback
 FakeEmbedder    — zero vectors for testing (no model download)
+HashEmbedder    — deterministic SHA-256 pseudo-vectors (NON-SEMANTIC; replay/CI)
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import math
 import threading
 from typing import Any
 
@@ -29,6 +32,44 @@ class FakeEmbedder(Embedder):
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         return [[0.0] * self.dimension for _ in texts]
+
+
+def _hash_embed(text: str, dim: int) -> list[float]:
+    """Deterministic, L2-normalised pseudo-embedding (lifted from the build
+    repo's validated DeterministicHashEmbedder). Expands SHA-256(text||counter)
+    into 32-bit words mapped to [-1, 1), then L2-normalises. Pure function of
+    text — replaying a projection reproduces the embedding bit-for-bit."""
+    seed = text.encode("utf-8")
+    out: list[float] = []
+    counter = 0
+    while len(out) < dim:
+        digest = hashlib.sha256(seed + counter.to_bytes(4, "big")).digest()
+        for j in range(0, len(digest), 4):
+            if len(out) >= dim:
+                break
+            word = int.from_bytes(digest[j:j + 4], "big")
+            out.append((word / 2_147_483_648.0) - 1.0)
+        counter += 1
+    norm = math.sqrt(sum(x * x for x in out)) or 1.0
+    return [x / norm for x in out]
+
+
+class HashEmbedder(Embedder):
+    """Deterministic 1024-dim hash embedder — NON-SEMANTIC, never a production
+    retrieval backend. Exists so consolidation/replay tests run anywhere with
+    byte-identical vectors and no model download (the replay-determinism
+    property the spec's exit criteria demand)."""
+
+    @property
+    def dimension(self) -> int:
+        return 1024
+
+    @property
+    def model_name(self) -> str:
+        return "deterministic-hash-1024"
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        return [_hash_embed(t, self.dimension) for t in texts]
 
 
 class LocalBgeM3(Embedder):

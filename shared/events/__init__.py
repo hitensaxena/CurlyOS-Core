@@ -43,7 +43,13 @@ def build_event(
     actor: str = "system",
     source: str = "curlyos-core",
 ) -> dict[str, Any]:
-    """Build a CloudEvents v1.0 envelope."""
+    """Build a CloudEvents v1.0 envelope.
+
+    The short type must be registered in the CLOSED catalog
+    (shared/events/catalog.py) — unknown types raise UnknownEventType."""
+    from shared.events.catalog import validate_short_type
+
+    validate_short_type(short_type)
     return {
         "specversion": "1.0",
         "type": full_type(short_type),
