@@ -1,0 +1,198 @@
+"""The Executive's tool registry — typed, action-classed, thin (curlyos-final/05 §3).
+
+Every tool: (a) declares its PDP action class — the gate decides per call;
+(b) wraps an EXISTING core function — no domain logic lives here (nodes and
+tools are adapters, P7); (c) returns a JSON-serializable dict the observation
+row stores verbatim.
+
+Phase-A set: read + memory_write + external_post only. file_edit/code_exec/
+net_egress arrive in later phases with their own floors and sandboxes.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
+
+log = logging.getLogger("curlyos-core.orchestration.tools")
+
+
+@dataclass
+class ToolDeps:
+    """Infra bundle the runner assembles once per run."""
+    pool: Any
+    publisher: Any
+    redis: Any
+    notifier: Any
+    scope: str
+    run_id: str
+    embedder_factory: Callable[[], Awaitable[Any]]
+
+
+@dataclass(frozen=True)
+class Tool:
+    name: str
+    action_class: str
+    description: str          # one line, planner-facing
+    params: str               # compact signature, planner-facing
+    fn: Callable[[ToolDeps, dict], Awaitable[dict]]
+
+
+# ── read tools ────────────────────────────────────────────────────────────────
+
+async def _recall(deps: ToolDeps, args: dict) -> dict:
+    from memory.retrieval import retrieve
+    from shared.types import RetrievalRequest
+
+    req = RetrievalRequest(query=str(args.get("query", ""))[:2000], scope=deps.scope,
+                           mode="fast", token_budget=2000)
+    result = await retrieve(req, deps.pool, await deps.embedder_factory(), redis=deps.redis)
+    items = [
+        {"id": i.id, "content": i.content[:400], "tier": i.tier, "score": round(i.score, 4)}
+        for i in result.items[:12]
+    ]
+    return {"items": items, "count": len(items)}
+
+
+async def _search_graph(deps: ToolDeps, args: dict) -> dict:
+    name = str(args.get("name", ""))[:200]
+    async with deps.pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT e.id, e.name, e.label, "
+                "(SELECT count(*) FROM knowledge_edges k WHERE (k.src_entity_id = e.id "
+                " OR k.dst_entity_id = e.id) AND k.valid_to IS NULL) AS degree "
+                "FROM knowledge_entities e WHERE e.scope = %s AND e.valid_to IS NULL "
+                "AND e.name ILIKE %s ORDER BY degree DESC LIMIT 10",
+                (deps.scope, f"%{name}%"),
+            )
+            rows = await cur.fetchall()
+    return {"entities": [{"id": r[0], "name": r[1], "label": r[2], "degree": r[3]}
+                         for r in rows]}
+
+
+async def _list_goals(deps: ToolDeps, args: dict) -> dict:
+    from goals import list_goals
+
+    items = await list_goals(deps.pool, deps.scope, status=args.get("status") or "active")
+    return {"goals": [{"id": g["id"], "title": g["title"], "status": g["status"],
+                       "progress": g["progress"], "horizon": g["horizon"],
+                       "success_criteria": g["success_criteria"]} for g in items]}
+
+
+async def _get_identity(deps: ToolDeps, args: dict) -> dict:
+    from identity import get_identity_context
+
+    ctx = await get_identity_context(deps.pool, deps.scope)
+    return {"identity": ctx}
+
+
+# ── memory_write tools ────────────────────────────────────────────────────────
+
+async def _remember(deps: ToolDeps, args: dict) -> dict:
+    """Record an episode + a recallable memory (the agent's own provenance)."""
+    from memory.governance import add, record_episode
+
+    statement = str(args.get("statement", "")).strip()[:4000]
+    if not statement:
+        return {"error": "remember: empty statement"}
+    epi = await record_episode(deps.pool, deps.publisher, deps.scope,
+                               content=statement, source_ref=f"agent:{deps.run_id}")
+    mem = await add(deps.pool, deps.publisher, deps.scope, statement=statement,
+                    source_episode_id=epi["epi_id"],
+                    kind=str(args.get("kind", "fact"))[:50],
+                    epistemic_status="canonical")
+    return {"epi_id": epi["epi_id"], "mem_id": mem.get("mem_id")}
+
+
+async def _record_decision(deps: ToolDeps, args: dict) -> dict:
+    from goals import record_decision
+
+    return await record_decision(
+        deps.pool, deps.publisher, deps.scope,
+        title=str(args.get("title", ""))[:300],
+        chosen=str(args.get("chosen", ""))[:2000],
+        rationale=str(args.get("rationale", ""))[:4000],
+        context=(str(args["context"])[:4000] if args.get("context") else None),
+        reversibility=args.get("reversibility"),
+        goal_id=args.get("goal_id"),
+        review_at=args.get("review_at"),
+    )
+
+
+async def _create_goal(deps: ToolDeps, args: dict) -> dict:
+    from goals import create_goal
+
+    return await create_goal(
+        deps.pool, deps.publisher, deps.scope,
+        title=str(args.get("title", ""))[:300],
+        description=(str(args["description"])[:4000] if args.get("description") else None),
+        horizon=args.get("horizon"),
+        success_criteria=(str(args["success_criteria"])[:2000]
+                          if args.get("success_criteria") else None),
+    )
+
+
+async def _create_sketch(deps: ToolDeps, args: dict) -> dict:
+    """Write into the studio (epistemic seed) — the agent's scratchpad output."""
+    import studio as studio_mod
+
+    studio_id = args.get("studio_id")
+    if not studio_id:
+        s = await studio_mod.create_studio(deps.pool, deps.publisher, deps.scope,
+                                           title=str(args.get("studio_title", "agent studio"))[:200])
+        studio_id = s["id"]
+    sk = await studio_mod.create_sketch(deps.pool, deps.publisher, studio_id,
+                                        content=str(args.get("content", ""))[:8000])
+    return {"studio_id": studio_id, "sketch_id": sk["id"]}
+
+
+# ── external_post ─────────────────────────────────────────────────────────────
+
+async def _notify(deps: ToolDeps, args: dict) -> dict:
+    delivered = await deps.notifier.notify(str(args.get("text", ""))[:1500],
+                                           run_id=deps.run_id)
+    return {"delivered": bool(delivered)}
+
+
+REGISTRY: dict[str, Tool] = {
+    t.name: t for t in [
+        Tool("recall", "read", "Search the user's memory (hybrid semantic+keyword).",
+             "query: str", _recall),
+        Tool("search_graph", "read", "Find knowledge-graph entities by name.",
+             "name: str", _search_graph),
+        Tool("list_goals", "read", "List the user's goals with progress and criteria.",
+             "status?: active|paused|achieved", _list_goals),
+        Tool("get_identity", "read", "The user's current identity facts (who they are).",
+             "(none)", _get_identity),
+        Tool("remember", "memory_write", "Store a fact/insight into memory (with provenance).",
+             "statement: str, kind?: str", _remember),
+        Tool("record_decision", "memory_write", "Record a decision in the registry.",
+             "title, chosen, rationale, reversibility?: reversible|costly|one_way, goal_id?, review_at?",
+             _record_decision),
+        Tool("create_goal", "memory_write", "Create a new goal.",
+             "title, description?, horizon?: life|year|quarter|month, success_criteria?",
+             _create_goal),
+        Tool("create_sketch", "memory_write", "Write a sketch into the studio (speculative scratchpad).",
+             "content: str, studio_id?: str, studio_title?: str", _create_sketch),
+        Tool("notify", "external_post", "Send the user a notification message.",
+             "text: str", _notify),
+    ]
+}
+
+
+def planner_tool_block() -> str:
+    """The tool list as the planner prompt sees it."""
+    return "\n".join(f"- {t.name}({t.params}) [{t.action_class}]: {t.description}"
+                     for t in REGISTRY.values())
+
+
+async def execute_tool(name: str, deps: ToolDeps, args: dict) -> dict:
+    tool = REGISTRY.get(name)
+    if tool is None:
+        return {"error": f"unknown tool {name!r}"}
+    try:
+        return await tool.fn(deps, args or {})
+    except Exception as exc:  # noqa: BLE001 — tool failure is an observation, not a crash
+        log.exception("tool %s failed", name)
+        return {"error": f"{type(exc).__name__}: {exc}"}

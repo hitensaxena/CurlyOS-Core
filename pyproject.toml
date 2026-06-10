@@ -16,9 +16,6 @@ postgres = [
     "psycopg[pool]>=3.1",
     "pgvector>=0.3",
 ]
-neo4j = [
-    "neo4j>=5.0",
-]
 redis = [
     "redis>=5.0",
 ]
@@ -28,14 +25,16 @@ embeddings = [
 reranker = [
     "sentence-transformers>=3.0",
 ]
-nats = [
-    "nats-py>=2.0",
-]
 llm = [
     "openai>=1.40",
 ]
+orchestration = [
+    "langgraph>=1.2",
+    "langgraph-checkpoint-postgres==3.1.0",
+    "langchain-core>=1.0",
+]
 all = [
-    "curlyos-core[postgres,neo4j,redis,embeddings,reranker,nats,llm]",
+    "curlyos-core[postgres,redis,embeddings,reranker,llm,orchestration]",
 ]
 dev = [
     "pytest>=8.0",
@@ -50,7 +49,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["memory", "knowledge", "identity", "cognition", "studio", "simulation", "evaluation", "workspace", "shared", "hermes_integration"]
+packages = ["memory", "knowledge", "identity", "cognition", "studio", "simulation", "evaluation", "workspace", "shared", "hermes_integration", "safety", "agent", "goals", "orchestration"]
 
 [tool.ruff]
 target-version = "py311"

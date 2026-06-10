@@ -63,7 +63,33 @@ async def lifespan(app: FastAPI):
         scheduler.start()
     app.state.scheduler = scheduler
 
+    # The Executive runner (Phase A) — LangGraph + Postgres checkpointer.
+    # CURLYOS_RUNNER=0 disables (tests, machines without the orchestration extra).
+    runner = None
+    if os.environ.get("CURLYOS_RUNNER", "1").lower() not in ("0", "false", "off"):
+        try:
+            from orchestration.runner import Runner
+            from shared.notify import get_notifier as _gn
+
+            runner = Runner(
+                dsn=DSN,
+                scope=SCOPE,
+                pool_factory=lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row),
+                publisher_factory=_make_publisher_sync,
+                redis_factory=_make_redis,
+                embedder_factory=get_shared_embedder,
+                llm=_runner_llm(),
+                notifier=_gn(),
+            )
+            await runner.start()
+        except Exception:
+            logger.exception("runner failed to start — agent runs disabled")
+            runner = None
+    app.state.runner = runner
+
     yield
+    if runner is not None:
+        await runner.stop()
     if scheduler is not None:
         await scheduler.stop()
     sweep.cancel()
@@ -103,6 +129,39 @@ def _include_goal_router() -> None:
 
 
 _include_goal_router()
+
+
+def _runner_llm():
+    """The runner's LLM seam: async (system, user) -> text over the shared
+    OpenRouter client, or None (graph falls back to deterministic planning)."""
+    client, model = _make_llm_client()
+    if client is None:
+        return None
+
+    async def llm(system: str, user: str) -> str:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            temperature=0.2,
+            max_tokens=1500,
+        )
+        return resp.choices[0].message.content or ""
+
+    return llm
+
+
+def _include_agents_router() -> None:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from orchestration.api import make_router as make_agents_router
+
+    app.include_router(make_agents_router(
+        pool_factory=lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row),
+        scope=SCOPE,
+    ))
+
+
+_include_agents_router()
 
 
 @app.exception_handler(Exception)
@@ -1034,24 +1093,42 @@ async def create_human_approval(body: CreateApprovalRequest):
             "action_class": body.action_class, "ttl_seconds": ttl}
 
 
+async def _resume_after_decision(request: Request, result: dict) -> dict:
+    """Grant AND deny both wake a parked run — the act node reads the
+    approval's final state and proceeds (execute) or records the denial and
+    moves on. One resume primitive (runner.resume)."""
+    run_id = result.get("run_id")
+    runner = getattr(request.app.state, "runner", None)
+    if run_id and runner is not None:
+        try:
+            result["resumed"] = await runner.resume(run_id)
+        except Exception as e:
+            logger.exception("resume after approval decision failed run=%s", run_id)
+            result["resumed"] = False
+            result["resume_error"] = str(e)
+    return result
+
+
 @app.post("/api/approvals/{apv_id}/grant")
-async def grant_approval(apv_id: str):
-    """Grant a pending approval. (Phase A: the runner resumes any parked run_id.)"""
+async def grant_approval(apv_id: str, request: Request):
+    """Grant a pending approval; a parked run resumes and executes the action."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from agent.approval_service import grant
 
     ApprovalNotFound, ApprovalNotActionable = _approval_errors()
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
     try:
-        return await grant(pool, _make_publisher_sync(), SCOPE, apv_id)
+        result = await grant(pool, _make_publisher_sync(), SCOPE, apv_id)
     except ApprovalNotFound as e:
         raise HTTPException(404, str(e))
     except ApprovalNotActionable as e:
         raise HTTPException(409, str(e))
+    return await _resume_after_decision(request, result)
 
 
 @app.post("/api/approvals/{apv_id}/deny")
-async def deny_approval(apv_id: str, body: DenyApprovalRequest | None = None):
+async def deny_approval(apv_id: str, request: Request,
+                        body: DenyApprovalRequest | None = None):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from agent.approval_service import deny
 
@@ -1059,11 +1136,12 @@ async def deny_approval(apv_id: str, body: DenyApprovalRequest | None = None):
     body = body or DenyApprovalRequest()
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
     try:
-        return await deny(pool, _make_publisher_sync(), SCOPE, apv_id, reason=body.reason)
+        result = await deny(pool, _make_publisher_sync(), SCOPE, apv_id, reason=body.reason)
     except ApprovalNotFound as e:
         raise HTTPException(404, str(e))
     except ApprovalNotActionable as e:
         raise HTTPException(409, str(e))
+    return await _resume_after_decision(request, result)
 
 
 @app.get("/api/safety/kill")

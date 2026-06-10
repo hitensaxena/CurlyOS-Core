@@ -44,11 +44,14 @@ from safety.pdp import (
 
 log = logging.getLogger("curlyos-core.agent.pdp_gate")
 
-# Phase-A grant: the memory verbs + file_edit. Every other class is
-# deny-by-default (absent from `tools` → DENY capability_grant_missing).
-# file_edit's floor is bounded_auto, so at the Phase-A confirm_each ceiling it
-# clamps to REQUIRE_APPROVAL — writes park for approval like memory writes do.
-PHASE_A_GRANTED_TOOLS = ["read", "memory_write", "memory_forget_hard", "file_edit"]
+# Phase-A grant: the memory verbs + file_edit + external_post (the notify
+# tool — floor confirm_each for public, so it parks for approval at the
+# Phase-A ceiling). Every other class is deny-by-default (absent from `tools`
+# → DENY capability_grant_missing). file_edit's floor is bounded_auto, so at
+# the Phase-A confirm_each ceiling it clamps to REQUIRE_APPROVAL — writes
+# park for approval like memory writes do.
+PHASE_A_GRANTED_TOOLS = ["read", "memory_write", "memory_forget_hard", "file_edit",
+                         "external_post"]
 
 # Chat/runs are user-scoped (not bound to a workspace); identity only.
 _USER_SCOPE_WORKSPACE_ID = "ws_user_scope"
@@ -175,10 +178,15 @@ async def _create_approval(
     *,
     run_id: str,
     action_class: str,
-    decision: PDPDecision,
+    decision: PDPDecision | None,
     ttl: int,
+    payload: dict[str, Any] | None = None,
 ) -> str:
-    """Mint an `apv_`, INSERT the pending approvals row + emit `safety.approval.requested` atomically."""
+    """Mint an `apv_`, INSERT the pending approvals row + emit `safety.approval.requested` atomically.
+
+    `payload` is what's being approved (tool, args, plan cursor) — shown on the
+    approval card and used by the Executive's replay-safe approval lookup."""
+    from psycopg.types.json import Jsonb
     from shared.events import build_event
     from shared.types.ulid import mint
 
@@ -187,9 +195,10 @@ async def _create_approval(
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO approvals (id, run_id, origin, scope, action_class, state, expires_at) "
-                "VALUES (%s, %s, 'agent', %s, %s, 'pending', now() + make_interval(secs => %s))",
-                (apv_id, run_id, scope_text, action_class, ttl),
+                "INSERT INTO approvals (id, run_id, origin, scope, action_class, payload, state, expires_at) "
+                "VALUES (%s, %s, 'agent', %s, %s, %s, 'pending', now() + make_interval(secs => %s))",
+                (apv_id, run_id, scope_text, action_class,
+                 Jsonb(payload) if payload is not None else None, ttl),
             )
         ev = build_event(
             short_type="safety.approval.requested",
@@ -199,8 +208,9 @@ async def _create_approval(
                 "apv_id": apv_id,
                 "run_id": run_id,
                 "action_class": action_class,
-                "security_risk": decision.security_risk.value if decision.security_risk else None,
-                "policy_version": decision.policy_version,
+                "security_risk": (decision.security_risk.value
+                                  if decision and decision.security_risk else None),
+                "policy_version": decision.policy_version if decision else None,
             },
             actor=f"user:{parts['user_id']}",
             source="curlyos-core/safety",
