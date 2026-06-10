@@ -1,3 +1,3 @@
 name: curlyos
-version: 0.1.0
-description: "CurlyOS Core — HitenOS cognitive architecture for Hermes. Bi-temporal memory, knowledge graph, identity engine, meta-cognition, studio, simulation, evaluation."
+version: 0.2.0
+description: "CurlyOS Core — HitenOS cognitive architecture for Hermes. HTTP-only client over the curlyos-core API (:8643): bi-temporal memory, knowledge graph, identity engine, and agent approval grant/deny from chat."

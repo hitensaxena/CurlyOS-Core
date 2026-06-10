@@ -20,8 +20,8 @@ if [ -f "$DST/__init__.py" ]; then
 fi
 
 cp -f "$SRC/plugin.py"          "$DST/__init__.py"
-cp -f "$SRC/_import_helper.py"  "$DST/_import_helper.py"
 cp -f "$SRC/plugin.yaml"        "$DST/plugin.yaml"
+rm -f  "$DST/_import_helper.py"   # gone since the HTTP-only transport swap
 rm -rf "$DST/__pycache__"
 
 # prune old backups beyond the 3 most recent

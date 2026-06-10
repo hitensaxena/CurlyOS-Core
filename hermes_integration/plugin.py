@@ -1,7 +1,11 @@
-"""CurlyOS MemoryProvider for Hermes Agent.
+"""CurlyOS MemoryProvider for Hermes Agent — HTTP-only transport.
 
-Wraps the curlyos-core memory engine (Postgres+pgvector) as a Hermes MemoryProvider.
-This module exposes register(ctx) which calls ctx.register_memory_provider().
+Every operation goes through the curlyos-core API on :8643 (systemd unit
+`curlyos-api`). The plugin holds no database connection and imports no
+curlyos-core code: the API's venv owns the embedding model, the governance
+write path, and the event log. This venv (hermes-agent) only needs stdlib.
+
+Exposes register(ctx) which calls ctx.register_memory_provider().
 """
 from __future__ import annotations
 
@@ -9,17 +13,52 @@ import json
 import logging
 import os
 import re
-import sys
 import threading
 import time
-import asyncio
-from datetime import datetime, timezone
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_API_URL = "http://127.0.0.1:8643"
+
+# ---------------------------------------------------------------------------
+# HTTP transport
+# ---------------------------------------------------------------------------
+
+
+def _api_url() -> str:
+    return os.environ.get("CURLYOS_API_URL", DEFAULT_API_URL).rstrip("/")
+
+
+def _api(method: str, path: str, payload: Optional[dict] = None,
+         params: Optional[dict] = None, timeout: float = 30.0) -> dict:
+    """One round-trip to curlyos-core. HTTP errors raise RuntimeError carrying
+    the server's detail message — 404/409 are meaningful (not found / already
+    decided) and get relayed to the model verbatim."""
+    url = _api_url() + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Content-Type": "application/json"} if data is not None else {},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read().decode()).get("detail", "")
+        except Exception:
+            detail = ""
+        raise RuntimeError(f"HTTP {e.code} {path}: {detail or e.reason}") from None
+
 
 # ---------------------------------------------------------------------------
 # Tool schemas
@@ -111,12 +150,50 @@ IDENTITY_SCHEMA = {
     },
 }
 
+PENDING_APPROVALS_SCHEMA = {
+    "name": "curlyos_pending_approvals",
+    "description": (
+        "List CurlyOS approvals waiting on Hiten — agent actions parked until a "
+        "human grants or denies them. Use when Hiten asks what's pending, or to "
+        "find the apv_ id before curlyos_approve / curlyos_deny."
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
 
-def _now_iso():
-    return datetime.now(timezone.utc).isoformat()
+APPROVE_SCHEMA = {
+    "name": "curlyos_approve",
+    "description": (
+        "Grant a pending CurlyOS approval — the parked agent run resumes and "
+        "executes the gated action. ONLY call this when Hiten explicitly says to "
+        "approve/grant (e.g. 'approve apv_…'). Never approve on your own judgment. "
+        "If Hiten says 'approve' without an id, list pending approvals first and "
+        "confirm which one he means unless exactly one is pending."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "apv_id": {"type": "string", "description": "Approval id (apv_…)."},
+        },
+        "required": ["apv_id"],
+    },
+}
 
-def _today_iso():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+DENY_SCHEMA = {
+    "name": "curlyos_deny",
+    "description": (
+        "Deny a pending CurlyOS approval — the parked agent run resumes, records "
+        "the denial, and skips the gated action. ONLY call this when Hiten "
+        "explicitly says to deny/reject."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "apv_id": {"type": "string", "description": "Approval id (apv_…)."},
+            "reason": {"type": "string", "description": "Why it was denied (optional)."},
+        },
+        "required": ["apv_id"],
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -124,35 +201,42 @@ def _today_iso():
 # ---------------------------------------------------------------------------
 
 class CurlyOSMemoryProvider(MemoryProvider):
-    """Direct Postgres+pgvector memory provider using CurlyOS Core."""
+    """HTTP client over the curlyos-core API (:8643)."""
 
     def __init__(self):
-        self._dsn = ""
-        self._pool = None
-        self._loop = None
         self._session_id = ""
-        self._session_episode_id: Optional[str] = None
         self._scope_text = "user:usr_hiten"
         self._turn_count = 0
         self._consolidation_turn_count = 0
         self._auto_record = True
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
+        self._available: Optional[bool] = None
+        self._available_at = 0.0
 
     @property
     def name(self) -> str:
         return "curlyos"
 
     def is_available(self) -> bool:
-        return bool(os.environ.get("CURLYOS_DATABASE_URL", ""))
+        """Probe /api/health (cached 60s). The API being down means no memory
+        this session — honest, and the only mode HTTP-only transport has."""
+        now = time.monotonic()
+        if self._available is not None and now - self._available_at < 60:
+            return self._available
+        try:
+            _api("GET", "/api/health", timeout=2)
+            self._available = True
+        except Exception as e:
+            logger.debug("CurlyOS API unreachable at %s: %s", _api_url(), e)
+            self._available = False
+        self._available_at = now
+        return self._available
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        self._dsn = os.environ.get("CURLYOS_DATABASE_URL", "")
         self._session_id = session_id
-        self._session_episode_id = None
         self._turn_count = 0
         self._consolidation_turn_count = 0
-        self._api_thread = None
         # Single-user deployment: all memory is owned by Hiten. The gateway
         # passes the platform user_id (e.g. the numeric Telegram ID), which
         # would fork reads/writes into an empty phantom scope. Pin to a
@@ -162,41 +246,8 @@ class CurlyOSMemoryProvider(MemoryProvider):
         canonical_user = os.environ.get("CURLYOS_CANONICAL_USER", "hiten")
         user_id = canonical_user or platform_user_id or "hiten"
         self._scope_text = f"user:usr_{user_id}"
-        logger.info("CurlyOS scope pinned to %s (platform_user_id=%r)",
-                    self._scope_text, platform_user_id)
-        logger.info("CurlyOS provider initialized: scope=%s session=%s", self._scope_text, session_id)
-
-        # Ensure curlyos-core is on sys.path for api_server imports
-        curlyos_path = os.path.join(os.path.expanduser("~"), "curlyos-core")
-        if curlyos_path not in sys.path:
-            sys.path.insert(0, curlyos_path)
-
-        # Eagerly load all curlyos-core subpackages into sys.modules so that
-        # later imports inside handle_tool_call (which runs in a different
-        # import context) resolve correctly.
-        if self._dsn:
-            try:
-                self._import_curlyos()
-            except Exception as e:
-                logger.debug("CurlyOS eager import during init failed (will retry on tool call): %s", e)
-
-        # Start API server in background thread (optional — only if deps available)
-        api_port = int(os.environ.get("CURLYOS_API_PORT", "8643"))
-        try:
-            import threading
-
-            def _run_api():
-                import uvicorn
-                from api_server import app
-                uvicorn.run(app, host="127.0.0.1", port=api_port, log_level="warning")
-
-            self._api_thread = threading.Thread(target=_run_api, daemon=True, name="curlyos-api")
-            self._api_thread.start()
-            logger.info("CurlyOS API server started on port %d", api_port)
-        except ImportError as e:
-            logger.info("CurlyOS API server not started (dependency missing: %s) — optional, continuing", e)
-        except Exception as e:
-            logger.warning("Failed to start CurlyOS API server: %s", e)
+        logger.info("CurlyOS provider initialized: scope=%s session=%s api=%s reachable=%s",
+                    self._scope_text, session_id, _api_url(), self.is_available())
 
     def system_prompt_block(self) -> str:
         return (
@@ -207,260 +258,157 @@ class CurlyOSMemoryProvider(MemoryProvider):
             "- curlyos_add_note: store longer notes / reference material\n"
             "- curlyos_invalidate: soft-invalidate outdated facts (never deletes)\n"
             "- curlyos_identity: query Hiten's stable self-model\n"
+            "- curlyos_pending_approvals / curlyos_approve / curlyos_deny: agent "
+            "actions parked for Hiten's sign-off ('CurlyOS run … needs approval' "
+            "messages). Grant or deny ONLY on Hiten's explicit instruction.\n"
             "Facts are invalidated-not-deleted. Always check curlyos_recall first."
         )
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [RECALL_SCHEMA, ADD_FACT_SCHEMA, ADD_NOTE_SCHEMA, INVALIDATE_SCHEMA, IDENTITY_SCHEMA]
+        return [RECALL_SCHEMA, ADD_FACT_SCHEMA, ADD_NOTE_SCHEMA, INVALIDATE_SCHEMA,
+                IDENTITY_SCHEMA, PENDING_APPROVALS_SCHEMA, APPROVE_SCHEMA, DENY_SCHEMA]
 
     def get_config_schema(self):
         return [
-            {"key": "database_url", "description": "PostgreSQL DSN", "required": True, "env_var": "CURLYOS_DATABASE_URL"},
-            {"key": "redis_url", "description": "Redis URL", "env_var": "CURLYOS_REDIS_URL"},
+            {"key": "api_url", "description": "curlyos-core API base URL",
+             "env_var": "CURLYOS_API_URL", "default": DEFAULT_API_URL},
         ]
 
-    def _run_async(self, coro):
-        """Run an async coroutine from sync context."""
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                result = [None, None]
-                def _run():
-                    try:
-                        result[0] = asyncio.run(coro)
-                    except Exception as e:
-                        result[1] = e
-                t = threading.Thread(target=_run, daemon=True)
-                t.start()
-                t.join(timeout=15)
-                if result[1]:
-                    raise result[1]
-                return result[0]
-            else:
-                return loop.run_until_complete(coro)
-        except RuntimeError:
-            return asyncio.run(coro)
+    # ── write helper ─────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _curlyos_path():
-        """Return the absolute path to curlyos-core."""
-        return os.path.join(os.path.expanduser("~"), "curlyos-core")
+    def _ingest(self, text: str, source_ref: str, *, add_memory: bool = True,
+                extract_knowledge: bool = True, kind: str = "fact",
+                epistemic_status: str = "canonical") -> dict:
+        """Record via the governance path: episode + (optionally) a recallable
+        memory + background knowledge extraction. Returns {epi_id, mem_id?} or
+        {error} — /api/ingest reports write failures in-band, not as HTTP errors."""
+        return _api("POST", "/api/ingest", {
+            "text": text, "source_ref": source_ref, "scope": self._scope_text,
+            "add_memory": add_memory, "extract_knowledge": extract_knowledge,
+            "kind": kind, "epistemic_status": epistemic_status,
+        })
 
-    def _import_curlyos(self):
-        """Import CurlyOS Core modules, ensuring sys.path is set and caches are clean."""
-        import importlib
-        import importlib.util
-        import sys
-        path = self._curlyos_path()
-
-        if path not in sys.path:
-            sys.path.insert(0, path)
-
-        _prefixes = ("memory.", "shared.", "identity.", "cognition.")
-        _stale = [k for k in sys.modules
-                  if any(k.startswith(p) for p in _prefixes)]
-        for _extra in ("memory", "shared", "identity", "cognition"):
-            if _extra in sys.modules:
-                _stale.append(_extra)
-        for _key in _stale:
-            del sys.modules[_key]
-
-        _pkg_map = {
-            "memory":                 "memory/__init__.py",
-            "memory.governance":      "memory/governance/__init__.py",
-            "memory.retrieval":       "memory/retrieval/__init__.py",
-            "memory.consolidation":   "memory/consolidation/__init__.py",
-            "shared":                 "shared/__init__.py",
-            "shared.types":           "shared/types/__init__.py",
-            "shared.events":          "shared/events/__init__.py",
-            "shared.events.implementations": "shared/events/implementations/__init__.py",
-            "shared.embeddings":      "shared/embeddings/__init__.py",
-            "shared.embeddings.implementations": "shared/embeddings/implementations/__init__.py",
-            "identity":               "identity/__init__.py",
-            "cognition":              "cognition/__init__.py",
-            "cognition.reflection":   "cognition/reflection/__init__.py",
-        }
-        for _mod_name, _rel_path in _pkg_map.items():
-            _file = os.path.join(path, _rel_path)
-            if os.path.isfile(_file):
-                _spec = importlib.util.spec_from_file_location(
-                    _mod_name, _file,
-                    submodule_search_locations=[os.path.dirname(_file)],
-                )
-                _mod = importlib.util.module_from_spec(_spec)
-                sys.modules[_mod_name] = _mod
-                _spec.loader.exec_module(_mod)
-
-        from memory.governance import record_episode, add, invalidate, list_memories
-        from memory.retrieval import retrieve as mem_retrieve
-        from identity import get_identity_context, propose_identity_fact
-        from shared.types import RetrievalRequest
-        from shared.events.implementations import PgOnlyPublisher
-        from shared.embeddings.implementations import LocalBgeM3, FakeReranker
-        return (
-            record_episode, add, invalidate, list_memories,
-            mem_retrieve, get_identity_context, propose_identity_fact,
-            RetrievalRequest, PgOnlyPublisher, LocalBgeM3, FakeReranker,
-        )
-
-    def _make_sync_pool(self, dsn):
-        """Create a synchronous wrapper around psycopg for async-style usage."""
-        import psycopg
-
-        class SyncPool:
-            def __init__(self, dsn):
-                self._dsn = dsn
-            def connection(self):
-                return SyncPool._CtxMgr(self._dsn)
-
-            class _CtxMgr:
-                def __init__(self, dsn):
-                    self._dsn = dsn
-                    self._conn = None
-                async def __aenter__(self):
-                    self._conn = psycopg.connect(self._dsn, autocommit=False)
-                    return SyncPool._ConnWrap(self._conn)
-                async def __aexit__(self, *a):
-                    if self._conn:
-                        self._conn.commit()
-                        self._conn.close()
-
-            class _ConnWrap:
-                def __init__(self, c):
-                    self._c = c
-                def cursor(self):
-                    return SyncPool._CurCtx(self._c)
-
-            class _CurCtx:
-                def __init__(self, c):
-                    self._c = c
-                async def __aenter__(self):
-                    return SyncPool._CurAdapt(self._c.cursor())
-                async def __aexit__(self, *a):
-                    pass
-
-            class _CurAdapt:
-                def __init__(self, c):
-                    self._c = c
-                async def execute(self, q, p=None):
-                    self._c.execute(q, p)
-                async def fetchone(self):
-                    return self._c.fetchone()
-                async def fetchall(self):
-                    return self._c.fetchall()
-
-        return SyncPool(dsn)
+    # ── tools ────────────────────────────────────────────────────────────────
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
-        if not self._dsn:
-            return json.dumps({"error": "CURLYOS_DATABASE_URL not set"})
-
         try:
-            (
-                record_episode, add, invalidate_op, list_memories,
-                mem_retrieve, get_identity_context, propose_identity_fact,
-                RetrievalRequest, PgOnlyPublisher, LocalBgeM3, FakeReranker,
-            ) = self._import_curlyos()
-
-            pool = self._make_sync_pool(self._dsn)
-            pub = PgOnlyPublisher()
-
             if tool_name == "curlyos_recall":
-                query = args.get("query", "")
-                k = min(int(args.get("k", 6)), 20)
-                mode = args.get("mode", "fast")
-                # Semantic recall needs query embedding (sentence_transformers),
-                # which THIS plugin's venv (hermes-agent) does NOT have. Running
-                # LocalBgeM3 in-process either errors (no torch/ST) or — worse —
-                # silently returns zero vectors (FakeEmbedder), which makes every
-                # pgvector distance equal so rows come back in ULID order and the
-                # ranking is garbage. So we route recall through the curlyos-core
-                # API (:8643), which runs in a venv that HAS the model warm.
-                import urllib.request
-                api_url = os.environ.get(
-                    "CURLYOS_API_URL", "http://127.0.0.1:8643").rstrip("/")
-                try:
-                    payload = json.dumps({
-                        "query": query, "scope": self._scope_text,
-                        "mode": mode, "k": k,
-                    }).encode()
-                    req = urllib.request.Request(
-                        api_url + "/api/recall", data=payload,
-                        headers={"Content-Type": "application/json"})
-                    with urllib.request.urlopen(req, timeout=30) as resp:
-                        data = json.loads(resp.read().decode())
-                    if data.get("error"):
-                        raise RuntimeError(data["error"])
-                    return json.dumps({
-                        "results": data.get("results", [])[:k],
-                        "count": data.get("count", len(data.get("results", []))),
-                    })
-                except Exception as e:
-                    # Fallback: keyword full-text search via API (no embedding).
-                    try:
-                        import urllib.parse
-                        qs = urllib.parse.urlencode({
-                            "q": query, "scope": self._scope_text, "limit": k})
-                        with urllib.request.urlopen(
-                                api_url + "/api/search?" + qs, timeout=15) as resp:
-                            data = json.loads(resp.read().decode())
-                        items = [{
-                            "id": it.get("id"),
-                            "text": (it.get("statement") or "")[:200],
-                            "score": it.get("score", 0.0),
-                            "tier": it.get("kind", "fact"),
-                            "epistemic_status": it.get("epistemic_status", "canonical"),
-                        } for it in data.get("items", [])]
-                        return json.dumps({
-                            "results": items, "count": len(items),
-                            "fallback": "keyword"})
-                    except Exception as e2:
-                        return json.dumps({
-                            "error": f"recall via API failed: {e}; "
-                                     f"keyword fallback failed: {e2}",
-                            "results": [], "count": 0})
+                return self._tool_recall(args)
 
             elif tool_name == "curlyos_add_fact":
                 statement = args.get("statement", "")
-                valid_from = args.get("valid_from") or _today_iso()
-                if not self._session_episode_id:
-                    epi = self._run_async(record_episode(pool, pub, self._scope_text,
-                        content=f"Session context: {statement[:200]}", source_ref="hermes"))
-                    self._session_episode_id = epi["epi_id"]
-                ref = self._run_async(add(pool, pub, self._scope_text,
-                    statement=statement, source_episode_id=self._session_episode_id))
-                return json.dumps({"result": "Fact stored.", "id": ref["mem_id"],
-                                   "valid_from": valid_from})
+                res = self._ingest(statement, f"hermes:{self._session_id}:fact")
+                if res.get("error"):
+                    return tool_error(f"CurlyOS error: {res['error']}")
+                return json.dumps({"result": "Fact stored.", "id": res.get("mem_id"),
+                                   "episode": res.get("epi_id")})
 
             elif tool_name == "curlyos_add_note":
                 content = args.get("content", "")
-                if not self._session_episode_id:
-                    epi = self._run_async(record_episode(pool, pub, self._scope_text,
-                        content=content[:200], source_ref="hermes"))
-                    self._session_episode_id = epi["epi_id"]
-                ref = self._run_async(add(pool, pub, self._scope_text,
-                    statement=content, source_episode_id=self._session_episode_id,
-                    kind="procedure"))
-                return json.dumps({"result": "Note stored.", "id": ref["mem_id"]})
+                title = args.get("title", "")
+                text = f"{title}\n\n{content}" if title else content
+                res = self._ingest(text, f"hermes:{self._session_id}:note",
+                                   kind="procedure")
+                if res.get("error"):
+                    return tool_error(f"CurlyOS error: {res['error']}")
+                return json.dumps({"result": "Note stored.", "id": res.get("mem_id")})
 
             elif tool_name == "curlyos_invalidate":
                 mem_id = args.get("mem_id", "")
                 reason = args.get("reason", "")
-                sup = args.get("superseded_by")
-                result = self._run_async(invalidate_op(pool, pub, self._scope_text,
-                    mem_id=mem_id, superseded_by=sup, reason=reason))
-                return json.dumps({"result": "Fact invalidated.", "valid_to": str(result.get("valid_to", ""))})
+                res = _api("POST", f"/api/memories/{mem_id}/invalidate",
+                           {"reason": reason}, timeout=15)
+                return json.dumps({"result": "Fact invalidated.",
+                                   "valid_to": res.get("valid_to", "")})
 
             elif tool_name == "curlyos_identity":
                 predicates = args.get("predicates")
-                ctx = self._run_async(get_identity_context(pool, self._scope_text,
-                    predicates=predicates))
-                return json.dumps({"identity": ctx})
+                params = {"predicates": ",".join(predicates)} if predicates else None
+                data = _api("GET", "/api/identity", params=params, timeout=15)
+                identity = [
+                    {"predicate": it.get("predicate"), "object": it.get("object"),
+                     "confidence": it.get("confidence")}
+                    for it in data.get("items", [])
+                ]
+                return json.dumps({"identity": identity, "count": len(identity)})
+
+            elif tool_name == "curlyos_pending_approvals":
+                data = _api("GET", "/api/approvals", timeout=15)
+                items = [
+                    {"apv_id": it.get("apv_id"), "action_class": it.get("action_class"),
+                     "origin": it.get("origin"), "run_id": it.get("run_id"),
+                     "payload": json.dumps(it.get("payload") or {})[:300],
+                     "expires_at": it.get("expires_at")}
+                    for it in data.get("items", [])
+                ]
+                return json.dumps({"pending": items, "count": len(items)})
+
+            elif tool_name == "curlyos_approve":
+                apv_id = (args.get("apv_id") or "").strip()
+                if not apv_id.startswith("apv_"):
+                    return tool_error(
+                        "curlyos_approve needs an explicit apv_… id — "
+                        "use curlyos_pending_approvals to find it")
+                data = _api("POST", f"/api/approvals/{apv_id}/grant", timeout=30)
+                return json.dumps({"result": "Approval granted.",
+                                   "apv_id": data.get("apv_id"),
+                                   "action_class": data.get("action_class"),
+                                   "run_id": data.get("run_id"),
+                                   "run_resumed": data.get("resumed", False)})
+
+            elif tool_name == "curlyos_deny":
+                apv_id = (args.get("apv_id") or "").strip()
+                if not apv_id.startswith("apv_"):
+                    return tool_error(
+                        "curlyos_deny needs an explicit apv_… id — "
+                        "use curlyos_pending_approvals to find it")
+                data = _api("POST", f"/api/approvals/{apv_id}/deny",
+                            {"reason": (args.get("reason") or "user_denied")[:500]},
+                            timeout=30)
+                return json.dumps({"result": "Approval denied.",
+                                   "apv_id": data.get("apv_id"),
+                                   "action_class": data.get("action_class"),
+                                   "run_id": data.get("run_id"),
+                                   "run_resumed": data.get("resumed", False)})
 
             return tool_error(f"Unknown tool: {tool_name}")
         except Exception as e:
             logger.error("CurlyOS tool error: %s", e, exc_info=True)
             return tool_error(f"CurlyOS error: {e}")
+
+    def _tool_recall(self, args: dict) -> str:
+        query = args.get("query", "")
+        k = min(int(args.get("k", 6)), 20)
+        mode = args.get("mode", "fast")
+        try:
+            data = _api("POST", "/api/recall", {
+                "query": query, "scope": self._scope_text, "mode": mode, "k": k})
+            if data.get("error"):
+                raise RuntimeError(data["error"])
+            return json.dumps({
+                "results": data.get("results", [])[:k],
+                "count": data.get("count", len(data.get("results", []))),
+            })
+        except Exception as e:
+            # Fallback: keyword full-text search (no embedding involved).
+            try:
+                data = _api("GET", "/api/search",
+                            params={"q": query, "scope": self._scope_text, "limit": k},
+                            timeout=15)
+                items = [{
+                    "id": it.get("id"),
+                    "text": (it.get("statement") or "")[:200],
+                    "score": it.get("score", 0.0),
+                    "tier": it.get("kind", "fact"),
+                    "epistemic_status": it.get("epistemic_status", "canonical"),
+                } for it in data.get("items", [])]
+                return json.dumps({"results": items, "count": len(items),
+                                   "fallback": "keyword"})
+            except Exception as e2:
+                return json.dumps({
+                    "error": f"recall via API failed: {e}; "
+                             f"keyword fallback failed: {e2}",
+                    "results": [], "count": 0})
 
     # ════════════════════════════════════════════════════════════════════════
     # Autonomous Operation Hooks
@@ -474,13 +422,9 @@ class CurlyOSMemoryProvider(MemoryProvider):
         """
         if not query.strip():
             return ""
-        if not self._dsn:
-            return ""
         try:
             with self._prefetch_lock:
-                cached = self._prefetch_result
-            if cached:
-                return cached
+                return self._prefetch_result
         except Exception as e:
             logger.debug("prefetch cache read failed: %s", e)
         return ""
@@ -489,31 +433,18 @@ class CurlyOSMemoryProvider(MemoryProvider):
         """Queue a background recall for the NEXT turn.
 
         Called after each turn completes. Starts a background thread that
-        calls curlyos_recall and stores the formatted result in
+        calls /api/recall and stores the formatted result in
         self._prefetch_result, which prefetch() will read at the start
         of the next turn.
         """
         if not query.strip():
             return
-        if not self._dsn:
-            return
 
         def _background_recall():
             try:
-                # Route through the curlyos-core API (:8643) — recall needs the
-                # embedding model, which this venv lacks. See curlyos_recall.
-                import urllib.request
-                api_url = os.environ.get(
-                    "CURLYOS_API_URL", "http://127.0.0.1:8643").rstrip("/")
-                payload = json.dumps({
+                data = _api("POST", "/api/recall", {
                     "query": query, "scope": self._scope_text,
-                    "mode": "fast", "k": 6,
-                }).encode()
-                req = urllib.request.Request(
-                    api_url + "/api/recall", data=payload,
-                    headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    data = json.loads(resp.read().decode())
+                    "mode": "fast", "k": 6})
                 items = data.get("results", [])[:6]
                 if data.get("error") or not items:
                     with self._prefetch_lock:
@@ -543,42 +474,8 @@ class CurlyOSMemoryProvider(MemoryProvider):
         t.start()
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        """Called at the start of each turn with the user message.
-
-        Increments internal turn counter, periodically logs status,
-        and every 10 turns runs a quick consolidation check.
-        """
         self._turn_count += 1
         logger.debug("CurlyOS on_turn_start: turn=%d turn_count=%d", turn_number, self._turn_count)
-
-        if self._turn_count % 10 == 0:
-            self._run_consolidation_check()
-
-    def _run_consolidation_check(self):
-        """Quick consolidation check — count pending events and log status."""
-        if not self._dsn:
-            return
-        try:
-            pool = self._make_sync_pool(self._dsn)
-
-            async def _check():
-                async with pool.connection() as conn:
-                    async with conn.cursor() as cur:
-                        await cur.execute(
-                            "SELECT COUNT(*) FROM events "
-                            "WHERE scope = %s AND seq > COALESCE("
-                            "  (SELECT MIN(last_seq) FROM projection_watermarks "
-                            "   WHERE scope = %s), 0)",
-                            (self._scope_text, self._scope_text),
-                        )
-                        row = await cur.fetchone()
-                        return row[0] if row else 0
-
-            pending = self._run_async(_check())
-            logger.info("CurlyOS consolidation check (turn=%d): %d unconsolidated events for scope %s",
-                        self._turn_count, pending, self._scope_text)
-        except Exception as e:
-            logger.debug("CurlyOS consolidation check failed: %s", e)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Called when a session ends (explicit exit or timeout).
@@ -587,7 +484,7 @@ class CurlyOSMemoryProvider(MemoryProvider):
         episode, proposes identity facts, and triggers fast-path
         consolidation.
         """
-        if not self._dsn or not messages:
+        if not messages:
             return
 
         logger.info("CurlyOS on_session_end: processing %d messages", len(messages))
@@ -659,37 +556,27 @@ class CurlyOSMemoryProvider(MemoryProvider):
 
         # ── Step 3: Record session-end episode and write facts ──
         try:
-            (
-                record_episode, add, invalidate_op, list_memories,
-                mem_retrieve, get_identity_ctx, propose_identity_fact,
-                RetrievalRequest, PgOnlyPublisher, LocalBgeM3, FakeReranker,
-            ) = self._import_curlyos()
-            pool = self._make_sync_pool(self._dsn)
-            pub = PgOnlyPublisher()
-
-            # Record session-end episode
-            epi = self._run_async(record_episode(pool, pub, self._scope_text,
-                content=summary[:2000], source_ref=f"hermes:{self._session_id}:session_end"))
+            epi = self._ingest(summary[:2000],
+                               f"hermes:{self._session_id}:session_end",
+                               add_memory=False, extract_knowledge=False)
             epi_id = epi.get("epi_id")
 
-            # Write identity facts
+            # Identity facts go through the governance path (conflict
+            # resolution + supersession live in the identity module).
             for predicate, obj, tag in unique_idf:
                 try:
-                    self._run_async(propose_identity_fact(
-                        pool, pub, self._scope_text,
-                        predicate=predicate,
-                        object=obj,
-                        confidence=0.8,
-                        source_episode_id=epi_id,
-                    ))
+                    _api("POST", "/api/identity", {
+                        "predicate": predicate, "object": obj,
+                        "confidence": 0.8,
+                        "source_episode_id": epi_id or ""}, timeout=20)
                 except Exception as e:
                     logger.debug("Failed to propose identity fact (%s=%s): %s", predicate, obj, e)
 
             # Write semantic facts
             for stmt in semantic_facts:
                 try:
-                    self._run_async(add(pool, pub, self._scope_text,
-                        statement=stmt, source_episode_id=epi_id))
+                    self._ingest(stmt, f"hermes:{self._session_id}:session_end",
+                                 extract_knowledge=False)
                 except Exception as e:
                     logger.debug("Failed to write semantic fact: %s", e)
 
@@ -702,70 +589,17 @@ class CurlyOSMemoryProvider(MemoryProvider):
         self._trigger_async_consolidation()
 
     def _trigger_async_consolidation(self):
-        """Run fast-path consolidation in a background thread (non-blocking)."""
-        if not self._dsn:
-            return
-
+        """Run fast-path consolidation via the API in a background thread."""
         def _run():
             try:
-                from memory.consolidation import run_consolidation
-                import redis.asyncio as aioredis
-
-                (
-                    record_episode, add, invalidate_op, list_memories,
-                    mem_retrieve, get_identity_ctx, propose_identity_fact,
-                    RetrievalRequest, PgOnlyPublisher, LocalBgeM3, FakeReranker,
-                ) = self._import_curlyos()
-                pool = self._make_sync_pool(self._dsn)
-                pub = PgOnlyPublisher()
-
-                # Try Redis, fall back to FakeRedis
-                redis_url = os.environ.get("CURLYOS_REDIS_URL", "")
-                if redis_url:
-                    redis_client = aioredis.from_url(redis_url)
-                else:
-                    from memory.consolidation.scheduler import FakeRedis
-                    redis_client = None  # will create inline
-
-                loop = asyncio.new_event_loop()
-                try:
-                    if redis_client is None:
-                        # Inline FakeRedis
-                        class FakeRedis:
-                            def __init__(self): self._data = {}
-                            async def set(self, k, v, nx=False, px=None):
-                                if nx and k in self._data: return False
-                                self._data[k] = v; return True
-                            async def get(self, k): return self._data.get(k)
-                            async def delete(self, *keys):
-                                for k in keys: self._data.pop(k, None)
-                            async def hset(self, n, k, v):
-                                if n not in self._data: self._data[n] = {}
-                                self._data[n][k] = v
-                            async def hdel(self, n, *keys):
-                                for k in keys: self._data.get(n, {}).pop(k, None)
-                            async def scan_iter(self, match=None):
-                                import fnmatch
-                                for k in self._data:
-                                    if match is None or fnmatch.fnmatch(k, match): yield k
-                            async def keys(self, pattern=None):
-                                import fnmatch
-                                if pattern: return [k for k in self._data if fnmatch.fnmatch(k, pattern)]
-                                return list(self._data.keys())
-                        redis_client = FakeRedis()
-
-                    result = loop.run_until_complete(run_consolidation(
-                        pool, redis_client, LocalBgeM3(), pub, FakeReranker(),
-                        scope=self._scope_text, deep=False,
-                    ))
-                    scopes = result.get("scopes", [])
-                    total_processed = sum(
-                        s.get("projection", {}).get("processed", 0) for s in scopes
-                    )
-                    logger.info("CurlyOS async consolidation complete: %d events processed across %d scopes",
-                                total_processed, len(scopes))
-                finally:
-                    loop.close()
+                res = _api("POST", "/api/consolidation/run",
+                           {"mode": "fast", "scope": self._scope_text}, timeout=300)
+                scopes = res.get("scopes", [])
+                total_processed = sum(
+                    s.get("projection", {}).get("processed", 0) for s in scopes
+                ) if isinstance(scopes, list) else 0
+                logger.info("CurlyOS async consolidation complete: %d events processed across %d scopes",
+                            total_processed, len(scopes) if isinstance(scopes, list) else 0)
             except Exception as e:
                 logger.warning("CurlyOS async consolidation failed (non-fatal): %s", e)
 
@@ -781,7 +615,7 @@ class CurlyOSMemoryProvider(MemoryProvider):
         Returns empty string (the insights are in the DB, not needed in
         the compression prompt).
         """
-        if not self._dsn or not messages:
+        if not messages:
             return ""
 
         try:
@@ -806,26 +640,14 @@ class CurlyOSMemoryProvider(MemoryProvider):
             if not insights:
                 return ""
 
-            # Write as hypothesis memories
-            (
-                record_episode, add, invalidate_op, list_memories,
-                mem_retrieve, get_identity_ctx, propose_identity_fact,
-                RetrievalRequest, PgOnlyPublisher, LocalBgeM3, FakeReranker,
-            ) = self._import_curlyos()
-            pool = self._make_sync_pool(self._dsn)
-            pub = PgOnlyPublisher()
-
-            # Record a compression episode
-            epi = self._run_async(record_episode(pool, pub, self._scope_text,
-                content=f"Pre-compression extraction: {len(insights)} insights from {len(messages)} messages",
-                source_ref=f"hermes:{self._session_id}:pre_compress"))
-            epi_id = epi.get("epi_id")
-
-            for insight in insights[:5]:  # cap at 5 to avoid spam
+            # Each insight is its own episode+hypothesis memory (cap 5).
+            # Hypothesis status keeps them out of default recall.
+            for insight in insights[:5]:
                 try:
-                    self._run_async(add(pool, pub, self._scope_text,
-                        statement=insight, source_episode_id=epi_id,
-                        epistemic_status="hypothesis"))
+                    self._ingest(insight,
+                                 f"hermes:{self._session_id}:pre_compress",
+                                 extract_knowledge=False,
+                                 epistemic_status="hypothesis")
                 except Exception as e:
                     logger.debug("Failed to write pre-compress insight: %s", e)
 
@@ -851,38 +673,22 @@ class CurlyOSMemoryProvider(MemoryProvider):
         - action='replace'              → invalidate old, add new
         - action='remove'               → invalidate
         """
-        if not self._dsn or not content.strip():
+        if not content.strip():
             return
 
         try:
-            (
-                record_episode, add, invalidate_op, list_memories,
-                mem_retrieve, get_identity_ctx, propose_identity_fact,
-                RetrievalRequest, PgOnlyPublisher, LocalBgeM3, FakeReranker,
-            ) = self._import_curlyos()
-            pool = self._make_sync_pool(self._dsn)
-            pub = PgOnlyPublisher()
-
             if action == "add":
                 if target == "memory":
-                    # Store as a semantic fact
-                    epi = self._run_async(record_episode(pool, pub, self._scope_text,
-                        content=f"Memory: {content[:200]}", source_ref="hermes:builtin_memory"))
-                    self._run_async(add(pool, pub, self._scope_text,
-                        statement=content, source_episode_id=epi["epi_id"]))
+                    self._ingest(content, "hermes:builtin_memory",
+                                 extract_knowledge=False)
                     logger.debug("CurlyOS on_memory_write: stored semantic fact (%d chars)", len(content))
 
                 elif target == "user":
-                    # Store as identity fact (preference/self-model)
-                    epi = self._run_async(record_episode(pool, pub, self._scope_text,
-                        content=f"User fact: {content[:200]}", source_ref="hermes:builtin_memory"))
-                    self._run_async(propose_identity_fact(
-                        pool, pub, self._scope_text,
-                        predicate="stated_preference",
-                        object=content,
-                        confidence=0.9,
-                        source_episode_id=epi["epi_id"],
-                    ))
+                    # /api/identity records its own provenance episode when
+                    # source_episode_id is empty.
+                    _api("POST", "/api/identity", {
+                        "predicate": "stated_preference", "object": content,
+                        "confidence": 0.9, "source_episode_id": ""}, timeout=20)
                     logger.debug("CurlyOS on_memory_write: stored identity fact (%d chars)", len(content))
 
             elif action == "replace":
@@ -890,48 +696,36 @@ class CurlyOSMemoryProvider(MemoryProvider):
                 metadata = metadata or {}
                 old_content = metadata.get("old_content", "")
                 if old_content:
-                    try:
-                        result = self._run_async(
-                            list_memories(pool, self._scope_text, min_similarity=0.85)
-                        )
-                        for mem in getattr(result, "items", []):
-                            if mem.text and old_content[:80] in mem.text:
-                                self._run_async(invalidate_op(
-                                    pool, pub, self._scope_text,
-                                    mem_id=mem.id,
-                                    reason="Replaced via built-in memory tool",
-                                ))
-                                break
-                    except Exception as e:
-                        logger.debug("Failed to invalidate old memory for replace: %s", e)
-
-                # Add new
-                epi = self._run_async(record_episode(pool, pub, self._scope_text,
-                    content=f"Memory (replaced): {content[:200]}", source_ref="hermes:builtin_memory"))
-                self._run_async(add(pool, pub, self._scope_text,
-                    statement=content, source_episode_id=epi["epi_id"]))
+                    self._invalidate_by_content(old_content,
+                                                "Replaced via built-in memory tool")
+                self._ingest(content, "hermes:builtin_memory",
+                             extract_knowledge=False)
                 logger.debug("CurlyOS on_memory_write: replaced memory fact")
 
             elif action == "remove":
-                # Invalidate by content match
-                try:
-                    result = self._run_async(
-                        list_memories(pool, self._scope_text, min_similarity=0.85)
-                    )
-                    for mem in getattr(result, "items", []):
-                        if mem.text and content[:80] in mem.text:
-                            self._run_async(invalidate_op(
-                                pool, pub, self._scope_text,
-                                mem_id=mem.id,
-                                reason="Removed via built-in memory tool",
-                            ))
-                            logger.debug("CurlyOS on_memory_write: invalidated memory fact")
-                            break
-                except Exception as e:
-                    logger.debug("Failed to invalidate memory for remove: %s", e)
+                if self._invalidate_by_content(content,
+                                               "Removed via built-in memory tool"):
+                    logger.debug("CurlyOS on_memory_write: invalidated memory fact")
 
         except Exception as e:
             logger.warning("CurlyOS on_memory_write failed (non-fatal): %s", e)
+
+    def _invalidate_by_content(self, content: str, reason: str) -> bool:
+        """Find a current memory whose statement contains the given content
+        (keyword search) and soft-invalidate it. Best-effort."""
+        try:
+            data = _api("GET", "/api/search",
+                        params={"q": content[:80], "scope": self._scope_text,
+                                "limit": 5}, timeout=15)
+            for it in data.get("items", []):
+                stmt = it.get("statement") or ""
+                if it.get("id") and content[:80] in stmt:
+                    _api("POST", f"/api/memories/{it['id']}/invalidate",
+                         {"reason": reason}, timeout=15)
+                    return True
+        except Exception as e:
+            logger.debug("Failed to invalidate by content match: %s", e)
+        return False
 
     def on_delegation(
         self,
@@ -946,30 +740,18 @@ class CurlyOSMemoryProvider(MemoryProvider):
         Records the delegation as an episode and extracts any facts
         from the subagent's result.
         """
-        if not self._dsn:
-            return
-
         logger.info("CurlyOS on_delegation: child_session=%s task=%.60s", child_session_id or "?", task)
 
         try:
-            (
-                record_episode, add, invalidate_op, list_memories,
-                mem_retrieve, get_identity_ctx, propose_identity_fact,
-                RetrievalRequest, PgOnlyPublisher, LocalBgeM3, FakeReranker,
-            ) = self._import_curlyos()
-            pool = self._make_sync_pool(self._dsn)
-            pub = PgOnlyPublisher()
-
             # Record delegation episode
             epi_content = (
                 f"Delegated task (child_session={child_session_id}):\n"
                 f"{task[:500]}\n\n"
                 f"Result:\n{result[:1000]}"
             )
-            epi = self._run_async(record_episode(pool, pub, self._scope_text,
-                content=epi_content[:2000],
-                source_ref=f"hermes:delegation:{child_session_id}"))
-            epi_id = epi.get("epi_id")
+            self._ingest(epi_content[:2000],
+                         f"hermes:delegation:{child_session_id}",
+                         add_memory=False, extract_knowledge=False)
 
             # Extract facts from the result using simple pattern matching
             self_ref_patterns = [
@@ -990,10 +772,10 @@ class CurlyOSMemoryProvider(MemoryProvider):
             # Write extracted facts as hypothesis memories
             for kind, stmt in extracted[:3]:
                 try:
-                    full_stmt = f"[Delegation {kind}] {stmt}"
-                    self._run_async(add(pool, pub, self._scope_text,
-                        statement=full_stmt, source_episode_id=epi_id,
-                        epistemic_status="hypothesis"))
+                    self._ingest(f"[Delegation {kind}] {stmt}",
+                                 f"hermes:delegation:{child_session_id}",
+                                 extract_knowledge=False,
+                                 epistemic_status="hypothesis")
                 except Exception as e:
                     logger.debug("Failed to write delegation fact: %s", e)
 
@@ -1008,23 +790,16 @@ class CurlyOSMemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", **kwargs) -> None:
         """Persist a completed turn to the backend, with periodic consolidation."""
-        if not self._auto_record or not self._dsn:
+        if not self._auto_record:
             return
         self._turn_count += 1
         self._consolidation_turn_count += 1
         if len(user_content) < 20 and len(assistant_content) < 50:
             return
         try:
-            record_episode = self._import_curlyos()[0]
-            LocalBgeM3 = self._import_curlyos()[9]  # not used here, but import is cached
-            PgOnlyPublisher = self._import_curlyos()[8]
-            pool = self._make_sync_pool(self._dsn)
-            pub = PgOnlyPublisher()
             episode_content = f"[turn {self._turn_count}] User: {user_content[:800]}\n\nAssistant: {assistant_content[:1200]}"
-            epi = self._run_async(record_episode(pool, pub, self._scope_text,
-                content=episode_content[:3000], source_ref=f"hermes:{self._session_id}"))
-            if epi and not self._session_episode_id:
-                self._session_episode_id = epi["epi_id"]
+            self._ingest(episode_content[:3000], f"hermes:{self._session_id}",
+                         add_memory=False, extract_knowledge=False)
         except Exception as e:
             logger.debug("CurlyOS sync_turn failed: %s", e)
             return
@@ -1037,14 +812,11 @@ class CurlyOSMemoryProvider(MemoryProvider):
     def on_session_switch(self, new_session_id: str, *, reset: bool = False, **kwargs) -> None:
         self._session_id = new_session_id
         if reset:
-            self._session_episode_id = None
             self._turn_count = 0
             self._consolidation_turn_count = 0
 
     def shutdown(self) -> None:
-        if self._api_thread is not None:
-            logger.info("CurlyOS API server thread is daemon — will stop when process exits")
-            self._api_thread = None
+        pass
 
 
 def register(ctx) -> None:

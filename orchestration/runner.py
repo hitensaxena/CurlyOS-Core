@@ -212,7 +212,8 @@ class Runner:
         try:
             await self._notifier.notify(
                 f"CurlyOS run {run_id} needs approval: {intr.get('tool')} "
-                f"({intr.get('action_class')}) — grant or deny in Mission Control.",
+                f"({intr.get('action_class')}) — reply 'approve {apv_id}' or "
+                f"'deny {apv_id}' here, or decide in Mission Control.",
                 approval_id=apv_id, run_id=run_id,
             )
         except Exception:  # noqa: BLE001
