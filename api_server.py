@@ -781,10 +781,16 @@ def cognition_meta(scope: str = SCOPE):
             "WHERE scope = %s ORDER BY created_at DESC LIMIT 50",
             [scope],
         ).fetchall()
+        mental_models = conn.execute(
+            "SELECT id, name, description, domain FROM mental_models "
+            "WHERE scope = %s AND valid_to IS NULL ORDER BY created_at DESC",
+            [scope],
+        ).fetchall()
     return {
         "principles": principles,
         "assumptions": assumptions,
         "decision_audits": decision_audits,
+        "mental_models": mental_models,
     }
 
 
