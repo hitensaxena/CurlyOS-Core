@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from shared.types.ulid import mint
+from shared.llm import first_json
 
 log = logging.getLogger("curlyos.narrative")
 
@@ -443,7 +444,7 @@ async def compose_chapters(
                 max_tokens=160,
                 response_format={"type": "json_object"},
             )
-            data = _json.loads(resp.choices[0].message.content or "{}")
+            data = first_json(resp.choices[0].message.content, default={})
             title = (str(data.get("title") or "")).strip()[:80] or kw_title
             summary = (str(data.get("summary") or "")).strip()[:300] or f"A period about {kw_title.lower()}."
             return title, summary

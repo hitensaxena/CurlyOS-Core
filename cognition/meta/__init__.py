@@ -20,6 +20,7 @@ from typing import Any
 
 from shared.types.ulid import mint
 from shared.events import build_event
+from shared.llm import first_json
 
 log = logging.getLogger("curlyos.metacog")
 
@@ -364,7 +365,7 @@ async def _llm_extract_decisions(llm_client: Any, model: str, episodes_text: str
         response_format={"type": "json_object"},
         temperature=0.2,
     )
-    data = json.loads(response.choices[0].message.content)
+    data = first_json(response.choices[0].message.content, default={})
     out = []
     for d in data.get("decisions", []):
         if isinstance(d, dict) and d.get("decision"):
@@ -490,7 +491,7 @@ async def _llm_distill_principles(llm_client: Any, model: str, audit_rows: list)
         response_format={"type": "json_object"},
         temperature=0.3,
     )
-    data = json.loads(response.choices[0].message.content)
+    data = first_json(response.choices[0].message.content, default={})
     out = []
     for p in data.get("principles", []):
         if isinstance(p, dict) and p.get("statement"):

@@ -24,19 +24,21 @@ import logging
 import re
 from typing import Any, Awaitable, Callable
 
+from shared.llm import first_json, json_records
+
 log = logging.getLogger("curlyos-core.orchestration.workflows")
 
 LLMFn = Callable[[str, str], Awaitable[str]]
 
 
 def _json_block(text: str) -> Any:
-    m = re.search(r"\[.*\]|\{.*\}", text, re.DOTALL)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return None
+    # Robust to fences / prose / truncation (json_records salvages records from
+    # a cut-off response — the configured model may be a :free one that truncates).
+    out = first_json(text)
+    if out is not None:
+        return out
+    recs = json_records(text)
+    return recs or None
 
 
 def _clamp01(v: Any, default: float = 0.5) -> float:

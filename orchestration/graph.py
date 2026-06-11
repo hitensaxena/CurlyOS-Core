@@ -20,6 +20,7 @@ import logging
 import re
 from typing import Annotated, Any, Awaitable, Callable, TypedDict
 
+from shared.llm import first_json, json_records
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
@@ -70,14 +71,11 @@ CONTEXT (memory + identity + goals):
 
 
 def _extract_json_array(text: str) -> list | None:
-    m = re.search(r"\[.*\]", text, re.DOTALL)
-    if not m:
-        return None
-    try:
-        out = json.loads(m.group(0))
-        return out if isinstance(out, list) else None
-    except json.JSONDecodeError:
-        return None
+    out = first_json(text)
+    if isinstance(out, list):
+        return out
+    recs = json_records(text)
+    return recs or None
 
 
 def _fallback_plan(task: str) -> list[dict]:

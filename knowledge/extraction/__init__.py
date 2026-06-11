@@ -9,14 +9,29 @@ Two modes:
 """
 from __future__ import annotations
 
+import os
 import re
 import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 from shared.types.ulid import mint
+from shared.llm import json_records
 
 log = logging.getLogger("curlyos.knowledge.extraction")
+
+
+# Closed entity-type taxonomy. Mirrors the webapp graph legend (LABEL_COLORS).
+ENTITY_LABELS = (
+    "Person", "Organization", "Project", "Tool", "Skill",
+    "Concept", "Place", "Event", "Health", "Media", "Activity", "Other",
+)
+_LABEL_LOOKUP = {label.lower(): label for label in ENTITY_LABELS}
+
+
+def normalize_label(raw: str | None) -> str:
+    """Map a free-form type string to the closed taxonomy (fallback 'Other')."""
+    return _LABEL_LOOKUP.get((raw or "").strip().lower(), "Other")
 
 
 @dataclass
@@ -27,18 +42,28 @@ class ExtractedTriple:
     confidence: float  # 0.0–1.0
     source_episode_id: str
     source_text: str = ""  # the exact text span this was extracted from
+    subject_type: str = "Other"  # entity type from ENTITY_LABELS
+    object_type: str = "Other"
 
 
 # ── Prompt template ──────────────────────────────────────────────────────────
 
-EXTRACTION_PROMPT = """Extract entity-relation triples from the following text. Return JSON array.
+EXTRACTION_PROMPT = """Extract entity-relation triples from the following text. Return JSON.
 
-Each triple: {"subject": "...", "predicate": "...", "object": "...", "confidence": 0.0-1.0}
+Return: {"triples": [{"subject": "...", "subject_type": "...", "predicate": "...", "object": "...", "object_type": "...", "confidence": 0.0-1.0}]}
+
+subject_type and object_type MUST be exactly one of:
+  Person       a named individual              Organization  company / school / team
+  Project      a named project/product built   Tool          software / app / library / device / tech
+  Skill        an ability or competency        Concept       abstract idea / field / emotion / philosophy
+  Place        a location                      Event         a dated happening
+  Health       a medical metric or condition   Media         a book / song / film / album / artist
+  Activity     a hobby / practice / routine    Other         none of the above / unclear
 
 Rules:
-- subject and object are entities (people, tools, projects, concepts, places)
-- predicate is the relationship (uses, works_on, prefers, located_in, member_of, etc.)
-- confidence: 1.0 for explicitly stated, 0.7 for implied
+- subject and object are entities (people, tools, projects, concepts, places).
+- predicate is the relationship (uses, works_on, prefers, located_in, member_of, etc.).
+- confidence: 1.0 for explicitly stated, 0.7 for implied.
 - Extract 1-5 triples per sentence. Quality over quantity.
 - Normalize: lowercase predicates with underscores, proper nouns preserved.
 
@@ -51,13 +76,14 @@ async def extract_with_llm(
     episode_content: str,
     source_episode_id: str,
     llm_client: Any = None,
-    model: str = "gpt-4o-mini",
+    model: str | None = None,
 ) -> list[ExtractedTriple]:
     """LLM-extract entity/relation triples from an episode."""
     if llm_client is None:
         # Fall through to pattern extraction
         return extract_with_patterns(episode_content, source_episode_id)
 
+    model = model or os.environ.get("CURLYOS_LLM_MODEL", "openai/gpt-4o-mini")
     try:
         response = await llm_client.chat.completions.create(
             model=model,
@@ -69,19 +95,12 @@ async def extract_with_llm(
             ],
             response_format={"type": "json_object"},
             temperature=0.1,
-            max_tokens=1024,
+            max_tokens=2048,
         )
 
-        import json
-        content = response.choices[0].message.content
-        # Parse - handle both {"triples": [...]} and [...]
-        data = json.loads(content)
-        if isinstance(data, dict):
-            triples_data = data.get("triples", data.get("results", []))
-        elif isinstance(data, list):
-            triples_data = data
-        else:
-            return []
+        # Robust parse — tolerates fences / prose / truncation (json_records
+        # salvages complete records from a cut-off response).
+        triples_data = json_records(response.choices[0].message.content)
 
         triples = []
         for t in triples_data:
@@ -93,6 +112,8 @@ async def extract_with_llm(
                     confidence=min(max(float(t.get("confidence", 0.8)), 0.0), 1.0),
                     source_episode_id=source_episode_id,
                     source_text=episode_content[:200],
+                    subject_type=normalize_label(t.get("subject_type")),
+                    object_type=normalize_label(t.get("object_type")),
                 ))
             except (KeyError, TypeError, ValueError) as e:
                 log.warning("skipping malformed triple: %s", e)

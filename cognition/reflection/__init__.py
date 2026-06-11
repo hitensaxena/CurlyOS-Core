@@ -23,6 +23,7 @@ from typing import Any
 
 from shared.types.ulid import mint
 from shared.events import build_event
+from shared.llm import first_json
 
 log = logging.getLogger("curlyos.reflection")
 
@@ -249,7 +250,7 @@ async def _analyze_with_llm(llm_client, model, episodes, identity_ctx):
             response_format={"type": "json_object"},
             temperature=0.3,
         )
-        data = json.loads(response.choices[0].message.content)
+        data = first_json(response.choices[0].message.content, default={})
         return (
             data.get("findings", []),
             data.get("goal_deltas", []),

@@ -563,7 +563,7 @@ async def extract_and_project(
     # between the create_entity commit and the next resolve_entity lookup.
     seen: dict[str, str] = {}
 
-    async def _get_or_create(mention: str) -> str | None:
+    async def _get_or_create(mention: str, label: str = "Other") -> str | None:
         nonlocal entities_created, entities_merged
         norm = normalize_mention(mention)
         if len(norm) < 2:
@@ -576,7 +576,7 @@ async def extract_and_project(
         )
         if decision == ResolutionDecision.MINT or not key:
             ent = await create_entity(
-                pool, publisher, scope, mention.strip(),
+                pool, publisher, scope, mention.strip(), label=label,
                 source_episode_id=episode_id, embedder=embedder,
             )
             entities_created += 1
@@ -588,8 +588,8 @@ async def extract_and_project(
         return eid
 
     for triple in triples:
-        s_id = await _get_or_create(triple.subject)
-        o_id = await _get_or_create(triple.object)
+        s_id = await _get_or_create(triple.subject, getattr(triple, "subject_type", "Other"))
+        o_id = await _get_or_create(triple.object, getattr(triple, "object_type", "Other"))
         if s_id and o_id and s_id != o_id:
             await create_edge(
                 pool, publisher,

@@ -28,6 +28,8 @@ import logging
 import re
 from typing import Any, Awaitable, Callable
 
+from shared.llm import first_json, json_records
+
 log = logging.getLogger("curlyos-core.orchestration.evolution")
 
 LLMFn = Callable[[str, str], Awaitable[str]]
@@ -54,14 +56,11 @@ GOLDEN_PLANNER_TASKS: list[dict] = [
 
 
 def _extract_plan(text: str) -> list | None:
-    m = re.search(r"\[.*\]", text, re.DOTALL)
-    if not m:
-        return None
-    try:
-        out = json.loads(m.group(0))
-        return out if isinstance(out, list) else None
-    except json.JSONDecodeError:
-        return None
+    out = first_json(text)
+    if isinstance(out, list):
+        return out
+    recs = json_records(text)
+    return recs or None
 
 
 def score_plan(plan_text: str, expect: dict) -> tuple[bool, str]:
