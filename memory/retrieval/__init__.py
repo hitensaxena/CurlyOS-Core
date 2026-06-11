@@ -42,10 +42,15 @@ def _bitemporal_where(as_of: datetime | None = None) -> tuple[str, list]:
 
 
 def _epistemic_filter_for_mode(mode: str) -> frozenset[str]:
-    """Return the set of epistemic statuses to include for a given retrieval mode."""
+    """Return the set of epistemic statuses to include for a given retrieval mode.
+
+    `belief` (Hiten's held worldview/values) grounds "who he is", so it surfaces
+    alongside `canonical` in normal recall — previously it was in NO mode and
+    never recalled. `divergent` additionally pulls speculative tiers.
+    """
     if mode == "divergent":
-        return frozenset({"canonical", "hypothesis", "conjecture", "possible_world"})
-    return frozenset({"canonical"})
+        return frozenset({"canonical", "belief", "hypothesis", "conjecture", "possible_world"})
+    return frozenset({"canonical", "belief"})
 
 
 # ── Stage 1: Hybrid first-stage ────────────────────────────────────────────

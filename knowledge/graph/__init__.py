@@ -228,6 +228,52 @@ async def search_entities(
             return [_row_to_entity(r) for r in rows]
 
 
+async def graph_context(pool: Any, scope: str, top_n: int = 25, max_rels: int = 4) -> str:
+    """Compact text summary of the CURRENT knowledge graph for cognition prompts.
+
+    The most-connected entities (valid_to IS NULL) + a few key relationships each,
+    so reflection/narrative can ground their analysis in the live graph instead of
+    re-deriving everything from raw episodes. Empty string if the graph is empty.
+    """
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "WITH deg AS ("
+                "  SELECT eid, count(*) d FROM ("
+                "    SELECT src_entity_id eid FROM knowledge_edges WHERE valid_to IS NULL "
+                "    UNION ALL SELECT dst_entity_id FROM knowledge_edges WHERE valid_to IS NULL"
+                "  ) x GROUP BY eid) "
+                "SELECT e.id, e.name, e.label, COALESCE(d.d, 0) AS deg "
+                "FROM knowledge_entities e LEFT JOIN deg d ON d.eid = e.id "
+                "WHERE e.scope = %s AND e.valid_to IS NULL "
+                "ORDER BY deg DESC, e.created_at ASC LIMIT %s",
+                (scope, top_n),
+            )
+            ents = await cur.fetchall()
+            if not ents:
+                return ""
+            ids = [e[0] for e in ents]
+            await cur.execute(
+                "SELECT k.src_entity_id, k.rel_type, d.name FROM knowledge_edges k "
+                "JOIN knowledge_entities d ON d.id = k.dst_entity_id "
+                "WHERE k.valid_to IS NULL AND k.src_entity_id = ANY(%s) "
+                "ORDER BY k.src_entity_id, k.created_at",
+                (ids,),
+            )
+            edges = await cur.fetchall()
+
+    rel_by_src: dict[str, list[str]] = {}
+    for src, rel, dst in edges:
+        bucket = rel_by_src.setdefault(src, [])
+        if len(bucket) < max_rels:
+            bucket.append(f"{rel}→{dst}")
+    lines = []
+    for eid, name, label, _deg in ents:
+        rels = rel_by_src.get(eid, [])
+        lines.append(f"- {name} [{label}]" + (f": {'; '.join(rels)}" if rels else ""))
+    return "Current knowledge graph (top entities + relationships):\n" + "\n".join(lines)
+
+
 async def create_edge(
     pool: Any,
     publisher: Any,

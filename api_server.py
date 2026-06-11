@@ -1756,6 +1756,25 @@ async def _process_episode_bg(
             logger.warning("embedding attempt %d incomplete epi=%s", attempt + 1, epi_id)
             await asyncio.sleep(2 ** attempt * 2)
 
+        # Classify the captured memory's epistemic status (canonical/belief/
+        # hypothesis) instead of blanket canonical. Best-effort, background.
+        if mem_id:
+            try:
+                llm_client, model = _make_llm_client()
+                if llm_client:
+                    from shared.epistemic import classify_statements
+                    res = await classify_statements(llm_client, model, [{"id": mem_id, "statement": text[:2000]}])
+                    status = res.get(mem_id, "canonical")
+                    if status != "canonical":
+                        async with pool.connection() as conn:
+                            async with conn.cursor() as cur:
+                                await cur.execute(
+                                    "UPDATE memories SET epistemic_status = %s WHERE id = %s AND valid_to IS NULL",
+                                    (status, mem_id),
+                                )
+            except Exception:
+                logger.exception("epistemic classify failed epi=%s", epi_id)
+
         # Then knowledge-graph extraction (entities/edges).
         if extract_knowledge:
             llm_client, _ = _make_llm_client()

@@ -344,6 +344,10 @@ async def compose_chapters(
     import re
     import json as _json
     from collections import Counter
+    from knowledge.graph import graph_context as _graph_ctx
+
+    # Ground chapter theming in the current knowledge graph (entities/relationships).
+    graph_ctx = await _graph_ctx(pool, scope, top_n=20) if llm_client else ""
 
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
@@ -434,7 +438,8 @@ async def compose_chapters(
             "(e.g. 'Building CurlyOS', 'Health reset'). summary = one plain sentence. "
             "Synthesize the theme; do NOT copy any entry verbatim and do NOT include "
             "speaker tags ('User:'/'Assistant:'), '[turn ...]', timestamps, or 'Session ...'.\n\n"
-            f"Entries:\n{sample}"
+            + (f"{graph_ctx}\n\n" if graph_ctx else "")
+            + f"Entries:\n{sample}"
         )
         try:
             resp = await llm_client.chat.completions.create(

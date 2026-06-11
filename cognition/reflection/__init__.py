@@ -81,6 +81,8 @@ Recent episodes:
 Current identity context:
 {identity_context}
 
+{graph_context}
+
 Respond as JSON:
 {{
   "findings": [{{"statement": "...", "confidence": 0.8, "tags": ["..."]}}],
@@ -164,13 +166,15 @@ async def run_reflection(
     if episodes_scanned == 0:
         return {"rpt_id": rpt_id, "episodes_scanned": 0, "findings": 0, "identity_candidates": 0}
 
-    # 2. Fetch identity context
+    # 2. Fetch identity context + current knowledge-graph context
     identity_ctx = await get_identity_context(pool, scope)
+    from knowledge.graph import graph_context as _graph_ctx
+    graph_ctx = await _graph_ctx(pool, scope)
 
     # 3. Run analysis
     if llm_client is not None:
         findings, goal_deltas, identity_candidates = await _analyze_with_llm(
-            llm_client, llm_model, episode_rows, identity_ctx
+            llm_client, llm_model, episode_rows, identity_ctx, graph_ctx
         )
     else:
         findings, goal_deltas, identity_candidates = _analyze_heuristic(
@@ -234,14 +238,17 @@ async def run_reflection(
     }
 
 
-async def _analyze_with_llm(llm_client, model, episodes, identity_ctx):
-    """LLM-powered reflection analysis."""
+async def _analyze_with_llm(llm_client, model, episodes, identity_ctx, graph_ctx=""):
+    """LLM-powered reflection analysis (grounded in the current knowledge graph)."""
     import json
 
     episodes_text = "\n".join(f"- [{r[2].isoformat()[:10]}] {r[1][:200]}" for r in episodes[:50])
     identity_text = json.dumps(identity_ctx, indent=2, default=str)
 
-    prompt = WEEKLY_ANALYSIS_PROMPT.format(episodes=episodes_text, identity_context=identity_text)
+    prompt = WEEKLY_ANALYSIS_PROMPT.format(
+        episodes=episodes_text, identity_context=identity_text,
+        graph_context=graph_ctx or "(knowledge graph empty)",
+    )
 
     try:
         response = await llm_client.chat.completions.create(
@@ -391,8 +398,10 @@ async def run_weekly_reflection(
     if llm_client is not None:
         try:
             from identity import get_identity_context as _get_ctx
+            from knowledge.graph import graph_context as _graph_ctx
             ident_ctx = await _get_ctx(pool, scope)
-            lf, lgd, lic = await _analyze_with_llm(llm_client, llm_model, episode_rows, ident_ctx)
+            graph_ctx = await _graph_ctx(pool, scope)
+            lf, lgd, lic = await _analyze_with_llm(llm_client, llm_model, episode_rows, ident_ctx, graph_ctx)
             seen_ic = {(c.get("predicate"), str(c.get("object")).lower()) for c in identity_candidates}
             for c in lic:
                 if not (c.get("predicate") and c.get("object")):
@@ -571,8 +580,10 @@ async def run_monthly_reflection(
     if llm_client is not None:
         try:
             from identity import get_identity_context as _get_ctx
+            from knowledge.graph import graph_context as _graph_ctx
             ident_ctx = await _get_ctx(pool, scope)
-            lf, lgd, lic = await _analyze_with_llm(llm_client, llm_model, episode_rows, ident_ctx)
+            graph_ctx = await _graph_ctx(pool, scope)
+            lf, lgd, lic = await _analyze_with_llm(llm_client, llm_model, episode_rows, ident_ctx, graph_ctx)
             seen_ic = {(c.get("predicate"), str(c.get("object")).lower()) for c in identity_candidates}
             for c in lic:
                 if not (c.get("predicate") and c.get("object")):
