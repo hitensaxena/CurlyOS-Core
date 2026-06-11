@@ -1665,13 +1665,18 @@ def _make_llm_client():
         from openai import AsyncOpenAI
     except Exception:
         return None, ""
-    model = os.environ.get("CURLYOS_LLM_MODEL", "openai/gpt-4o-mini")
-    client = AsyncOpenAI(
+    from shared.models import FallbackClient, general_chain, primary_model
+    # Fast per-model failure (no slow same-model 429 backoff) — the chain is the
+    # resilience, so we move to the next model instead of retrying a limited one.
+    raw = AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=key,
         timeout=60.0,
-        max_retries=2,
+        max_retries=0,
     )
+    # Wrap so .chat.completions.create fails over across CURLYOS_MODEL_CHAIN.
+    client = FallbackClient(raw, general_chain())
+    model = os.environ.get("CURLYOS_LLM_MODEL") or primary_model()
     _LLM_CLIENT, _LLM_MODEL = client, model
     return client, model
 
