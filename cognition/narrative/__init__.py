@@ -268,58 +268,42 @@ async def surface_themes(
                 (scope,),
             )
 
-    # Conversation-artifact words to exclude — episodes are formatted as
-    # "[turn N] User: ... Assistant: ...", so these capitalized tokens are
-    # structural noise, not meaningful themes.
-    artifact_words = {
-        "user", "assistant", "turn", "session", "system", "hiten", "the",
-        "what", "can", "here", "this", "that", "you", "your", "and", "but",
-        "for", "with", "from", "have", "will", "would", "should", "could",
-        "note", "based", "done", "okay", "yes", "sure", "let", "now", "also",
-        "morning", "good", "i", "im", "ive", "id",
-    }
-
-    # Extract proper noun phrases
-    noun_phrase_re = re.compile(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b')
-    all_text = " ".join(r[1] for r in episode_rows)
-    phrases = noun_phrase_re.findall(all_text)
-
-    # Count frequency
-    phrase_counts: Counter[str] = Counter(phrases)
-
-    # Filter by min_frequency and cluster similar (case-insensitive dedup),
-    # dropping single-word conversation artifacts.
-    seen: dict[str, str] = {}  # lowercase -> original case
-    for phrase, count in phrase_counts.most_common():
-        if count < min_frequency:
-            continue
-        lower = phrase.lower()
-        # Skip single-word artifacts; multi-word phrases are kept (more specific)
-        if " " not in lower and lower in artifact_words:
-            continue
-        if lower not in seen:
-            seen[lower] = phrase
+    # Themes = the most-CONNECTED entities in the current knowledge graph (clean,
+    # typed, deduped). Raw capitalized-word frequency produced sentence-fragment
+    # junk ("It", "Not", "There", ...); the graph already holds the real recurring
+    # subjects. Exclude the central person (Hiten himself).
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "WITH deg AS ("
+                "  SELECT eid, count(*) d FROM ("
+                "    SELECT src_entity_id eid FROM knowledge_edges WHERE valid_to IS NULL "
+                "    UNION ALL SELECT dst_entity_id FROM knowledge_edges WHERE valid_to IS NULL"
+                "  ) x GROUP BY eid) "
+                "SELECT e.name, e.label, COALESCE(d.d, 0) AS deg FROM knowledge_entities e "
+                "LEFT JOIN deg d ON d.eid = e.id "
+                "WHERE e.scope = %s AND e.valid_to IS NULL AND lower(e.name) <> 'hiten' "
+                "AND COALESCE(d.d, 0) >= %s "
+                "ORDER BY deg DESC, e.created_at ASC LIMIT 30",
+                (scope, max(min_frequency, 2)),
+            )
+            ent_rows = await cur.fetchall()
 
     themes: list[dict] = []
-    for lower, original in seen.items():
-        count = phrase_counts[original]
+    for name, label, deg in ent_rows:
         thm_id = mint("thm")
+        desc = f"{label}; connected to {deg} things in the knowledge graph"
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "INSERT INTO themes (id, scope, name, description, frequency, epistemic_status) "
                     "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
-                    (thm_id, scope, original,
-                     f"Appears {count} times across {len(episode_rows)} episodes",
-                     count, "hypothesis"),
+                    (thm_id, scope, name, desc, deg, "hypothesis"),
                 )
                 (tid,) = await cur.fetchone()
         themes.append({
-            "id": tid,
-            "name": original,
-            "description": f"Appears {count} times across {len(episode_rows)} episodes",
-            "frequency": count,
-            "epistemic_status": "hypothesis",
+            "id": tid, "name": name, "description": desc,
+            "frequency": deg, "epistemic_status": "hypothesis",
         })
 
     return themes
