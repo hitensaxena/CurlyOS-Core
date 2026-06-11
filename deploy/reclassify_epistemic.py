@@ -18,19 +18,37 @@ from shared.epistemic import classify_statements
 
 DSN = os.environ["CURLYOS_DATABASE_URL"]
 SCOPE = os.environ.get("CURLYOS_SCOPE", "user:usr_hiten")
-BATCH = 40
-CONCURRENCY = 4
+# Backend: "hermes" (Claude Max via hermes-bridge) or default (OpenRouter chain).
+BACKEND = os.environ.get("EPISTEMIC_BACKEND", "openrouter")
+BATCH = int(os.environ.get("EPISTEMIC_BATCH", "40"))
+CONCURRENCY = int(os.environ.get("EPISTEMIC_CONCURRENCY", "4"))
 
 
 def log(m): print(m, flush=True)
 
 
+def _bridge_key():
+    if os.environ.get("BRIDGE_API_KEY"):
+        return os.environ["BRIDGE_API_KEY"]
+    with open(os.path.expanduser("~/hermes-bridge/.env")) as f:
+        for line in f:
+            if line.startswith("BRIDGE_API_KEY="):
+                return line.split("=", 1)[1].strip()
+    raise RuntimeError("no BRIDGE_API_KEY")
+
+
 async def main():
     from openai import AsyncOpenAI
-    key = os.environ["OPENROUTER_API_KEY"]
-    raw = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=key, timeout=120.0, max_retries=0)
-    llm = FallbackClient(raw, general_chain())
-    model = primary_model()
+    if BACKEND == "hermes":
+        # Claude Max via hermes-bridge (no fallback chain — bridge serves only Claude).
+        llm = AsyncOpenAI(base_url=os.environ.get("HERMES_BRIDGE_URL", "http://127.0.0.1:8787/v1"),
+                          api_key=_bridge_key(), timeout=180.0, max_retries=1)
+        model = os.environ.get("EPISTEMIC_MODEL", "claude-sonnet-4-6")
+    else:
+        raw = AsyncOpenAI(base_url="https://openrouter.ai/api/v1",
+                          api_key=os.environ["OPENROUTER_API_KEY"], timeout=120.0, max_retries=0)
+        llm = FallbackClient(raw, general_chain())
+        model = primary_model()
 
     conn = psycopg.connect(DSN, autocommit=True)
     rows = conn.execute(
