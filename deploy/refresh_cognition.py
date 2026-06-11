@@ -21,7 +21,7 @@ import api_server
 from cognition.reflection import run_weekly_reflection, run_monthly_reflection
 from cognition.narrative import surface_themes, compose_chapters
 from cognition.attention import detect_alignment_gaps, get_allocation, estimate_cognitive_load
-from cognition.meta import run_decision_audit, distill_principles
+from cognition.meta import run_decision_audit, distill_principles, generate_assumptions_and_models
 
 DSN = os.environ["CURLYOS_DATABASE_URL"]
 SCOPE = os.environ.get("CURLYOS_SCOPE", "user:usr_hiten")
@@ -104,7 +104,9 @@ async def main():
                                      window_days=30, llm_client=llm, llm_model=model)
     principles = await distill_principles(pool=pool, publisher=pub, scope=SCOPE,
                                           llm_client=llm, llm_model=model)
-    log(f"meta: audit={audit} principles_distilled={len(principles)}")
+    am = await generate_assumptions_and_models(pool=pool, publisher=pub, scope=SCOPE,
+                                               llm_client=llm, llm_model=model)
+    log(f"meta: audit={audit} principles_distilled={len(principles)} assumptions/models={am}")
     try:
         emb = await api_server.get_shared_embedder()
         sync = await api_server._sync_principles_to_memory(pool, pub, emb, SCOPE)

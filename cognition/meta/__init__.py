@@ -577,6 +577,89 @@ async def distill_principles(
 
 # ── Principles (wisdom registry) ───────────────────────────────────────────
 
+async def generate_assumptions_and_models(
+    pool: Any,
+    publisher: Any,
+    scope: str,
+    llm_client: Any = None,
+    llm_model: str = "openai/gpt-4o-mini",
+) -> dict:
+    """LLM-extract load-bearing ASSUMPTIONS + recurring MENTAL MODELS from Hiten's
+    beliefs, principles, and knowledge graph. Supersedes prior auto-generated rows
+    (idempotent). No-op without an LLM client.
+    """
+    if llm_client is None:
+        return {"assumptions": 0, "mental_models": 0}
+    import json
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT statement FROM principles WHERE scope = %s AND valid_to IS NULL", (scope,))
+            principles = [r[0] for r in await cur.fetchall()]
+            await cur.execute(
+                "SELECT statement FROM memories WHERE scope = %s AND valid_to IS NULL "
+                "AND epistemic_status = 'belief' ORDER BY created_at DESC LIMIT 50", (scope,))
+            beliefs = [r[0] for r in await cur.fetchall()]
+            await cur.execute(
+                "WITH deg AS (SELECT eid, count(*) d FROM ("
+                "  SELECT src_entity_id eid FROM knowledge_edges WHERE valid_to IS NULL "
+                "  UNION ALL SELECT dst_entity_id FROM knowledge_edges WHERE valid_to IS NULL"
+                ") x GROUP BY eid) "
+                "SELECT e.name, e.label FROM knowledge_entities e LEFT JOIN deg d ON d.eid = e.id "
+                "WHERE e.scope = %s AND e.valid_to IS NULL AND lower(e.name) <> 'hiten' "
+                "ORDER BY COALESCE(d.d, 0) DESC LIMIT 25", (scope,))
+            entities = [f"{n} ({lab})" for n, lab in await cur.fetchall()]
+
+    ctx = (
+        "PRINCIPLES:\n- " + "\n- ".join(principles or ["(none)"]) +
+        "\n\nBELIEFS:\n- " + "\n- ".join(beliefs or ["(none)"]) +
+        "\n\nKNOWLEDGE GRAPH (top entities): " + ", ".join(entities or ["(none)"])
+    )
+    prompt = (
+        "Below is Hiten's belief / principle / knowledge-graph profile.\n"
+        "1) ASSUMPTIONS — load-bearing things he treats as TRUE that COULD be wrong and that "
+        "other beliefs/plans depend on (the kind worth stress-testing). 5-10.\n"
+        "2) MENTAL_MODELS — recurring frameworks/lenses he reasons WITH (named + one-sentence "
+        "description). 4-8.\n"
+        'Return ONLY JSON: {"assumptions":[{"statement":"...","domain":"...","confidence":0.0-1.0}],'
+        '"mental_models":[{"name":"...","description":"...","domain":"..."}]}.\n'
+        "domain is one of: general, work, creative, health, personal, tooling, philosophy.\n\n" + ctx
+    )
+    resp = await llm_client.chat.completions.create(
+        model=llm_model, messages=[{"role": "user", "content": prompt}],
+        temperature=0.2, max_tokens=2000,
+    )
+    data = first_json(resp.choices[0].message.content, default={})
+    assumptions = data.get("assumptions", []) if isinstance(data, dict) else []
+    models = data.get("mental_models", []) if isinstance(data, dict) else []
+
+    # Supersede prior auto-generated rows → fresh snapshot.
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE assumptions SET valid_to = now() WHERE scope = %s AND valid_to IS NULL", (scope,))
+            await cur.execute(
+                "UPDATE mental_models SET valid_to = now() WHERE scope = %s AND valid_to IS NULL", (scope,))
+
+    na = nm = 0
+    for a in assumptions[:12]:
+        if isinstance(a, dict) and str(a.get("statement", "")).strip():
+            await create_assumption(
+                pool, publisher, scope, statement=str(a["statement"])[:300],
+                domain=str(a.get("domain", "general"))[:30],
+                confidence=min(max(float(a.get("confidence", 0.5)), 0.0), 1.0))
+            na += 1
+    for m in models[:10]:
+        if isinstance(m, dict) and str(m.get("name", "")).strip():
+            await create_mental_model(
+                pool, publisher, scope, name=str(m["name"])[:80],
+                description=str(m.get("description", ""))[:300],
+                domain=str(m.get("domain", "general"))[:30])
+            nm += 1
+    return {"assumptions": na, "mental_models": nm}
+
+
 async def get_principles(
     pool: Any,
     scope: str,

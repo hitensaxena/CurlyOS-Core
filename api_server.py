@@ -809,23 +809,30 @@ async def cognition_attention(scope: str = SCOPE, window_days: int = 7):
 
     gaps = await asyncio.to_thread(_fetch_gaps)
 
-    # Allocation (time-by-category + trend) and cognitive load are computed
-    # read-only — no LLM, no writes — so the GET can surface them live for the
-    # dashboard. POST /api/attention/scan additionally writes fresh
-    # alignment_signals; that mutation isn't needed just to display the numbers.
-    allocation = None
-    cognitive_load = None
+    # KG-grounded attention: focus areas (cognitive mass), neglected entities,
+    # and breadth — computed live, read-only. Replaces the old ingested_at
+    # keyword-allocation + fake heatmap (meaningless on a bulk-imported corpus).
+    focus_areas = neglected = breadth = cognitive_load = None
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from cognition.attention import get_allocation, estimate_cognitive_load
+        from cognition.attention import (
+            get_focus_areas, get_neglected_entities, cognitive_breadth, estimate_cognitive_load,
+        )
         pool = await _get_async_pool()
-        allocation = await get_allocation(pool=pool, scope=scope, window_days=window_days)
+        focus_areas = await get_focus_areas(pool=pool, scope=scope)
+        neglected = await get_neglected_entities(pool=pool, scope=scope)
+        breadth = await cognitive_breadth(pool=pool, scope=scope)
         cognitive_load = await estimate_cognitive_load(pool=pool, scope=scope, window_days=14)
     except Exception:
-        # Allocation/load are best-effort enrichment; gaps still render without them.
-        logger.warning("attention allocation/load enrichment failed", exc_info=True)
+        logger.warning("attention enrichment failed", exc_info=True)
 
-    return {"alignment_gaps": gaps, "allocation": allocation, "cognitive_load": cognitive_load}
+    return {
+        "alignment_gaps": gaps,
+        "focus_areas": focus_areas,
+        "neglected": neglected,
+        "breadth": breadth,
+        "cognitive_load": cognitive_load,
+    }
 
 
 @app.get("/api/cognition/narrative")

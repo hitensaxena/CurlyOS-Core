@@ -142,88 +142,159 @@ async def detect_alignment_gaps(
     publisher: Any,
     scope: str,
 ) -> list[dict]:
-    """Detect value-action gaps: things Hiten values but isn't spending time on.
+    """Value/goal–action gaps grounded in the knowledge graph + genuine activity.
 
-    Queries identity_facts for values/goals/preferences, then checks recent
-    episode activity for keyword matches. Gaps become alignment_signals
-    at hypothesis status.
+    A stated goal or value is "aligned" if it shows up in the knowledge graph
+    (entity names) OR in recent genuine captures (journal/voice/hermes — not the
+    bulk import). Goals/values with NO such presence become alignment_signals.
     """
+    # Distinctive terms only — generic fillers/verbs recur in any activity text and
+    # would mask real under-attention; only specific concept words should drive the match.
+    STOP = {"with", "that", "this", "make", "have", "your", "from", "into",
+            "need", "want", "goal", "goals", "case", "more", "most", "very", "much",
+            "many", "some", "they", "them", "will", "what", "when", "here", "there",
+            "find", "create", "build", "work", "start", "keep", "take", "plan",
+            "doing", "using", "based", "thing", "things", "stuff", "good", "five",
+            "only", "also", "just", "like", "well", "about", "over", "such", "than",
+            "then", "been", "were", "would", "could", "should", "next"}
+
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
-            # Get stated values, goals, preferences, priorities from identity_facts
             await cur.execute(
-                "SELECT id, predicate, object "
-                "FROM identity_facts "
+                "SELECT id, title FROM goals WHERE scope = %s AND valid_to IS NULL "
+                "AND status = 'active'", (scope,))
+            goals = await cur.fetchall()
+            await cur.execute(
+                "SELECT id, predicate, object FROM identity_facts "
                 "WHERE scope = %s AND valid_to IS NULL "
-                "AND predicate IN (%s, %s, %s, %s)",
-                (scope, "values", "goal", "prefers", "priority"),
-            )
-            identity_rows = await cur.fetchall()
-
-            # Get recent episodes (last 30 days)
+                "AND (predicate ILIKE '%%value%%' OR predicate IN "
+                "('builds', 'focus', 'priority', 'primary_project', 'cares_about', 'exercise'))",
+                (scope,))
+            values = await cur.fetchall()
+            # Alignment is about BEHAVIOUR: match goals/values against recent
+            # genuine activity (captures, excluding the bulk import), NOT the full
+            # historical graph — a goal can sit in the graph yet get no real
+            # attention. Absence here = "stated but not being acted on".
             await cur.execute(
-                "SELECT id, content FROM episodes "
-                "WHERE scope = %s AND ingested_at >= now() - interval '%s days' "
-                "ORDER BY ingested_at DESC LIMIT 200",
-                (scope, 30),
-            )
-            episode_rows = await cur.fetchall()
+                "SELECT content FROM episodes WHERE scope = %s "
+                "AND coalesce(source_ref,'') NOT ILIKE 'brain:%%' "
+                "AND coalesce(source_ref,'') NOT ILIKE 'mind:%%' "
+                "ORDER BY ingested_at DESC LIMIT 200", (scope,))
+            activity = " ".join((r[0] or "").lower() for r in await cur.fetchall())
 
-    if not identity_rows or not episode_rows:
-        return []
+    haystack = activity
 
-    # Idempotency: supersede prior auto-generated (hypothesis) signals so cron
-    # re-runs produce a fresh snapshot instead of unbounded duplicates.
+    # Idempotency: supersede prior hypothesis signals → fresh snapshot.
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
                 "UPDATE alignment_signals SET valid_to = now() "
                 "WHERE scope = %s AND valid_to IS NULL AND epistemic_status = 'hypothesis'",
-                (scope,),
-            )
+                (scope,))
 
-    # Build recent activity text for keyword matching
-    recent_text = " ".join(r[1].lower() for r in episode_rows if r[1])
-    # Also build a set of individual words for matching
-    recent_words = set(re.findall(r'\b[a-z]{3,}\b', recent_text))
+    def _kw(s: str) -> set[str]:
+        return {w for w in re.findall(r'\b[a-z]{4,}\b', (s or "").lower())} - STOP
 
+    # A goal/value is "getting attention" if its distinctive terms recur in recent
+    # activity. Low recurrence = stated priority barely being acted on (a soft gap),
+    # which is far more useful than binary presence on a broad conversational corpus.
+    LOW_ATTENTION = 8
+    targets = ([("goal", g[0], g[1], 0.7) for g in goals]
+               + [("value", v[0], str(v[2]), 0.5) for v in values])
     gaps = []
-    for fact_id, predicate, obj in identity_rows:
-        if not obj:
+    for kind, ref_id, label, base_sev in targets:
+        kws = _kw(label)
+        if not kws:
             continue
-
-        # Extract keywords from the identity fact object
-        obj_lower = str(obj).lower()
-        obj_words = set(re.findall(r'\b[a-z]{3,}\b', obj_lower))
-
-        # Check if any word from the value/goal appears in recent activity
-        is_active = bool(obj_words & recent_words) or (obj_lower in recent_text)
-
-        if not is_active:
-            gap_id = mint("aln")
-            description = (
-                f"Stated '{predicate}' = '{obj}' but no related activity "
-                f"in recent episodes"
-            )
-            async with pool.connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        "INSERT INTO alignment_signals "
-                        "(id, scope, signal_type, description, severity, epistemic_status) "
-                        "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
-                        (gap_id, scope, "value_action_gap",
-                         description, 0.6, "hypothesis"),
-                    )
-                    (aid,) = await cur.fetchone()
-            gaps.append({
-                "id": aid,
-                "topic": str(obj),
-                "type": "value_action_gap",
-                "description": description,
-                "identity_fact_id": fact_id,
-            })
-
+        mentions = max(
+            (len(re.findall(r'\b' + re.escape(k) + r'\b', haystack)) for k in kws),
+            default=0)
+        if mentions >= LOW_ATTENTION:
+            continue  # actively getting attention → aligned
+        severity = round(min(base_sev + (LOW_ATTENTION - mentions) * 0.1, 0.95), 2)
+        gap_id = mint("aln")
+        plural = "s" if mentions != 1 else ""
+        desc = (f"{kind.title()} '{label}' gets little recent attention "
+                f"({mentions} mention{plural}) — stated but barely being acted on")
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT INTO alignment_signals "
+                    "(id, scope, signal_type, description, severity, epistemic_status) "
+                    "VALUES (%s, %s, %s, %s, %s, 'hypothesis') RETURNING id",
+                    (gap_id, scope, f"{kind}_action_gap", desc, severity))
+                (aid,) = await cur.fetchone()
+        gaps.append({"id": aid, "topic": label, "type": f"{kind}_action_gap",
+                     "description": desc, "severity": severity, "mentions": mentions,
+                     "ref_id": ref_id})
     return gaps
+
+
+async def get_focus_areas(pool: Any, scope: str, limit: int = 12) -> list[dict]:
+    """Where cognitive mass sits: the most-connected knowledge-graph entities
+    (excluding the central person), with type. This is honest attention signal —
+    derived from graph structure, not fake activity telemetry."""
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "WITH deg AS (SELECT eid, count(*) d FROM ("
+                "  SELECT src_entity_id eid FROM knowledge_edges WHERE valid_to IS NULL "
+                "  UNION ALL SELECT dst_entity_id FROM knowledge_edges WHERE valid_to IS NULL"
+                ") x GROUP BY eid) "
+                "SELECT e.name, e.label, COALESCE(d.d, 0) FROM knowledge_entities e "
+                "LEFT JOIN deg d ON d.eid = e.id "
+                "WHERE e.scope = %s AND e.valid_to IS NULL AND lower(e.name) <> 'hiten' "
+                "ORDER BY COALESCE(d.d, 0) DESC, e.created_at ASC LIMIT %s",
+                (scope, limit))
+            return [{"name": n, "label": lab, "weight": d} for n, lab, d in await cur.fetchall()]
+
+
+async def get_neglected_entities(pool: Any, scope: str, min_degree: int = 5,
+                                 limit: int = 10) -> list[dict]:
+    """High-degree entities (well-established in the graph) absent from recent
+    genuine captures — relationships/projects/topics drifting out of attention."""
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT content FROM episodes WHERE scope = %s "
+                "AND coalesce(source_ref,'') NOT ILIKE 'brain:%%' "
+                "AND coalesce(source_ref,'') NOT ILIKE 'mind:%%' "
+                "ORDER BY ingested_at DESC LIMIT 200", (scope,))
+            activity = " ".join((r[0] or "").lower() for r in await cur.fetchall())
+            await cur.execute(
+                "WITH deg AS (SELECT eid, count(*) d FROM ("
+                "  SELECT src_entity_id eid FROM knowledge_edges WHERE valid_to IS NULL "
+                "  UNION ALL SELECT dst_entity_id FROM knowledge_edges WHERE valid_to IS NULL"
+                ") x GROUP BY eid) "
+                "SELECT e.name, e.label, COALESCE(d.d, 0) FROM knowledge_entities e "
+                "LEFT JOIN deg d ON d.eid = e.id "
+                "WHERE e.scope = %s AND e.valid_to IS NULL AND lower(e.name) <> 'hiten' "
+                "AND COALESCE(d.d, 0) >= %s ORDER BY COALESCE(d.d, 0) DESC LIMIT 40",
+                (scope, min_degree))
+            ents = await cur.fetchall()
+    out = [{"name": n, "label": lab, "weight": d}
+           for n, lab, d in ents if n.lower() not in activity]
+    return out[:limit]
+
+
+async def cognitive_breadth(pool: Any, scope: str) -> dict:
+    """KG-based breadth: how many distinct entity types are active + the spread
+    (vs concentration in a few). An honest 'how scattered is cognition' metric."""
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT label, count(*) FROM knowledge_entities "
+                "WHERE scope = %s AND valid_to IS NULL GROUP BY label ORDER BY 2 DESC",
+                (scope,))
+            by_label = await cur.fetchall()
+    total = sum(c for _, c in by_label) or 1
+    top = by_label[0][1] if by_label else 0
+    return {
+        "total_entities": total,
+        "distinct_types": len(by_label),
+        "by_type": {lab: c for lab, c in by_label},
+        "concentration": round(top / total, 2),
+    }
 
 
 async def get_neglected_opportunities(
