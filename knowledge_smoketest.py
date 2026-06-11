@@ -53,9 +53,9 @@ async def main():
         print(f"    ({t.subject}) --[{t.predicate}]--> ({t.object}) conf={t.confidence}")
 
     print("\n[2] Entity resolution")
-    # Before loading entities, all should be MINT
+    # With no pool there is nothing to look up against → MINT.
     d1, k1 = await resolve_entity("Hiten")
-    check("unknown entity → MINT", d1 == ResolutionDecision.MINT, f"got {d1}")
+    check("no-pool resolution → MINT", d1 == ResolutionDecision.MINT, f"got {d1}")
 
     print("\n[3] Full extract + project pipeline on real episodes")
     # Get episodes from the DB

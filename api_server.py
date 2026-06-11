@@ -611,10 +611,16 @@ def get_graph(scope: str = SCOPE, limit: int = Query(default=200, le=500)):
         entity_ids = [e["id"] for e in entities]
         edges = []
         if entity_ids:
+            # Both directions — an inbound-only node must still show its edges
+            # and earn a non-zero degree.
             edges = conn.execute(
-                "SELECT id, src_entity_id, dst_entity_id, rel_type, properties FROM knowledge_edges WHERE src_entity_id = ANY(%s) AND valid_to IS NULL",
-                [entity_ids],
+                "SELECT id, src_entity_id, dst_entity_id, rel_type, properties FROM knowledge_edges WHERE (src_entity_id = ANY(%s) OR dst_entity_id = ANY(%s)) AND valid_to IS NULL",
+                [entity_ids, entity_ids],
             ).fetchall()
+    # Keep only edges whose BOTH endpoints are in the returned node set so the
+    # client never gets a link pointing at an off-list (truncated) node.
+    _idset = set(entity_ids)
+    edges = [e for e in edges if e["src_entity_id"] in _idset and e["dst_entity_id"] in _idset]
 
     # Build degree map
     degree: dict[str, int] = {}

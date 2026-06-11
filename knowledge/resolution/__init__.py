@@ -1,108 +1,93 @@
-"""Entity resolution — determine whether two mentions refer to the same real-world entity.
+"""Entity resolution — decide whether a mention refers to an EXISTING graph node.
 
-Pipeline:
-  1. Exact match — string equality (fastest)
-  2. Alias match — known aliases (e.g. "Zed" == "Zed Editor")
-  3. ANN blocking — embedding similarity >= threshold
-  4. Cross-encoder — final decision (LLM or model)
+Resolution is performed directly against the `knowledge_entities` table (the
+store the graph is actually built from), scope-bound, in two stages:
 
-Decision outcomes: MERGE, MINT (new entity), AMBIGUOUS (route to Reflection)
+  1. Exact match  — normalized-name equality (uses idx_ke_name).
+  2. ANN blocking — embedding cosine similarity >= threshold (uses idx_ke_hnsw),
+                    e.g. "Zed" ≈ "Zed Editor".
+
+A MERGE result carries a real `ent_` id that can be used directly as an edge
+endpoint. This is what lets a node accumulate edges across mentions/episodes
+instead of every triple minting a fresh, single-edge duplicate.
+
+Decision outcomes: MERGE (link to existing entity), MINT (create a new entity).
 """
 from __future__ import annotations
 
 import logging
+import re
 from enum import StrEnum
 from typing import Any
 
-from shared.types.ulid import mint
-
 log = logging.getLogger("curlyos.knowledge.resolution")
+
+DEFAULT_SCOPE = "user:usr_hiten"
 
 
 class ResolutionDecision(StrEnum):
-    MERGE = "merge"       # Same entity — link to existing
-    MINT = "mint"         # New entity — create fresh
-    AMBIGUOUS = "ambiguous"  # Uncertain — defer to Reflection agent
+    MERGE = "merge"          # Same entity — link to the returned existing id
+    MINT = "mint"            # New entity — create fresh
+    AMBIGUOUS = "ambiguous"  # Reserved (defer to Reflection); not yet emitted
 
 
-# ── Entity mention store ────────────────────────────────────────────────────
-
-# In-memory cache of known entities (populated from Postgres at startup)
-_known_entities: dict[str, dict] = {}  # name → {id, embedding, aliases, mention_count}
-
-
-def load_known_entities(pool: Any) -> None:
-    """Load entity mentions from memories table into the resolution cache."""
-    global _known_entities
-    import psycopg
-
-    try:
-        conn = psycopg.connect(
-            pool._dsn if hasattr(pool, '_dsn') else str(pool),
-            autocommit=True
-        )
-        rows = conn.execute(
-            "SELECT DISTINCT ON (statement_key) id, statement, statement_key "
-            "FROM memories WHERE kind = 'fact' AND valid_to IS NULL "
-            "ORDER BY statement_key, created_at DESC LIMIT 500"
-        ).fetchall()
-        for r in rows:
-            key = r[2]  # statement_key (normalised)
-            if key and len(key) > 3:
-                _known_entities[key] = {"id": r[0], "statement": r[1]}
-        conn.close()
-        log.info("Loaded %d known entities for resolution", len(_known_entities))
-    except Exception as e:
-        log.warning("Failed to load known entities: %s", e)
+def normalize_mention(mention: str) -> str:
+    """Canonical comparison form for an entity name."""
+    return re.sub(r"\s+", " ", (mention or "").strip().lower())
 
 
 async def resolve_entity(
     mention: str,
-    embedder: Any = None,
+    scope: str = DEFAULT_SCOPE,
     pool: Any = None,
+    embedder: Any = None,
     similarity_threshold: float = 0.85,
 ) -> tuple[ResolutionDecision, str | None]:
-    """Resolve a mentioned entity against known entities.
+    """Resolve `mention` against existing entities in `scope`.
 
-    Returns (decision, existing_entity_key_or_None).
+    Returns (decision, entity_id_or_None). With no pool we cannot look anything
+    up, so we MINT (the offline/test path). The returned id on MERGE is a real
+    knowledge_entities.id — safe to pass straight to create_edge.
     """
-    from shared.types.ulid import is_valid
+    normalized = normalize_mention(mention)
+    if len(normalized) < 2 or pool is None:
+        return ResolutionDecision.MINT, None
 
-    # Normalize
-    import re
-    normalized = re.sub(r"\s+", " ", mention.strip().lower())
+    # 1. Exact normalized-name match (scope-bound). Pick the OLDEST row so
+    #    repeated resolution converges on a single canonical node.
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT id FROM knowledge_entities "
+                    "WHERE scope = %s AND lower(name) = %s AND valid_to IS NULL "
+                    "ORDER BY created_at ASC LIMIT 1",
+                    (scope, normalized),
+                )
+                row = await cur.fetchone()
+                if row is not None:
+                    return ResolutionDecision.MERGE, row[0]
+    except Exception as e:  # noqa: BLE001 — resolution must never break ingest
+        log.warning("exact-match resolution failed for %r: %s", mention, e)
 
-    # 1. Exact match
-    if normalized in _known_entities:
-        return ResolutionDecision.MERGE, normalized
-
-    # 2. Substring match (e.g. "Zed" in "Zed Editor")
-    for key, info in _known_entities.items():
-        if normalized in key or key in normalized:
-            if len(normalized) >= 3 and len(key) >= 3:  # avoid tiny matches
-                return ResolutionDecision.MERGE, key
-
-    # 3. ANN blocking (if embedder available)
-    if embedder is not None and pool is not None:
+    # 2. ANN blocking — semantic near-duplicate. Only sees embedded rows.
+    if embedder is not None:
         try:
             vec = await embedder.embed_single(mention)
-            # Query pgvector for nearest neighbor
-            import psycopg
-            conn = psycopg.connect(
-                pool._dsn if hasattr(pool, '_dsn') else str(pool),
-                autocommit=True
-            )
-            result = conn.execute(
-                "SELECT statement_key, 1 - (embedding <=> %s::vector) AS sim "
-                "FROM memories WHERE embedding IS NOT NULL AND kind = 'fact' AND valid_to IS NULL "
-                "ORDER BY embedding <=> %s::vector LIMIT 1",
-                [str(vec), str(vec)]
-            ).fetchone()
-            conn.close()
-            if result and float(result[1]) >= similarity_threshold:
-                return ResolutionDecision.MERGE, result[0]
-        except Exception as e:
-            log.debug("ANN resolution failed: %s", e)
+            async with pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT id, 1 - (embedding <=> %s::vector) AS sim "
+                        "FROM knowledge_entities "
+                        "WHERE embedding IS NOT NULL AND scope = %s AND valid_to IS NULL "
+                        "ORDER BY embedding <=> %s::vector LIMIT 1",
+                        (str(vec), scope, str(vec)),
+                    )
+                    row = await cur.fetchone()
+                    if row is not None and float(row[1]) >= similarity_threshold:
+                        return ResolutionDecision.MERGE, row[0]
+        except Exception as e:  # noqa: BLE001
+            log.debug("ANN resolution failed for %r: %s", mention, e)
 
-    # 4. No match found → mint new entity
+    # 3. No match → mint a new entity.
     return ResolutionDecision.MINT, None

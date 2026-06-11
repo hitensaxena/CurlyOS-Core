@@ -99,15 +99,34 @@ async def extract_with_llm(
                 continue
         return triples
     except Exception as e:
-        log.warning("LLM extraction failed, using regex fallback: %s", e)
-        return extract_with_patterns(episode_content, source_episode_id)
+        # Do NOT fall back to regex here: the pattern extractor grabs arbitrary
+        # noun-phrase spans and pollutes the graph with sentence fragments. An
+        # LLM client was provided, so a transient failure should yield nothing
+        # (the episode can be re-extracted) rather than garbage triples.
+        log.warning("LLM extraction failed (no triples emitted): %s", e)
+        return []
+
+
+def _looks_like_entity(s: str) -> bool:
+    """Reject sentence fragments so the regex path can't fabricate junk nodes.
+
+    Entities are short noun phrases — a name, a tool, a project. Long spans or
+    many-word runs are almost always a regex over-match (e.g. "every 30 minutes
+    and philosophy prompts are queued for 9am daily").
+    """
+    s = s.strip()
+    return 2 < len(s) <= 40 and len(s.split()) <= 4
 
 
 def extract_with_patterns(
     episode_content: str,
     source_episode_id: str,
 ) -> list[ExtractedTriple]:
-    """Rule-based extraction — no LLM needed. Handles common patterns."""
+    """Rule-based extraction — no LLM needed. Handles common patterns.
+
+    Used only on the offline path (no llm_client). Output is quality-gated by
+    _looks_like_entity so it cannot inject sentence-fragment "entities".
+    """
     triples = []
 
     # Pattern: "X uses Y" / "X switched from Y to Z"
@@ -115,7 +134,7 @@ def extract_with_patterns(
         subject = match.group(1).strip()
         predicate = "uses"
         obj = match.group(3).strip() if match.group(3) else match.group(2).strip()
-        if len(subject) > 2 and len(obj) > 2:
+        if _looks_like_entity(subject) and _looks_like_entity(obj):
             triples.append(ExtractedTriple(
                 subject=subject, predicate=predicate, object=obj,
                 confidence=0.7, source_episode_id=source_episode_id,
@@ -126,7 +145,8 @@ def extract_with_patterns(
     for match in re.finditer(r'(\w[\w\s]+?)\s+(?:is|are)\s+(?:an?\s+)?(\w[\w\s]+?)(?:\.|,|$)', episode_content, re.IGNORECASE):
         subject = match.group(1).strip()
         obj = match.group(2).strip()
-        if len(subject) > 2 and len(obj) > 2 and subject.lower() not in ("it", "this", "that", "there"):
+        if (_looks_like_entity(subject) and _looks_like_entity(obj)
+                and subject.lower() not in ("it", "this", "that", "there")):
             triples.append(ExtractedTriple(
                 subject=subject, predicate="is", object=obj,
                 confidence=0.7, source_episode_id=source_episode_id,

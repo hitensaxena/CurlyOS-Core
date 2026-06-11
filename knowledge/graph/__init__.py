@@ -117,12 +117,14 @@ async def create_entity(
     entity_id = mint("ent")
     props = properties or {}
 
-    # Build embedding text if embedder is provided
+    # Build embedding text if embedder is provided. Use embed_single — embed()
+    # expects a list and returns a list-of-vectors; passing a bare string only
+    # produced a usable vector by accident.
     embedding = None
     if embedder is not None:
-        embed_text = f"{name} {json.dumps(props)}"
+        embed_text = f"{name} {json.dumps(props)}" if props else name
         try:
-            embedding = await embedder.embed(embed_text)
+            embedding = await embedder.embed_single(embed_text)
         except Exception as e:
             log.warning("Embedding generation failed for entity %s: %s", entity_id, e)
 
@@ -546,7 +548,7 @@ async def extract_and_project(
     when processing `memory.episode.recorded` events.
     """
     from knowledge.extraction import extract_with_llm, ExtractedTriple
-    from knowledge.resolution import resolve_entity, ResolutionDecision
+    from knowledge.resolution import resolve_entity, ResolutionDecision, normalize_mention
 
     # 1. Extract triples
     triples = await extract_with_llm(episode_content, episode_id, llm_client=llm_client)
@@ -556,36 +558,42 @@ async def extract_and_project(
     entities_merged = 0
     edges_created = 0
 
+    # Within-episode cache (normalized name → entity id). Dedupes repeated
+    # mentions in one episode and dodges any read-after-write visibility gap
+    # between the create_entity commit and the next resolve_entity lookup.
+    seen: dict[str, str] = {}
+
+    async def _get_or_create(mention: str) -> str | None:
+        nonlocal entities_created, entities_merged
+        norm = normalize_mention(mention)
+        if len(norm) < 2:
+            return None
+        if norm in seen:
+            entities_merged += 1
+            return seen[norm]
+        decision, key = await resolve_entity(
+            mention, scope=scope, pool=pool, embedder=embedder,
+        )
+        if decision == ResolutionDecision.MINT or not key:
+            ent = await create_entity(
+                pool, publisher, scope, mention.strip(),
+                source_episode_id=episode_id, embedder=embedder,
+            )
+            entities_created += 1
+            eid = ent["id"]
+        else:
+            entities_merged += 1
+            eid = key
+        seen[norm] = eid
+        return eid
+
     for triple in triples:
-        # Resolve subject
-        s_decision, s_key = await resolve_entity(triple.subject, embedder=embedder, pool=pool)
-        if s_decision == ResolutionDecision.MINT:
-            s_entity = await create_entity(
-                pool, publisher, scope, triple.subject,
-                source_episode_id=episode_id, embedder=embedder,
-            )
-            entities_created += 1
-        else:
-            s_entity = {"id": s_key}  # use existing
-            entities_merged += 1
-
-        # Resolve object
-        o_decision, o_key = await resolve_entity(triple.object, embedder=embedder, pool=pool)
-        if o_decision == ResolutionDecision.MINT:
-            o_entity = await create_entity(
-                pool, publisher, scope, triple.object,
-                source_episode_id=episode_id, embedder=embedder,
-            )
-            entities_created += 1
-        else:
-            o_entity = {"id": o_key}
-            entities_merged += 1
-
-        # Create edge
-        if s_entity.get("id") and o_entity.get("id") and s_entity["id"] != o_entity["id"]:
+        s_id = await _get_or_create(triple.subject)
+        o_id = await _get_or_create(triple.object)
+        if s_id and o_id and s_id != o_id:
             await create_edge(
                 pool, publisher,
-                s_entity["id"], o_entity["id"], triple.predicate,
+                s_id, o_id, triple.predicate,
                 properties={"confidence": triple.confidence},
                 source_episode_id=episode_id,
             )
