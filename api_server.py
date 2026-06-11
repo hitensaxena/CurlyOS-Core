@@ -602,17 +602,32 @@ async def propose_identity(body: ProposeIdentityRequest):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/graph")
-def get_graph(scope: str = SCOPE, limit: int = Query(default=200, le=500)):
+def get_graph(scope: str = SCOPE, limit: int = Query(default=1500, le=5000)):
+    # Order by full-graph degree (not recency) so the hubs are always in view
+    # when the limit truncates — recency ordering buried Hiten et al. behind a
+    # window of the newest leaf nodes. Default limit comfortably exceeds the
+    # current graph (~1.3k entities) so the whole thing renders.
     with get_conn() as conn:
         entities = conn.execute(
-            "SELECT id, name, label, properties, epistemic_status FROM knowledge_entities WHERE scope = %s AND valid_to IS NULL ORDER BY created_at DESC LIMIT %s",
+            "WITH deg AS ("
+            "  SELECT eid, count(*) AS d FROM ("
+            "    SELECT src_entity_id AS eid FROM knowledge_edges WHERE valid_to IS NULL "
+            "    UNION ALL "
+            "    SELECT dst_entity_id FROM knowledge_edges WHERE valid_to IS NULL"
+            "  ) x GROUP BY eid"
+            ") "
+            "SELECT e.id, e.name, e.label, e.properties, e.epistemic_status, "
+            "       COALESCE(d.d, 0) AS degree "
+            "FROM knowledge_entities e "
+            "LEFT JOIN deg d ON d.eid = e.id "
+            "WHERE e.scope = %s AND e.valid_to IS NULL "
+            "ORDER BY degree DESC, e.created_at DESC LIMIT %s",
             [scope, limit],
         ).fetchall()
         entity_ids = [e["id"] for e in entities]
         edges = []
         if entity_ids:
-            # Both directions — an inbound-only node must still show its edges
-            # and earn a non-zero degree.
+            # Both directions — an inbound-only node must still show its edges.
             edges = conn.execute(
                 "SELECT id, src_entity_id, dst_entity_id, rel_type, properties FROM knowledge_edges WHERE (src_entity_id = ANY(%s) OR dst_entity_id = ANY(%s)) AND valid_to IS NULL",
                 [entity_ids, entity_ids],
@@ -622,14 +637,10 @@ def get_graph(scope: str = SCOPE, limit: int = Query(default=200, le=500)):
     _idset = set(entity_ids)
     edges = [e for e in edges if e["src_entity_id"] in _idset and e["dst_entity_id"] in _idset]
 
-    # Build degree map
-    degree: dict[str, int] = {}
-    for e in edges:
-        degree[e["src_entity_id"]] = degree.get(e["src_entity_id"], 0) + 1
-        degree[e["dst_entity_id"]] = degree.get(e["dst_entity_id"], 0) + 1
-
+    # degree is the FULL-graph degree (from SQL), so a node shows its true
+    # connectivity even when some neighbors fall outside a truncated window.
     nodes = [
-        {"id": e["id"], "name": e["name"], "label": e["label"], "degree": degree.get(e["id"], 0)}
+        {"id": e["id"], "name": e["name"], "label": e["label"], "degree": e["degree"]}
         for e in entities
     ]
     links = [
