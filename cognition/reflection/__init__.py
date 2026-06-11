@@ -313,6 +313,29 @@ def _analyze_heuristic(episodes, identity_ctx):
 
 # ── Weekly reflection (task API) ─────────────────────────────────────────────
 
+async def _kg_recurring_themes(pool: Any, scope: str, limit: int = 15) -> list[dict]:
+    """Recurring themes = the most-connected entities in the current knowledge
+    graph (clean/typed/deduped), NOT raw capitalized-word frequency (which
+    produced sentence-fragment junk like "It"/"There" mentioned hundreds of
+    times). Returns [{"phrase","count"}] where count is graph degree.
+    """
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "WITH deg AS ("
+                "  SELECT eid, count(*) d FROM ("
+                "    SELECT src_entity_id eid FROM knowledge_edges WHERE valid_to IS NULL "
+                "    UNION ALL SELECT dst_entity_id FROM knowledge_edges WHERE valid_to IS NULL"
+                "  ) x GROUP BY eid) "
+                "SELECT e.name, COALESCE(d.d, 0) FROM knowledge_entities e "
+                "LEFT JOIN deg d ON d.eid = e.id "
+                "WHERE e.scope = %s AND e.valid_to IS NULL AND lower(e.name) <> 'hiten' "
+                "AND COALESCE(d.d, 0) >= 2 ORDER BY COALESCE(d.d, 0) DESC, e.created_at ASC LIMIT %s",
+                (scope, limit),
+            )
+            return [{"phrase": n, "count": d} for n, d in await cur.fetchall()]
+
+
 async def run_weekly_reflection(
     pool: Any,
     publisher: Any,
@@ -357,18 +380,8 @@ async def run_weekly_reflection(
     if episodes_scanned == 0:
         return {"report_id": rpt_id, "findings_count": 0, "identity_candidates_count": 0}
 
-    # 2. Extract recurring themes (proper noun phrases)
-    noun_phrase_re = re.compile(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b')
-    all_text = " ".join(r[1] for r in episode_rows)
-    phrases = noun_phrase_re.findall(all_text)
-    phrase_counts: dict[str, int] = {}
-    for p in phrases:
-        phrase_counts[p] = phrase_counts.get(p, 0) + 1
-    recurring_themes = [
-        {"phrase": phrase, "count": count}
-        for phrase, count in sorted(phrase_counts.items(), key=lambda x: -x[1])
-        if count >= 2 and (" " in phrase or phrase.lower() not in _ARTIFACT_WORDS)
-    ][:20]
+    # 2. Recurring themes from the knowledge graph (clean/typed/deduped).
+    recurring_themes = await _kg_recurring_themes(pool, scope)
 
     # 3. Track goal progress: first-class goals (Phase G), legacy fallback inside
     goal_deltas: list[dict] = []
@@ -426,7 +439,7 @@ async def run_weekly_reflection(
     findings: list[dict] = list(llm_findings)
     for theme in recurring_themes[:10]:
         findings.append({
-            "statement": f"Recurring theme: '{theme['phrase']}' (mentioned {theme['count']}x)",
+            "statement": f"Recurring theme: {theme['phrase']} (connected to {theme['count']} things in the knowledge graph)",
             "confidence": min(0.5 + theme["count"] * 0.05, 0.9),
             "tags": ["theme"],
         })
@@ -519,18 +532,8 @@ async def run_monthly_reflection(
     if episodes_scanned == 0:
         return {"report_id": rpt_id, "findings_count": 0, "identity_candidates_count": 0, "summary": "Monthly reflection: no episodes found"}
 
-    # 2. Extract recurring themes (proper noun phrases)
-    noun_phrase_re = re.compile(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b')
-    all_text = " ".join(r[1] for r in episode_rows)
-    phrases = noun_phrase_re.findall(all_text)
-    phrase_counts: dict[str, int] = {}
-    for p in phrases:
-        phrase_counts[p] = phrase_counts.get(p, 0) + 1
-    recurring_themes = [
-        {"phrase": phrase, "count": count}
-        for phrase, count in sorted(phrase_counts.items(), key=lambda x: -x[1])
-        if count >= 2 and (" " in phrase or phrase.lower() not in _ARTIFACT_WORDS)
-    ][:20]
+    # 2. Recurring themes from the knowledge graph (clean/typed/deduped).
+    recurring_themes = await _kg_recurring_themes(pool, scope)
 
     # 2b. Deeper analysis: mental_models review
     mental_model_findings: list[dict] = []
@@ -600,7 +603,7 @@ async def run_monthly_reflection(
     findings: list[dict] = list(llm_findings)
     for theme in recurring_themes[:15]:
         findings.append({
-            "statement": f"Recurring theme: '{theme['phrase']}' (mentioned {theme['count']}x)",
+            "statement": f"Recurring theme: {theme['phrase']} (connected to {theme['count']} things in the knowledge graph)",
             "confidence": min(0.5 + theme["count"] * 0.05, 0.9),
             "tags": ["theme"],
         })

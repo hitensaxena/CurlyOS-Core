@@ -21,6 +21,7 @@ import api_server
 from cognition.reflection import run_weekly_reflection, run_monthly_reflection
 from cognition.narrative import surface_themes, compose_chapters
 from cognition.attention import detect_alignment_gaps, get_allocation, estimate_cognitive_load
+from cognition.meta import run_decision_audit, distill_principles
 
 DSN = os.environ["CURLYOS_DATABASE_URL"]
 SCOPE = os.environ.get("CURLYOS_SCOPE", "user:usr_hiten")
@@ -89,6 +90,27 @@ async def main():
     alloc = await get_allocation(pool=pool, scope=SCOPE, window_days=7)
     load = await estimate_cognitive_load(pool=pool, scope=SCOPE, window_days=14)
     log(f"attention: gaps={len(gaps)} load={load}")
+
+    # 5. Meta-cognition: clear stale decision_audits + principles, re-derive from
+    #    clean data, re-mirror principles into recallable memories.
+    conn = psycopg.connect(DSN, autocommit=True)
+    n_da = conn.execute("DELETE FROM decision_audits WHERE scope = %s", [SCOPE]).rowcount
+    n_pr = conn.execute(
+        "UPDATE principles SET valid_to = now() WHERE valid_to IS NULL AND scope = %s", [SCOPE]
+    ).rowcount
+    conn.close()
+    log(f"cleared {n_da} stale decision_audits + superseded {n_pr} principles")
+    audit = await run_decision_audit(pool=pool, publisher=pub, scope=SCOPE,
+                                     window_days=30, llm_client=llm, llm_model=model)
+    principles = await distill_principles(pool=pool, publisher=pub, scope=SCOPE,
+                                          llm_client=llm, llm_model=model)
+    log(f"meta: audit={audit} principles_distilled={len(principles)}")
+    try:
+        emb = await api_server.get_shared_embedder()
+        sync = await api_server._sync_principles_to_memory(pool, pub, emb, SCOPE)
+        log(f"principle mirror: {sync}")
+    except Exception as e:  # noqa: BLE001
+        log(f"principle mirror skipped: {e}")
     log("DONE")
 
 
