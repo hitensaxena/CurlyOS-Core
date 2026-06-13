@@ -51,11 +51,12 @@ def log(m): print(m, flush=True)
 
 
 async def make_llm():
+    # Default OpenRouter; override LLM_BASE_URL + LLM_API_KEY to use the Claude Max
+    # hermes-bridge (base http://localhost:8787/v1, key BRIDGE_API_KEY).
     from openai import AsyncOpenAI
-    return AsyncOpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=os.environ["OPENROUTER_API_KEY"], timeout=90.0, max_retries=2,
-    )
+    base = os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
+    key = os.environ.get("LLM_API_KEY") or os.environ.get("OPENROUTER_API_KEY", "")
+    return AsyncOpenAI(base_url=base, api_key=key, timeout=90.0, max_retries=2)
 
 
 async def classify(llm, batch):

@@ -35,3 +35,7 @@ Thumbs.db
 
 # Don't ignore these
 !deploy/.env.example
+
+# large personal-data exports (mind vault) — do not publish
+deploy/*.tsv
+deploy/*.jsonl
