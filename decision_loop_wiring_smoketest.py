@@ -22,7 +22,9 @@ import psycopg
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from goals import record_decision, review_decision
-from cognition.decision_loop import retrieve_lessons_async
+from cognition.decision_loop import (
+    retrieve_lessons_async, record_outcome_async, distill_lessons_from_outcomes,
+)
 from shared.embeddings.implementations import HashEmbedder
 from shared.types.ulid import mint
 
@@ -161,6 +163,41 @@ async def main():
         top = next((h for h in hits if h["id"] == res["lesson_id"]), None)
         check("similarity high for same-text query", top and top["similarity"] > 0.99,
               top["similarity"] if top else None)
+
+        print("\n[4] automatic distillation from a high-surprise outcome (no hand-written lesson)")
+        dec2 = await record_decision(
+            pool, pub, SCOPE,
+            title="Skip writing tests for the ingest worker to ship faster",
+            chosen="ship without tests",
+            rationale="deadline pressure, code looked simple",
+            reversibility="costly",
+            predicted_outcome="no regressions, saves a day",
+            prediction_confidence=0.9,
+        )
+        out2 = await record_outcome_async(
+            conn, scope=SCOPE, decision_id=dec2["id"],
+            summary="A silent embedding-dim bug shipped and corrupted a batch; cost two days",
+            valence="failure", matched_prediction=False,  # surprise = (0.9-0)^2 = 0.81
+        )
+        # No embedder → no-op (guard).
+        noop = await distill_lessons_from_outcomes(pool, scope=SCOPE, embedder=None)
+        check("no embedder → distillation is a no-op", noop["lessons_created"] == 0, noop)
+
+        dist = await distill_lessons_from_outcomes(
+            pool, scope=SCOPE, embedder=embedder, llm_client=None)  # heuristic statement
+        check("high-surprise outcome distilled into a lesson", dist["lessons_created"] >= 1, dist)
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, properties->>'kg_entity_id' FROM lessons "
+                "WHERE scope=%s AND %s = ANY(derived_from_outcomes)", (SCOPE, out2))
+            lrow = await cur.fetchone()
+        check("lesson links back to the outcome", lrow is not None, lrow)
+        check("auto-distilled lesson mirrored to KG", lrow and lrow[1], lrow)
+
+        dist2 = await distill_lessons_from_outcomes(
+            pool, scope=SCOPE, embedder=embedder, llm_client=None)
+        check("re-run is idempotent (outcome already distilled)",
+              dist2["lessons_created"] == 0 and dist2["lessons_reinforced"] == 0, dist2)
 
     finally:
         await conn.rollback()  # leave no residue

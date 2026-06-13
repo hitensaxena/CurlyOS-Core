@@ -470,3 +470,103 @@ async def mirror_lesson_to_kg_async(
             (entity_id, lesson_id),
         )
     return entity_id
+
+
+# ===========================================================================
+# Automatic distillation — the reflection step. Turns high-surprise outcomes
+# (the system was confidently wrong) into lessons without waiting for a human
+# or agent to hand-write one. The LLM is an optional seam; a heuristic
+# statement is always available so the loop runs even with no model.
+# ===========================================================================
+
+# Brier >= 0.25 means a >=0.5-confidence prediction missed (or a very confident
+# one was somewhat off) — the threshold where surprise is worth a lesson.
+DEFAULT_SURPRISE_THRESHOLD = 0.25
+
+
+async def _distill_statement(
+    llm_client, model, *, title, context, chosen, rationale, predicted, valence, summary,
+) -> str:
+    """Produce a one-sentence, generalizable lesson. LLM if available; otherwise
+    a heuristic seed that still captures decision/prediction/actual."""
+    heuristic = (
+        f"On '{title}', the bet was '{predicted}' but it turned out {valence}: "
+        f"{summary[:180]}. Revisit the assumption behind '{chosen}'."
+    )
+    if llm_client is None:
+        return heuristic
+    try:
+        prompt = (
+            "Distil ONE reusable lesson (a single sentence, generalizable and "
+            "actionable) from a decision whose outcome surprised us. Capture the "
+            "transferable principle, not the specifics.\n\n"
+            f"Decision: {title}\nContext: {context or '-'}\nChose: {chosen}\n"
+            f"Rationale: {rationale}\nPredicted: {predicted}\n"
+            f"Actual ({valence}): {summary}\n\nLesson:"
+        )
+        resp = await llm_client.chat.completions.create(
+            model=model, messages=[{"role": "user", "content": prompt}],
+            temperature=0.3, max_tokens=120,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        return text or heuristic
+    except Exception:  # noqa: BLE001 — never let a model failure break reflection
+        return heuristic
+
+
+async def distill_lessons_from_outcomes(
+    pool,
+    *,
+    scope: str,
+    embedder: Any = None,
+    llm_client: Any = None,
+    llm_model: str = "gpt-4o-mini",
+    surprise_threshold: float = DEFAULT_SURPRISE_THRESHOLD,
+    limit: int = 20,
+) -> dict[str, int]:
+    """Reflection step: distil lessons from high-surprise, not-yet-distilled
+    outcomes (reinforce-or-create), then mirror each into the knowledge graph.
+
+    Idempotent: an outcome already referenced by some lesson's
+    derived_from_outcomes is skipped, so repeated reflection passes converge.
+    Requires an embedder (lessons must be embedded to dedup + retrieve); with
+    none, it is a no-op.
+    """
+    result = {"outcomes_considered": 0, "lessons_created": 0, "lessons_reinforced": 0}
+    if embedder is None:
+        return result
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT o.id, o.summary, o.valence, "
+                "       d.title, d.context, d.chosen, d.rationale, d.predicted_outcome "
+                "FROM outcomes o JOIN decisions d ON d.id = o.decision_id "
+                "WHERE o.scope = %s AND o.valid_to IS NULL AND o.surprise >= %s "
+                "  AND NOT EXISTS (SELECT 1 FROM lessons l "
+                "     WHERE l.scope = o.scope AND l.valid_to IS NULL "
+                "       AND o.id = ANY(l.derived_from_outcomes)) "
+                "ORDER BY o.surprise DESC LIMIT %s",
+                (scope, surprise_threshold, limit),
+            )
+            candidates = await cur.fetchall()
+
+    result["outcomes_considered"] = len(candidates)
+    for (out_id, summary, valence, title, context, chosen, rationale, predicted) in candidates:
+        statement = await _distill_statement(
+            llm_client, llm_model, title=title, context=context, chosen=chosen,
+            rationale=rationale, predicted=predicted or "(none recorded)",
+            valence=valence, summary=summary,
+        )
+        embedding = (await embedder.embed([statement]))[0]
+        async with pool.connection() as conn:
+            _les_id, action = await distill_or_reinforce_lesson_async(
+                conn, scope=scope, statement=statement, embedding=embedding,
+                derived_from_outcomes=[out_id],
+            )
+            await mirror_lesson_to_kg_async(conn, scope=scope, lesson_id=_les_id)
+        if action == "created":
+            result["lessons_created"] += 1
+        else:
+            result["lessons_reinforced"] += 1
+    return result
