@@ -9,6 +9,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -1861,6 +1862,35 @@ async def _sweep_unembedded() -> None:
         logger.exception("unembedded sweep failed")
 
 
+# Harness/tooling scaffolding that leaks into captured "user" turns: task
+# notifications delivered as user messages, injected system reminders, and
+# slash-command wrappers. None of it is personal content — left in, it became
+# episodes/memories, derailed narrative compose, and polluted recall/search.
+_SCAFFOLD_TAGS = (
+    "system-reminder", "task-notification", "command-name", "command-message",
+    "command-args", "command-output", "local-command-stdout",
+    "local-command-stderr", "user-prompt-submit-hook",
+)
+_SCAFFOLD_BLOCK_RE = re.compile(
+    r"<(" + "|".join(_SCAFFOLD_TAGS) + r")\b[^>]*>.*?</\1\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+_SCAFFOLD_TAG_RE = re.compile(
+    r"</?(" + "|".join(_SCAFFOLD_TAGS) + r")\b[^>]*>", re.IGNORECASE
+)
+
+
+def _strip_scaffolding(text: str) -> str:
+    """Strip harness scaffolding blocks from a captured turn, returning only the
+    human content. Returns "" when the turn was pure scaffolding (e.g. a bare
+    <task-notification> delivered as a user message)."""
+    if not text:
+        return ""
+    cleaned = _SCAFFOLD_BLOCK_RE.sub("", text)
+    cleaned = _SCAFFOLD_TAG_RE.sub("", cleaned)  # drop any unpaired leftovers
+    return cleaned.strip()
+
+
 @app.post("/api/ingest")
 async def ingest(body: IngestRequest, background_tasks: BackgroundTasks):
     """Record raw text as an episode in curlyos-memory and process it.
@@ -1878,6 +1908,12 @@ async def ingest(body: IngestRequest, background_tasks: BackgroundTasks):
     text = body.text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
+    # Remove harness scaffolding before anything is recorded. A turn that is
+    # *only* scaffolding has no human content and is skipped without creating
+    # rows, so it can't pollute episodes/memories/extraction/recall.
+    text = _strip_scaffolding(text)
+    if not text:
+        return {"skipped": "scaffolding-only"}
     source_ref = body.source_ref or "web:capture"
     scope = body.scope or SCOPE
     add_memory = body.add_memory
