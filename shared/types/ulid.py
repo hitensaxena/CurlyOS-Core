@@ -47,6 +47,8 @@ PREFIXES: dict[str, str] = {
     "discovery": "dsc",
     "goal": "goal",
     "decision": "dec",
+    "outcome": "out",
+    "lesson": "les",
     "opportunity": "opp",
     # Introspection prefixes
     "assumption": "asu",
