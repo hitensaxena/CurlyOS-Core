@@ -283,3 +283,190 @@ def mirror_lesson_to_kg(
         (entity_id, lesson_id),
     )
     return entity_id
+
+
+# ===========================================================================
+# Async variants — for the live app path (orchestration/goals use a psycopg3
+# async pool). Same SQL + scoring as the sync helpers above (which serve the
+# sync consolidation/reflection world and the smoketests); they reuse the pure
+# _vec / _brier_surprise so the logic stays single-sourced.
+# ===========================================================================
+
+async def record_outcome_async(
+    conn,
+    *,
+    scope: str,
+    decision_id: str,
+    summary: str,
+    valence: str,
+    embedding: Optional[Sequence[float]] = None,
+    goal_id: Optional[str] = None,
+    matched_prediction: Optional[bool] = None,
+    metrics: Optional[dict[str, Any]] = None,
+    evidence_refs: Optional[list[str]] = None,
+    source_episode_id: Optional[str] = None,
+) -> str:
+    """Async record_outcome. `embedding` may be None (outcome still recorded
+    and scored; it just won't be semantically retrievable)."""
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT prediction_confidence FROM decisions WHERE id = %s",
+                          (decision_id,))
+        row = await cur.fetchone()
+        if row is None:
+            raise ValueError(f"decision {decision_id} not found")
+        surprise = _brier_surprise(row[0], matched_prediction)
+
+        out_id = mint("out")
+        vec = _vec(embedding) if embedding is not None else None
+        await cur.execute(
+            "INSERT INTO outcomes "
+            "(id, scope, decision_id, goal_id, summary, valence, matched_prediction, "
+            " surprise, metrics, evidence_refs, embedding, source_episode_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, %s)",
+            (out_id, scope, decision_id, goal_id, summary, valence, matched_prediction,
+             surprise, json.dumps(metrics or {}), evidence_refs or [], vec, source_episode_id),
+        )
+        await cur.execute(
+            "UPDATE decisions SET outcome = %s, outcome_id = %s, reviewed_at = now() WHERE id = %s",
+            (summary, out_id, decision_id),
+        )
+    return out_id
+
+
+async def distill_or_reinforce_lesson_async(
+    conn,
+    *,
+    scope: str,
+    statement: str,
+    embedding: Sequence[float],
+    derived_from_outcomes: list[str],
+    applies_when: Optional[str] = None,
+    conditions: Optional[dict[str, Any]] = None,
+    applies_to_entities: Optional[list[str]] = None,
+    updates_model: Optional[str] = None,
+    source_episode_id: Optional[str] = None,
+    sim_threshold: float = 0.85,
+    confidence_step: float = 0.1,
+) -> tuple[str, str]:
+    """Async distill_or_reinforce_lesson. Returns (lesson_id, "created"|"reinforced")."""
+    vec = _vec(embedding)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT id, 1 - (embedding <=> %s::vector) AS sim FROM lessons "
+            "WHERE scope = %s AND valid_to IS NULL AND embedding IS NOT NULL "
+            "ORDER BY embedding <=> %s::vector LIMIT 1",
+            (vec, scope, vec),
+        )
+        nearest = await cur.fetchone()
+        if nearest is not None and nearest[1] is not None and nearest[1] >= sim_threshold:
+            lesson_id = nearest[0]
+            await cur.execute(
+                "UPDATE lessons SET "
+                "  support_count = support_count + 1, "
+                "  confidence = LEAST(1.0, confidence + %s), "
+                "  derived_from_outcomes = ("
+                "    SELECT ARRAY(SELECT DISTINCT unnest(derived_from_outcomes || %s::text[]))), "
+                "  status = CASE WHEN status = 'provisional' AND support_count + 1 >= 3 "
+                "                THEN 'validated' ELSE status END, "
+                "  properties = properties || jsonb_build_object('last_reinforced_at', now()::text) "
+                "WHERE id = %s",
+                (confidence_step, derived_from_outcomes, lesson_id),
+            )
+            return lesson_id, "reinforced"
+
+        lesson_id = mint("les")
+        await cur.execute(
+            "INSERT INTO lessons "
+            "(id, scope, statement, applies_when, conditions, derived_from_outcomes, "
+            " applies_to_entities, updates_model, embedding, source_episode_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::vector, %s)",
+            (lesson_id, scope, statement, applies_when, json.dumps(conditions or {}),
+             derived_from_outcomes, applies_to_entities or [], updates_model, vec,
+             source_episode_id),
+        )
+    return lesson_id, "created"
+
+
+async def retrieve_lessons_async(
+    conn,
+    *,
+    scope: str,
+    query_embedding: Sequence[float],
+    domain: Optional[str] = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Async retrieve_lessons — the feedback read used by Executive hydration."""
+    vec = _vec(query_embedding)
+    params: list[Any] = [vec, scope]
+    domain_clause = ""
+    if domain is not None:
+        domain_clause = "AND (conditions->>'domain' = %s OR conditions = '{}'::jsonb) "
+        params.append(domain)
+    params.append(vec)
+    params.append(limit)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT id, statement, confidence, support_count, status, "
+            "       1 - (embedding <=> %s::vector) AS similarity "
+            "FROM lessons WHERE scope = %s AND valid_to IS NULL AND embedding IS NOT NULL "
+            "  AND status IN ('provisional','validated') "
+            + domain_clause +
+            "ORDER BY embedding <=> %s::vector LIMIT %s",
+            tuple(params),
+        )
+        rows = await cur.fetchall()
+    return [
+        {"id": r[0], "statement": r[1], "confidence": r[2],
+         "support_count": r[3], "status": r[4], "similarity": r[5]}
+        for r in rows
+    ]
+
+
+async def mirror_lesson_to_kg_async(
+    conn,
+    *,
+    scope: str,
+    lesson_id: str,
+    rel_type: str = "applies_to",
+    source_episode_id: Optional[str] = None,
+) -> str:
+    """Async mirror_lesson_to_kg — idempotent (cached on lessons.properties.kg_entity_id)."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT statement, embedding, applies_to_entities, properties->>'kg_entity_id' "
+            "FROM lessons WHERE id = %s AND valid_to IS NULL",
+            (lesson_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise ValueError(f"lesson {lesson_id} not found or invalidated")
+        statement, embedding, applies_to_entities, existing = row[0], row[1], row[2], row[3]
+        if existing:
+            return existing
+
+        entity_id = mint("ent")
+        name = statement if len(statement) <= 120 else statement[:117] + "..."
+        await cur.execute(
+            "INSERT INTO knowledge_entities "
+            "(id, scope, name, label, properties, embedding, epistemic_status, source_episode_id) "
+            "VALUES (%s, %s, %s, 'Lesson', %s, %s::vector, 'provisional', %s)",
+            (entity_id, scope, name, json.dumps({"lesson_id": lesson_id, "statement": statement}),
+             str(embedding) if embedding is not None else None, source_episode_id),
+        )
+        for dst in (applies_to_entities or []):
+            await cur.execute(
+                "SELECT 1 FROM knowledge_entities WHERE id = %s AND valid_to IS NULL", (dst,))
+            if await cur.fetchone() is None:
+                continue
+            await cur.execute(
+                "INSERT INTO knowledge_edges "
+                "(id, src_entity_id, dst_entity_id, rel_type, properties, source_episode_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (mint("cor"), entity_id, dst, rel_type, json.dumps({}), source_episode_id),
+            )
+        await cur.execute(
+            "UPDATE lessons SET properties = properties || jsonb_build_object('kg_entity_id', %s::text) "
+            "WHERE id = %s",
+            (entity_id, lesson_id),
+        )
+    return entity_id

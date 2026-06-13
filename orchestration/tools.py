@@ -108,6 +108,7 @@ async def _remember(deps: ToolDeps, args: dict) -> dict:
 async def _record_decision(deps: ToolDeps, args: dict) -> dict:
     from goals import record_decision
 
+    conf = args.get("prediction_confidence")
     return await record_decision(
         deps.pool, deps.publisher, deps.scope,
         title=str(args.get("title", ""))[:300],
@@ -117,7 +118,45 @@ async def _record_decision(deps: ToolDeps, args: dict) -> dict:
         reversibility=args.get("reversibility"),
         goal_id=args.get("goal_id"),
         review_at=args.get("review_at"),
+        predicted_outcome=(str(args["predicted_outcome"])[:2000]
+                           if args.get("predicted_outcome") else None),
+        prediction_confidence=(float(conf) if conf is not None else None),
     )
+
+
+async def _review_decision(deps: ToolDeps, args: dict) -> dict:
+    """Close the loop on a past decision: record the structured outcome and,
+    if a distilled lesson is given, reinforce/create + mirror it to the KG."""
+    from goals import review_decision
+
+    matched = args.get("matched_prediction")
+    return await review_decision(
+        deps.pool, deps.publisher, deps.scope,
+        str(args.get("dec_id", "")),
+        outcome=str(args.get("outcome", ""))[:4000],
+        valence=str(args.get("valence", "mixed")),
+        matched_prediction=(bool(matched) if matched is not None else None),
+        lesson=(str(args["lesson"])[:2000] if args.get("lesson") else None),
+        applies_to_entities=args.get("applies_to_entities") or None,
+        embedder=await deps.embedder_factory(),
+    )
+
+
+async def _recall_lessons(deps: ToolDeps, args: dict) -> dict:
+    """Retrieve lessons relevant to a query — the feedback half of the
+    decision → outcome → lesson loop, surfaced during hydration."""
+    from cognition.decision_loop import retrieve_lessons_async
+
+    query = str(args.get("query", ""))[:2000]
+    if not query:
+        return {"lessons": [], "count": 0}
+    embedding = (await (await deps.embedder_factory()).embed([query]))[0]
+    async with deps.pool.connection() as conn:
+        lessons = await retrieve_lessons_async(
+            conn, scope=deps.scope, query_embedding=embedding,
+            domain=args.get("domain"), limit=int(args.get("limit", 5)),
+        )
+    return {"lessons": lessons, "count": len(lessons)}
 
 
 async def _create_goal(deps: ToolDeps, args: dict) -> dict:
@@ -168,8 +207,17 @@ REGISTRY: dict[str, Tool] = {
         Tool("remember", "memory_write", "Store a fact/insight into memory (with provenance).",
              "statement: str, kind?: str", _remember),
         Tool("record_decision", "memory_write", "Record a decision in the registry.",
-             "title, chosen, rationale, reversibility?: reversible|costly|one_way, goal_id?, review_at?",
+             "title, chosen, rationale, reversibility?: reversible|costly|one_way, goal_id?, "
+             "review_at?, predicted_outcome?, prediction_confidence?: 0..1",
              _record_decision),
+        Tool("review_decision", "memory_write",
+             "Close a decision: record its outcome (scored vs the prediction) and an optional lesson.",
+             "dec_id, outcome, valence?: success|partial|failure|mixed|too_early, "
+             "matched_prediction?: bool, lesson?, applies_to_entities?: [ent_id]",
+             _review_decision),
+        Tool("recall_lessons", "read",
+             "Retrieve lessons learned from past decisions relevant to a query.",
+             "query: str, domain?, limit?", _recall_lessons),
         Tool("create_goal", "memory_write", "Create a new goal.",
              "title, description?, horizon?: life|year|quarter|month, success_criteria?",
              _create_goal),

@@ -126,6 +126,7 @@ def _include_goal_router() -> None:
         pool_factory=lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row),
         publisher_factory=lambda: _make_publisher_sync(),
         scope=SCOPE,
+        embedder_factory=get_shared_embedder,
     ))
 
 

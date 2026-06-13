@@ -66,7 +66,7 @@ Use notify only when the task asks to message the user."""
 
 _PLAN_USER = """TASK: {task}
 
-CONTEXT (memory + identity + goals):
+CONTEXT (memory + identity + goals + lessons):
 {context}"""
 
 
@@ -127,6 +127,14 @@ def make_graph(get_deps: DepsFn, llm: LLMFn | None, checkpointer: Any):
                     for g in goals["goals"][:10]))
         except Exception:  # noqa: BLE001
             log.warning("hydrate: goals failed", exc_info=True)
+        try:
+            lessons = await execute_tool("recall_lessons", deps, {"query": state["task"]})
+            if lessons.get("lessons"):
+                parts.append("LESSONS FROM PAST DECISIONS:\n" + "\n".join(
+                    f"- {ls['statement']} (confidence {round(ls['confidence'], 2)})"
+                    for ls in lessons["lessons"][:5]))
+        except Exception:  # noqa: BLE001
+            log.warning("hydrate: lessons failed", exc_info=True)
         return {"context": "\n\n".join(parts)[:6000]}
 
     async def plan(state: AgentState) -> dict:

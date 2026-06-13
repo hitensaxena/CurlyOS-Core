@@ -50,10 +50,17 @@ class RecordDecisionRequest(BaseModel):
     reversibility: str | None = Field(default=None, pattern="^(reversible|costly|one_way)$")
     goal_id: str | None = None
     review_at: str | None = None  # ISO timestamp
+    predicted_outcome: str | None = Field(default=None, max_length=2000)
+    prediction_confidence: float | None = Field(default=None, ge=0, le=1)
 
 
 class ReviewDecisionRequest(BaseModel):
     outcome: str = Field(min_length=1, max_length=4000)
+    valence: str = Field(default="mixed",
+                         pattern="^(success|partial|failure|mixed|too_early)$")
+    matched_prediction: bool | None = None
+    lesson: str | None = Field(default=None, max_length=2000)
+    applies_to_entities: list[str] = Field(default_factory=list)
 
 
 class CreateOpportunityRequest(BaseModel):
@@ -76,6 +83,7 @@ def make_router(
     pool_factory: Callable[[], Awaitable[Any]],
     publisher_factory: Callable[[], Any],
     scope: str,
+    embedder_factory: Callable[[], Awaitable[Any]] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api")
 
@@ -145,14 +153,22 @@ def make_router(
             context=body.context, options_considered=body.options_considered,
             reversibility=body.reversibility, goal_id=body.goal_id,
             review_at=body.review_at,
+            predicted_outcome=body.predicted_outcome,
+            prediction_confidence=body.prediction_confidence,
         )
 
     @router.post("/decisions/{dec_id}/review")
     async def decisions_review(dec_id: str, body: ReviewDecisionRequest):
         pool = await pool_factory()
+        embedder = await embedder_factory() if embedder_factory is not None else None
         try:
-            return await goals_mod.review_decision(pool, publisher_factory(), scope,
-                                                   dec_id, outcome=body.outcome)
+            return await goals_mod.review_decision(
+                pool, publisher_factory(), scope, dec_id,
+                outcome=body.outcome, valence=body.valence,
+                matched_prediction=body.matched_prediction,
+                lesson=body.lesson, applies_to_entities=body.applies_to_entities,
+                embedder=embedder,
+            )
         except ValueError as e:
             raise HTTPException(404, str(e))
 

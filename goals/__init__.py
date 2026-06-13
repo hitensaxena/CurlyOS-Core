@@ -213,6 +213,8 @@ async def record_decision(
     reversibility: str | None = None,
     goal_id: str | None = None,
     review_at: str | None = None,           # ISO timestamp or None
+    predicted_outcome: str | None = None,   # the falsifiable bet — scored at review
+    prediction_confidence: float | None = None,  # 0..1
     source_episode_id: str | None = None,
 ) -> dict:
     dec_id = mint("dec")
@@ -220,11 +222,13 @@ async def record_decision(
         async with conn.cursor() as cur:
             await cur.execute(
                 "INSERT INTO decisions (id, scope, title, context, options_considered, "
-                "chosen, rationale, reversibility, goal_id, review_at, source_episode_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "chosen, rationale, reversibility, goal_id, review_at, "
+                "predicted_outcome, prediction_confidence, source_episode_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 "RETURNING id, decided_at",
                 (dec_id, scope, title, context, json.dumps(options_considered or []),
-                 chosen, rationale, reversibility, goal_id, review_at, source_episode_id),
+                 chosen, rationale, reversibility, goal_id, review_at,
+                 predicted_outcome, prediction_confidence, source_episode_id),
             )
             row = await cur.fetchone()
         await _stage_and_emit(publisher, conn, "decision.recorded", dec_id, scope,
@@ -234,20 +238,58 @@ async def record_decision(
 
 
 async def review_decision(pool: Any, publisher: Any, scope: str, dec_id: str, *,
-                          outcome: str) -> dict:
+                          outcome: str,
+                          valence: str = "mixed",
+                          matched_prediction: bool | None = None,
+                          lesson: str | None = None,
+                          applies_to_entities: list[str] | None = None,
+                          embedder: Any = None) -> dict:
+    """Review a decision and close the loop: record a structured, Brier-scored
+    outcome (cognition.decision_loop), and — if a distilled `lesson` is supplied
+    — reinforce-or-create it and mirror it into the knowledge graph.
+
+    `decisions.outcome` is still kept as the human-readable cache. `embedder`
+    (any object with async .embed([...])) makes the outcome/lesson semantically
+    retrievable; if None, they are recorded but not embedded.
+    """
+    from cognition.decision_loop import (
+        record_outcome_async, distill_or_reinforce_lesson_async, mirror_lesson_to_kg_async,
+    )
+
+    async def _embed(text: str):
+        if embedder is None:
+            return None
+        return (await embedder.embed([text]))[0]
+
+    result: dict = {"id": dec_id, "outcome": outcome}
     async with pool.connection() as conn:
+        # Existence + scope check (also keeps the flat cache in sync).
         async with conn.cursor() as cur:
-            await cur.execute(
-                "UPDATE decisions SET outcome = %s, reviewed_at = now() "
-                "WHERE id = %s AND scope = %s RETURNING id, title",
-                (outcome, dec_id, scope),
-            )
-            row = await cur.fetchone()
-            if row is None:
+            await cur.execute("SELECT id FROM decisions WHERE id = %s AND scope = %s",
+                              (dec_id, scope))
+            if await cur.fetchone() is None:
                 raise ValueError(f"decision {dec_id!r} not found")
+
+        out_id = await record_outcome_async(
+            conn, scope=scope, decision_id=dec_id, summary=outcome, valence=valence,
+            embedding=await _embed(outcome), matched_prediction=matched_prediction,
+        )
+        result["outcome_id"] = out_id
+
+        if lesson:
+            les_id, action = await distill_or_reinforce_lesson_async(
+                conn, scope=scope, statement=lesson, embedding=await _embed(lesson),
+                derived_from_outcomes=[out_id], applies_to_entities=applies_to_entities or [],
+            )
+            ent_id = await mirror_lesson_to_kg_async(conn, scope=scope, lesson_id=les_id)
+            result["lesson_id"] = les_id
+            result["lesson_action"] = action
+            result["lesson_entity_id"] = ent_id
+
         await _stage_and_emit(publisher, conn, "decision.reviewed", dec_id, scope,
-                              {"dec_id": dec_id, "outcome": outcome[:300]})
-    return {"id": dec_id, "outcome": outcome}
+                              {"dec_id": dec_id, "outcome": outcome[:300],
+                               "valence": valence, "outcome_id": out_id})
+    return result
 
 
 async def list_decisions(pool: Any, scope: str, *, due_for_review: bool = False,
