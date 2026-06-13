@@ -8,12 +8,14 @@ license = {text = "MIT"}
 authors = [{name = "Hiten Saxena"}]
 
 dependencies = [
+    "fastapi>=0.110",
     "pydantic>=2.0",
+    "uvicorn[standard]>=0.29",
 ]
 
 [project.optional-dependencies]
 postgres = [
-    "psycopg[pool]>=3.1",
+    "psycopg[binary,pool]>=3.1",
     "pgvector>=0.3",
 ]
 redis = [
