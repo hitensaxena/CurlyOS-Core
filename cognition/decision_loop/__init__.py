@@ -570,3 +570,64 @@ async def distill_lessons_from_outcomes(
         else:
             result["lessons_reinforced"] += 1
     return result
+
+
+# ===========================================================================
+# Confidence decay — so a lesson that stops being reinforced fades and
+# eventually retires, instead of dominating retrieval forever. Reinforcement
+# (distill_or_reinforce_lesson) stamps last_reinforced_at and bumps confidence,
+# so an actively-confirmed lesson never decays; a neglected one does.
+# ===========================================================================
+
+DEFAULT_HALF_LIFE_DAYS = 30.0   # confidence halves per 30 idle days
+DEFAULT_CONFIDENCE_FLOOR = 0.1  # decayed (not retired) lessons never drop below this
+DEFAULT_RETIRE_BELOW = 0.05     # a single decay landing under this retires the lesson
+
+
+async def decay_lesson_confidence(
+    pool,
+    *,
+    scope: str,
+    half_life_days: float = DEFAULT_HALF_LIFE_DAYS,
+    floor: float = DEFAULT_CONFIDENCE_FLOOR,
+    retire_below: float = DEFAULT_RETIRE_BELOW,
+) -> dict[str, int]:
+    """Exponentially decay active lessons by idle time, anchored on the latest
+    of {created_at, last_reinforced_at, last_decayed_at}. A lesson whose decayed
+    confidence falls under `retire_below` is retired (excluded from retrieval);
+    otherwise it floors at `floor`. Stamping last_decayed_at each run keeps this
+    idempotent — running twice in a row barely moves anything.
+
+    Returns {"decayed": n, "retired": m}.
+    """
+    params = {"scope": scope, "hl": half_life_days, "floor": floor, "retire": retire_below}
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "WITH anchored AS ("
+                "  SELECT id, "
+                "    GREATEST(created_at, "
+                "      COALESCE((properties->>'last_reinforced_at')::timestamptz, created_at), "
+                "      COALESCE((properties->>'last_decayed_at')::timestamptz, created_at)"
+                "    ) AS anchor, "
+                "    confidence * power(0.5, EXTRACT(EPOCH FROM (now() - GREATEST(created_at, "
+                "      COALESCE((properties->>'last_reinforced_at')::timestamptz, created_at), "
+                "      COALESCE((properties->>'last_decayed_at')::timestamptz, created_at)"
+                "    ))) / 86400.0 / %(hl)s) AS raw_conf "
+                "  FROM lessons "
+                "  WHERE scope = %(scope)s AND valid_to IS NULL "
+                "    AND status IN ('provisional','validated')"
+                ") "
+                "UPDATE lessons l SET "
+                "  confidence = CASE WHEN a.raw_conf < %(retire)s THEN l.confidence "
+                "                    ELSE GREATEST(%(floor)s, a.raw_conf) END, "
+                "  status = CASE WHEN a.raw_conf < %(retire)s THEN 'retired' ELSE l.status END, "
+                "  properties = l.properties || jsonb_build_object('last_decayed_at', now()::text) "
+                "FROM anchored a "
+                "WHERE l.id = a.id AND now() > a.anchor "
+                "RETURNING l.status",
+                params,
+            )
+            rows = await cur.fetchall()
+    retired = sum(1 for r in rows if r[0] == "retired")
+    return {"decayed": len(rows), "retired": retired}

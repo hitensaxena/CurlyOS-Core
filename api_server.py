@@ -2189,14 +2189,17 @@ async def reflection_weekly(body: ReflectionRequest | None = None):
         result.update(await _sync_identity_from_reflection(pool, _make_publisher_sync(), scope))
         result.update(await _sync_goals_from_reflection(pool, scope))
         try:
-            from cognition.decision_loop import distill_lessons_from_outcomes
+            from cognition.decision_loop import (
+                distill_lessons_from_outcomes, decay_lesson_confidence,
+            )
 
             result["lessons"] = await distill_lessons_from_outcomes(
                 pool, scope=scope, embedder=await get_shared_embedder(),
                 llm_client=llm_client, llm_model=llm_model,
             )
+            result["lesson_decay"] = await decay_lesson_confidence(pool, scope=scope)
         except Exception:
-            logger.exception("lesson distillation failed scope=%s", scope)
+            logger.exception("lesson distillation/decay failed scope=%s", scope)
         return result
     except Exception as e:
         logger.exception("weekly reflection failed scope=%s", scope)

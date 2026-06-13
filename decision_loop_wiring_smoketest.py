@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from goals import record_decision, review_decision
 from cognition.decision_loop import (
     retrieve_lessons_async, record_outcome_async, distill_lessons_from_outcomes,
+    decay_lesson_confidence,
 )
 from shared.embeddings.implementations import HashEmbedder
 from shared.types.ulid import mint
@@ -198,6 +199,46 @@ async def main():
             pool, scope=SCOPE, embedder=embedder, llm_client=None)
         check("re-run is idempotent (outcome already distilled)",
               dist2["lessons_created"] == 0 and dist2["lessons_reinforced"] == 0, dist2)
+
+        print("\n[5] confidence decay for stale lessons")
+        # Backdate the lesson from [2] by 60 days at confidence 0.5 → should decay, not retire.
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE lessons SET created_at = now() - interval '60 days', confidence = 0.5, "
+                "properties = properties - 'last_reinforced_at' - 'last_decayed_at' WHERE id = %s",
+                (res["lesson_id"],),
+            )
+            # A very old, already-weak lesson → should retire.
+            stale_id = mint("les")
+            stale_vec = "[" + ",".join("0.001" for _ in range(1024)) + "]"
+            await cur.execute(
+                "INSERT INTO lessons (id, scope, statement, confidence, embedding, created_at) "
+                "VALUES (%s, %s, %s, 0.06, %s::vector, now() - interval '90 days')",
+                (stale_id, SCOPE, "stale neglected lesson", stale_vec),
+            )
+
+        dec = await decay_lesson_confidence(pool, scope=SCOPE, half_life_days=30,
+                                            floor=0.1, retire_below=0.05)
+        check("decay touched stale lessons", dec["decayed"] >= 2, dec)
+        check("at least one retired", dec["retired"] >= 1, dec)
+
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT confidence FROM lessons WHERE id=%s", (res["lesson_id"],))
+            c_after = (await cur.fetchone())[0]
+            await cur.execute("SELECT status FROM lessons WHERE id=%s", (stale_id,))
+            stale_status = (await cur.fetchone())[0]
+        check("backdated lesson confidence decayed below 0.5", c_after < 0.5, c_after)
+        check("backdated lesson floored (not retired)", c_after >= 0.1, c_after)
+        check("old weak lesson retired", stale_status == "retired", stale_status)
+
+        # Idempotent: immediate re-run (last_decayed_at ~ now) barely moves confidence.
+        await decay_lesson_confidence(pool, scope=SCOPE, half_life_days=30,
+                                      floor=0.1, retire_below=0.05)
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT confidence FROM lessons WHERE id=%s", (res["lesson_id"],))
+            c_again = (await cur.fetchone())[0]
+        check("decay is idempotent on immediate re-run", abs(c_again - c_after) < 1e-3,
+              (c_after, c_again))
 
     finally:
         await conn.rollback()  # leave no residue
