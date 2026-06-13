@@ -1,138 +1,147 @@
 # CurlyOS Core
 
-> **The cognitive architecture from [HitenOS](https://github.com/hitendev/hitenos-architecture) — implemented as a standalone Python service with a Hermes Agent memory plugin.**
+> **A cognitive operating system for AI agents — bi-temporal memory, a self-organizing knowledge graph, a stable identity model, and a metacognition layer that reflects on its own thinking.**
 
-CurlyOS Core is a bi-temporal knowledge graph + multi-tier memory system that gives AI agents persistent, queryable, self-evolving memory. It replaces the default flat-file memory in [Hermes Agent](https://hermes-agent.nousresearch.com) with a real knowledge store backed by PostgreSQL+pgvector and Redis.
+Most AI "memory" is a flat file or a pile of vectors: you dump text in, you cosine-search it back out, and nothing ever connects, ages, or changes its mind. CurlyOS Core is built on the opposite premise — that durable intelligence needs **structure, time, provenance, and self-revision**, not just recall.
+
+It is a standalone Python service (FastAPI, PostgreSQL + pgvector, Redis) that gives an agent a real cognitive substrate: every experience is recorded with provenance, distilled into time-aware facts, projected into a connected knowledge graph, folded into a stable self-model, and periodically re-examined by a reflection loop that distills principles, surfaces life themes, and flags its own stale assumptions. It ships as a drop-in [Hermes Agent](https://hermes-agent.nousresearch.com) memory plugin and powers a companion web UI for exploring the whole mind visually.
+
+---
+
+## Why CurlyOS Core is different
+
+| | Flat-file / scratchpad memory | Naive RAG (vector store) | **CurlyOS Core** |
+|---|---|---|---|
+| **Structure** | Unstructured notes | Opaque chunks | Episodes → facts → **entity/relation graph** |
+| **Time** | Overwrites or appends | No notion of time | **Bi-temporal** (`valid_from`/`valid_to` + `ingested_at`) — time-travel queries |
+| **Truth changes** | Lost or duplicated | Stale chunks linger | **Invalidate-not-delete** — superseded facts kept with full history |
+| **Provenance** | None | Chunk → source, maybe | **Every fact cites a `source_episode_id`** — no ungrounded claims |
+| **Confidence** | None | None | **Epistemic axis** — `hypothesis` / `belief` / `canonical` cross-cuts every fact |
+| **Retrieval** | grep | Vector top-k | **Hybrid**: BM25 + dense vectors + **graph expansion** + rerank |
+| **Self-revision** | None | None | **Consolidation + reflection** — dedup, conflict-resolve, distill principles, regenerate themes |
+| **Identity** | None | None | A **stable self-model** that survives context resets |
+
+The short version: a vector store remembers *what was said*. CurlyOS Core remembers *what is true, when it was true, why you believe it, and how confident you are* — and it keeps cleaning that up while you sleep.
+
+---
+
+## What it does
+
+CurlyOS Core is a layered stack. Each layer is a real, queryable subsystem with its own tables and REST endpoints.
+
+### 🧠 Multi-tier memory
+Four tiers, each with a single authoritative store and a clear write discipline (fast add on the hot path; heavy work deferred to an async "sleep" consolidation job).
+
+| Tier | Store | Role |
+|------|-------|------|
+| **Working** | Redis `wm:{session}` | Volatile scratch, TTL 2h |
+| **Episodic** | Postgres `episodes` | Append-only, ground-truth provenance |
+| **Semantic** | Postgres `memories` + pgvector HNSW | Distilled, bi-temporal facts |
+| **Procedural** | Postgres `skills` | Versioned skills / workflows |
+
+### 🕸️ Self-organizing knowledge graph
+An LLM extracts `(subject, predicate, object)` triples from episodes; an entity-resolution stage dedups and merges them; the result is a typed graph (Person, Project, Tool, Concept, Health, …) with bi-temporal edges. A densification pass adds *reversible, never-invented* inferred edges (embedding similarity + co-occurrence) so the graph stays one connected, navigable structure instead of a dust cloud of islands.
+
+### 🪪 Identity
+A bi-temporal self-model (`identity_facts`) — name, role, preferences, values — distilled from reflection and resilient to context compression. The agent can answer "who am I and what do I care about" consistently across sessions.
+
+### 🔍 Metacognition (the part that thinks about thinking)
+This is what makes it an *operating system* rather than a database:
+- **Reflection** — periodic weekly/monthly passes that read the clean graph and produce findings, **distilled principles**, and identity/goal updates.
+- **Narrative** — surfaces recurring **themes** and composes **life chapters** from your own episodes (grounded only in real material, never hallucinated).
+- **Attention** — tracks focus areas, neglected entities, cognitive load, and **alignment gaps** between stated goals and actual activity.
+- **Meta** — generates working **assumptions** and **mental models**, audits past decisions.
+
+### 🎨 Studio · 🌍 Simulation · ✅ Evaluation · 🎯 Goals
+An infinite canvas for raw ideas that can *graduate* into projects; a world-modeling layer for tracked assumptions and what-if scenarios; gate-checks and scorers for quality; and goal/task containers that the reflection loop keeps honest.
+
+### At a glance (a live instance)
+
+```
+52 REST endpoints   ·   43 Postgres tables
+~1.6k episodes  →  ~20k facts  →  3.2k entities / 8.7k edges  →  37 identity facts
+single fully-connected knowledge graph · 0 orphans
+```
+
+---
 
 ## Architecture
 
-Four memory tiers, each with a single authoritative store:
+### Key concepts
 
-| Tier | Store | Pattern |
-|------|-------|---------|
-| **Working** | Redis `wm:{session}:scratch` | Volatile, TTL 2h |
-| **Episodic** | Postgres `episodes` | Append-only provenance ground-truth |
-| **Semantic** | Postgres `memories` + pgvector HNSW | Distilled bi-temporal facts |
-| **Procedural** | Postgres `skills` | Versioned skills/workflows |
+- **Bi-temporal validity** — every fact carries `valid_from` / `valid_to` + `ingested_at`, so you can ask "what did I believe on date X" and "what is true now" independently.
+- **Invalidate-not-delete** — superseded facts get `valid_to = now()`, never a `DELETE`. History and provenance are preserved; every change is reversible.
+- **Episodic provenance** — every distilled fact MUST cite a `source_episode_id`. No fact exists without the experience that produced it.
+- **Epistemic axis** — `hypothesis → belief → canonical` (plus producer-specific `seed`/`conjecture`/`possible_world`). Confidence is a first-class dimension, classified by an LLM at capture time.
+- **Capture hygiene** — ingestion strips harness/tooling scaffolding (system reminders, task notifications, command wrappers) so only genuine content becomes memory.
+- **Event sourcing** — writes emit CloudEvents; projections (like the graph) are rebuildable from the episodic log.
 
-Write discipline: **add-mostly hot path + async consolidation ("sleep") job**.
+### LLM backend
+Knowledge extraction, epistemic classification, reflection, and narrative all call an LLM through a **failover chain**. By default it uses an OpenRouter model chain (`CURLYOS_MODEL_CHAIN`); set `REFRESH_BACKEND=hermes` to route the heavy cognition passes through **hermes-bridge** and run them on a local Claude (Max) subscription — faster and higher quality for the reflective work.
 
-### Service Map
+### Service map
 
 ```
 ~/curlyos-core/
 ├── api_server.py          # FastAPI app — REST API for all CurlyOS data (port 8643)
 ├── start_api_server.py    # Daemon start/stop helper
 ├── curlyos_setup.py       # Interactive setup wizard + health checks + migrations
-├── pyproject.toml         # Python project config (hatchling build)
+├── migrate.py             # Ordered SQL migration runner (schema_migrations ledger)
 │
-├── memory/                # 4-tier memory: governance, consolidation, retrieval
+├── memory/                # 4-tier memory
 │   ├── governance/        # Episode recording, fact CRUD, invalidation
-│   ├── consolidation/     # DEDUP, CONFLICT-RESOLVE, SUMMARIZE, DECAY, RECOMBINE
-│   ├── retrieval/         # Hybrid search: BM25 + vector + graph expansion
-│   └── stores/            # DDL, Postgres connection pool, embedding backends
+│   ├── consolidation/     # DEDUP · CONFLICT-RESOLVE · SUMMARIZE · DECAY · RECOMBINE ("sleep")
+│   ├── retrieval/         # Hybrid recall: BM25 + vector + graph expansion + rerank
+│   └── stores/            # DDL, Postgres pool, embedding backends
 │
-├── knowledge/             # Entity extraction, resolution, graph projection
-│   ├── extraction/        # NER + relation extraction from episodes
-│   ├── resolution/        # Entity dedup + merging
-│   └── graph/             # Knowledge graph tables + queries
-│
+├── knowledge/             # Entity + relation extraction → resolution → graph projection
 ├── identity/              # Bi-temporal self-model (identity_facts triples)
-│   ├── pipeline/          # Identity fact extraction from episodes
-│   └── predicates/        # Core identity attributes (name, role, preferences)
+├── cognition/             # Metacognition: attention · introspection · meta · narrative · reflection
+├── studio/                # Idea canvas: sketches → graduation pipeline
+├── simulation/            # Assumptions · scenarios · outcomes
+├── evaluation/            # Gate checks · replay · scorers
+├── goals/  workspace/     # Goal + task/project containers
 │
-├── cognition/             # Meta-cognition layers
-│   ├── attention/         # Attention tracking + focus management
-│   ├── introspection/     # Self-monitoring + decision audits
-│   ├── meta/              # Meta-cognitive assessments
-│   ├── narrative/         # Life chapters + themes + narrative construction
-│   └── reflection/        # Periodic reflection reports + principle distillation
-│
-├── studio/                # Infinite canvas of ideas
-│   ├── sketches/          # Raw idea capture
-│   └── graduation/        # Sketch → project promotion pipeline
-│
-├── simulation/            # World modeling
-│   ├── assumptions/       # Tracked assumptions
-│   ├── scenarios/         # What-if scenario definitions
-│   └── outcomes/          # Simulation results
-│
-├── evaluation/            # Quality assurance
-│   ├── gate/              # Gate checks (go/no-go decisions)
-│   ├── replay/            # Episode replay for testing
-│   └── scorers/           # Evaluation metrics
-│
-├── workspace/             # Project/task/goal containers
-│   ├── goals/             # Goal tracking
-│   └── tasks/             # Task management
-│
-├── shared/                # Cross-cutting contracts
-│   ├── embeddings/        # Embedder interface (fake, bge-m3, openai)
-│   ├── events/            # CloudEvents + NATS publishing
-│   └── types/             # Shared Pydantic types
-│
-├── hermes_integration/    # Hermes MemoryProvider plugin
-│   ├── __init__.py        # Plugin doc + imports
-│   ├── plugin.yaml        # Plugin manifest
-│   └── provider.py        # MemoryProvider implementation (tool schemas, hooks)
-│
-├── deploy/                # Docker infrastructure
-│   ├── docker-compose.yml # Postgres+pgvector + Redis stack (named volumes)
-│   ├── .env               # POSTGRES_PASSWORD (gitignored, chmod 600)
-│   ├── migrate-to-named-volumes.sh  # Migration from anonymous → named volumes
-│   └── backups/           # pg_dump snapshots (gitignored)
-│
-└── tests/                 # Pytest suite
+├── shared/                # Embedders, events, LLM model chain, epistemic classifier
+├── hermes_integration/    # Hermes MemoryProvider plugin (hooks + tool schemas)
+└── deploy/                # docker-compose (Postgres+pgvector + Redis), ops scripts, migrations
 ```
 
-## Key Concepts
+A separate Next.js app (`curly-os`) is the optional companion UI — it renders the knowledge graph, memory, episodes, identity, cognition, journal, and studio through this API.
 
-- **Bi-temporal validity**: Every fact carries `valid_from`/`valid_to` + `ingested_at` — time-travel queries work
-- **Invalidate-not-delete**: Superseded facts get `valid_to=now()`, never deleted — provenance preserved
-- **Episodic provenance**: Every fact MUST cite a `source_episode_id` — no ungrounded facts
-- **Epistemic axis**: `seed → conjecture → hypothesis → belief → canonical` — confidence cross-cuts all tiers
-- **Event sourcing**: All writes emit CloudEvents to `HITENOS_MEMORY` — projections are rebuildable
+---
 
 ## Prerequisites
 
-| Component | Minimum Version | Purpose |
-|-----------|----------------|---------|
+| Component | Minimum | Purpose |
+|-----------|---------|---------|
 | Python | 3.11+ | Runtime |
-| PostgreSQL | 16.4+ | Episodic + semantic memory store |
-| pgvector | 0.7.4+ | Vector similarity search in Postgres |
+| PostgreSQL | 16.4+ | Episodic + semantic store |
+| pgvector | 0.7.4+ | Vector similarity in Postgres |
 | Redis | 7.4+ | Working memory + cache + locks |
-| uv (optional) | any | Fast Python package manager |
-| Docker + Compose | any | Running Postgres+Redis locally |
+| Docker + Compose | any | Local Postgres + Redis stack |
+| uv | optional | Fast Python package manager |
 
 ## Quick Start
 
-### 1. Clone and Install
+### 1. Clone and install
 
 ```bash
-git clone git@github.com:hitendev/curlyos-core.git
-cd curlyos-core
+git clone https://github.com/hitensaxena/CurlyOS-Core.git
+cd CurlyOS-Core
 
-# Create venv (uses uv if available, falls back to venv)
 python3 -m venv .venv
 source .venv/bin/activate
 
-# Install with all optional dependencies
-pip install -e ".[all]"
-
-# Or with uv:
-uv pip install -e ".[all]"
+# Install with all optional dependencies (postgres, redis, embeddings, llm, …)
+pip install -e ".[all]"      # or:  uv pip install -e ".[all]"
 ```
 
-### 2. Start Data Stores
+### 2. Start the data stores
 
 ```bash
 cd deploy
-
-# Set Postgres password
-cp .env.example .env   # then edit .env with your password
-# Or just: echo 'POSTGRES_PASSWORD=yourpassword' > .env
-
-# Create named volumes and start
+cp .env.example .env          # then set POSTGRES_PASSWORD
 docker compose up -d
 
 # Verify
@@ -141,232 +150,152 @@ docker exec curlyos-pg psql -U curlyos -d curlyos -c "SELECT 1"
 docker exec curlyos-redis redis-cli ping
 ```
 
-### 3. Run the Setup Wizard
+### 3. Run the setup wizard
 
 ```bash
-# From the repo root:
+cd ..
 source .venv/bin/activate
 python3 curlyos_setup.py
 ```
 
-This interactive wizard will:
-1. Test your PostgreSQL connection
-2. Test your Redis connection
-3. Apply all DDL migrations via `python3 migrate.py` — an ordered runner that applies `migrations/*.sql` files and tracks each one in a `schema_migrations` ledger; `curlyos_setup.py --migrate` calls the same runner
-4. Configure your embedder (fake for testing, bge-m3 for local, OpenAI for API)
-5. Write `~/.hermes/curlyos.yaml` and update `~/.hermes/.env`
+The wizard tests Postgres + Redis, applies all DDL migrations (`migrations/*.sql` via `migrate.py`, tracked in a `schema_migrations` ledger), configures your embedder (`fake` for tests, `bge-m3` local, or `openai`), and writes `~/.hermes/curlyos.yaml`.
 
-### 4. Verify Installation
+### 4. Verify
 
 ```bash
 python3 curlyos_setup.py --check
 ```
 
-Expected output:
 ```json
 {
-  "postgres": {"status": "ok", "detail": "Postgres OK (...)"},
-  "redis": {"status": "ok", "detail": "Redis OK (...)"},
-  "tables": {
-    "episodes": 0,
-    "memories": 0,
-    ...
-  }
+  "postgres": {"status": "ok"},
+  "redis":    {"status": "ok"},
+  "tables":   {"episodes": 0, "memories": 0, "...": 0}
 }
 ```
 
-### 5. Start the API Server
+### 5. Start the API server
 
 ```bash
-# Foreground (dev):
-source .venv/bin/activate
+# Dev (foreground, auto-reload):
 uvicorn api_server:app --host 127.0.0.1 --port 8643 --reload
 
-# Background daemon (production):
+# Production (background daemon):
 python3 start_api_server.py
-python3 start_api_server.py --status   # check it's running
-python3 start_api_server.py --stop     # stop it
+python3 start_api_server.py --status
+python3 start_api_server.py --stop
 ```
 
-The API is available at `http://127.0.0.1:8643`.
+API is at `http://127.0.0.1:8643`.
 
-### 6. Test the API
+### 6. Smoke test
 
 ```bash
-# Health check
 curl http://127.0.0.1:8643/api/health | python3 -m json.tool
-
-# Stats
-curl http://127.0.0.1:8643/api/stats | python3 -m json.tool
+curl http://127.0.0.1:8643/api/stats  | python3 -m json.tool
 ```
 
-## Hermes Agent Integration
+---
 
-CurlyOS Core includes a **MemoryProvider plugin** that replaces Hermes's default flat-file memory with the full CurlyOS knowledge graph. Once integrated, Hermes automatically records every conversation turn as an episode, injects relevant memories into each turn's context, and gives you 5 new tools for direct knowledge graph interaction.
+## Hermes Agent integration
 
-### Option A: Plugin Install (Recommended)
+CurlyOS ships a **MemoryProvider plugin** that replaces Hermes's flat-file memory with the full knowledge graph. Once enabled, Hermes records every turn as an episode, injects relevant memories into context, and gains five direct tools.
 
 ```bash
-# 1. Copy the plugin to Hermes's plugin directory
+# Copy the plugin and enable it
 cp -r hermes_integration/ ~/.hermes/plugins/curlyos/
-
-# 2. Add to ~/.hermes/config.yaml:
-# plugins:
-#   enabled:
-#     - curlyos
-# memory:
-#   provider: curlyos
-
-# 3. Or use the Hermes CLI:
 hermes config set plugins.enabled '["curlyos"]'
 hermes config set memory.provider curlyos
+# Ensure ~/.hermes/.env has CURLYOS_DATABASE_URL and CURLYOS_REDIS_URL
 ```
 
-### Option B: Manual Config Edit
-
-Edit `~/.hermes/config.yaml`:
-
-```yaml
-memory:
-  provider: curlyos
-
-plugins:
-  enabled:
-    - curlyos
-
-# Make sure these env vars are in ~/.hermes/.env:
-# CURLYOS_DATABASE_URL=postgresql://curlyos:YOURPASSWORD@localhost:54321/curlyos
-# CURLYOS_REDIS_URL=redis://localhost:6379/0
-```
-
-### Verify Hermes Integration
-
-Start a Hermes session and check the system prompt — you should see the `curlyos_*` tools listed:
-
-```bash
-hermes
-# In the session, the system prompt should include:
-# curlyos_recall, curlyos_add_fact, curlyos_add_note, curlyos_invalidate, curlyos_identity
-```
-
-### What the Plugin Does
-
-| Hook | What Happens |
+| Hook | What happens |
 |------|-------------|
-| `prefetch()` | Before each turn, recalls relevant memories and injects them into the system prompt |
-| `sync_turn()` | After each turn, records it as an episode linked to the conversation |
-| `on_session_end()` | Summarizes the session, extracts key facts, proposes identity updates |
-| `on_pre_compress()` | Before context compression, saves insights from messages about to be discarded |
-| `on_memory_write()` | When Hermes's built-in memory tool fires, mirrors the write to CurlyOS |
-
-### Available Tools (in Hermes)
+| `prefetch()` | Recall relevant memories → inject into the system prompt |
+| `sync_turn()` | Record each turn as an episode (scaffolding stripped) |
+| `on_session_end()` | Summarize session, extract facts, propose identity updates |
+| `on_pre_compress()` | Save insights from messages about to be discarded |
+| `on_memory_write()` | Mirror Hermes's built-in memory writes into CurlyOS |
 
 | Tool | Description |
 |------|-------------|
 | `curlyos_recall` | Semantic + graph retrieval over the knowledge base |
-| `curlyos_add_fact` | Store a durable, grounded fact with bi-temporal validity |
-| `curlyos_add_note` | Store a longer note / reference material |
-| `curlyos_invalidate` | Soft-invalidate outdated facts (never deleted) |
-| `curlyos_identity` | Query Hiten's stable self-model |
+| `curlyos_add_fact` | Store a durable, grounded, bi-temporal fact |
+| `curlyos_add_note` | Store a longer note / reference |
+| `curlyos_invalidate` | Soft-invalidate an outdated fact (never deleted) |
+| `curlyos_identity` | Query the stable self-model |
 
-## API Reference
+---
 
-### Health & Stats
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/health` | GET | Database + Redis connectivity + embedder status |
-| `/api/stats` | GET | Row counts for all tables |
-
-### Memory
+## API reference (selected — 52 endpoints total)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/episodes` | GET | List episodes (paginated) |
-| `/api/episodes` | POST | Record a new episode |
-| `/api/memories` | GET | List memories (paginated) |
-| `/api/search?q=&mode=&limit=` | GET | Full-text search over memories (BM25) |
-| `/api/recall` | POST | Hybrid recall (BM25 + vector + graph) |
-| `/api/memories` | POST | Store a new memory/fact |
-| `/api/memories/{id}/invalidate` | POST | Invalidate a memory (soft-invalidation; records are never deleted) |
-
-### Identity
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/identity` | GET | Get all identity facts |
-| `/api/identity` | POST | Add/update identity facts |
-
-### Knowledge Graph
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/graph` | GET | List knowledge graph entities |
+| `/api/health` · `/api/stats` | GET | Connectivity/embedder status · row counts |
+| `/api/ingest` | POST | Record raw text → episode (+ memory, + async extraction); strips scaffolding |
+| `/api/episodes` | GET/POST | Append-only provenance log |
+| `/api/memories` | GET/POST | Distilled bi-temporal facts |
+| `/api/memories/{id}/invalidate` | POST | Soft-invalidate (history preserved) |
+| `/api/search?q=` | GET | Full-text (BM25) over facts |
+| `/api/recall` | POST | Hybrid recall: BM25 + vector + graph + rerank |
+| `/api/graph?limit=` | GET | Knowledge-graph nodes + edges (degree-ranked) |
 | `/api/graph/{id}/expand?k=` | GET | Expand a node's neighbourhood (k hops) |
+| `/api/identity` | GET/POST | Stable self-model |
+| `/api/cognition/narrative/compose` | POST | Compose a grounded first-person narrative for a query |
+| `/api/reflection/*` · `/api/meta/*` · `/api/attention/*` | POST | Run reflection, generate assumptions/models, scan attention |
+
+---
 
 ## Configuration
 
-CurlyOS reads configuration from (in order of priority):
-
-1. Environment variables (`CURLYOS_DATABASE_URL`, `CURLYOS_REDIS_URL`)
-2. `~/.hermes/curlyos.yaml`
-3. `~/.hermes/.env`
-
-### `~/.hermes/curlyos.yaml`
-
-```yaml
-database_url: "postgresql://curlyos:PASSWORD@localhost:54321/curlyos"
-redis_url: "redis://localhost:6379/0"
-embedder: "bge-m3"   # fake | bge-m3 | openai
-```
-
-### Environment Variables
+Resolved in priority order: **env vars → `~/.hermes/curlyos.yaml` → `~/.hermes/.env`**.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `CURLYOS_DATABASE_URL` | PostgreSQL DSN | (required) |
-| `CURLYOS_REDIS_URL` | Redis URL | (required) |
+| `CURLYOS_DATABASE_URL` | PostgreSQL DSN | *(required)* |
+| `CURLYOS_REDIS_URL` | Redis URL | *(required)* |
 | `CURLYOS_API_PORT` | API server port | `8643` |
 | `CURLYOS_SCOPE` | Default scope for facts | `user:usr_hiten` |
+| `OPENROUTER_API_KEY` | LLM key for extraction/cognition | *(optional)* |
+| `CURLYOS_MODEL_CHAIN` | Comma-separated failover model chain | OpenRouter default |
+| `REFRESH_BACKEND` | `chain` (OpenRouter) or `hermes` (Claude via hermes-bridge) | `chain` |
+
+```yaml
+# ~/.hermes/curlyos.yaml
+database_url: "postgresql://curlyos:PASSWORD@localhost:54321/curlyos"
+redis_url:    "redis://localhost:6379/0"
+embedder:     "bge-m3"   # fake | bge-m3 | openai
+```
+
+---
 
 ## Backups
 
 ```bash
-# Create a logical backup
+# Logical backup
 docker exec curlyos-pg pg_dump -U curlyos -d curlyos -Fc > backup.dump
 
-# Restore from backup
+# Restore
 cat backup.dump | docker exec -i curlyos-pg pg_restore -U curlyos -d curlyos --clean --if-exists
 
-# Set up daily backups via cron
+# Daily cron
 0 3 * * * docker exec curlyos-pg pg_dump -U curlyos -d curlyos -Fc > ~/curlyos-core/deploy/backups/curlyos-$(date +\%F).dump
 ```
 
 ## Development
 
 ```bash
-# Install with dev dependencies
 pip install -e ".[dev]"
-
-# Run tests
-pytest tests/ -q
-
-# Run tests with parallelism
-pytest tests/ -q -n auto
-
-# Lint
+pytest tests/ -q            # add -n auto for parallelism
 ruff check .
-
-# Type check
 mypy memory/ knowledge/ identity/ cognition/ shared/
 ```
 
-## Data Safety
+## Data safety
 
-- Named Docker volumes (`curlyos_pgdata`, `curlyos_redisdata`) survive `docker compose down`
-- Even `docker compose down -v` preserves them (volumes are `external: true`)
-- Facts are **never deleted** — only invalidated (`valid_to` set to now)
-- Append-only episode log — full provenance chain
+- Named Docker volumes (`curlyos_pgdata`, `curlyos_redisdata`) survive `docker compose down`.
+- Facts are **never deleted** — only invalidated (`valid_to = now()`).
+- Append-only episode log — full provenance chain, rebuildable projections.
 
 ## License
 
