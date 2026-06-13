@@ -33,6 +33,9 @@ Thumbs.db
 .mypy_cache/
 .ruff_cache/
 
+# Local reversal records from deploy/reclassify_entities.py
+deploy/reclassify_audit_*.json
+
 # Don't ignore these
 !deploy/.env.example
 

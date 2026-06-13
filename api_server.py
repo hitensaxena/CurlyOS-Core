@@ -602,11 +602,12 @@ async def propose_identity(body: ProposeIdentityRequest):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/graph")
-def get_graph(scope: str = SCOPE, limit: int = Query(default=1500, le=5000)):
+def get_graph(scope: str = SCOPE, limit: int = Query(default=20000, le=50000)):
     # Order by full-graph degree (not recency) so the hubs are always in view
     # when the limit truncates — recency ordering buried Hiten et al. behind a
-    # window of the newest leaf nodes. Default limit comfortably exceeds the
-    # current graph (~1.3k entities) so the whole thing renders.
+    # window of the newest leaf nodes. Default limit is set well above the live
+    # graph size (was 1500, which silently truncated once the graph grew past it
+    # — the webapp passes no limit and so only ever saw the top-degree 1500).
     with get_conn() as conn:
         entities = conn.execute(
             "WITH deg AS ("
