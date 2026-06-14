@@ -126,7 +126,9 @@ def _include_goal_router() -> None:
         pool_factory=lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row),
         publisher_factory=lambda: _make_publisher_sync(),
         scope=SCOPE,
-        embedder_factory=get_shared_embedder,
+        # Defined further down in this module but included at import time, so
+        # wrap in a lambda to defer resolution — see _include_agents_router().
+        embedder_factory=lambda: get_shared_embedder(),
     ))
 
 
