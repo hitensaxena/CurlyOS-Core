@@ -722,6 +722,18 @@ def make_router(
         await set_setting(await pool_factory(), "auto_plan", bool(body.enabled))
         return {"auto_plan": bool(body.enabled)}
 
+    @router.get("/settings/auto-promote")
+    async def get_autopromote():
+        from shared.settings import get_setting
+        on = await get_setting(await pool_factory(), "auto_promote", True)
+        return {"auto_promote": bool(on)}
+
+    @router.post("/settings/auto-promote")
+    async def set_autopromote(body: BypassRequest):
+        from shared.settings import set_setting
+        await set_setting(await pool_factory(), "auto_promote", bool(body.enabled))
+        return {"auto_promote": bool(body.enabled)}
+
     # ── plan execute / artifacts / autoplan ───────────────────────────────────
 
     @router.post("/goal-plans/{plan_id}/execute")
@@ -747,6 +759,14 @@ def make_router(
         from orchestration.orchestrator import autoplan_sweep
         return await autoplan_sweep(
             pool=await pool_factory(), publisher=_pub(), llm=_llm(), scope=scope,
+        )
+
+    @router.post("/orchestrator/promote")
+    async def run_promote():
+        """Manually run the opportunity→goal promotion sweep (full lifecycle front)."""
+        from orchestration.orchestrator import promote_opportunities_sweep
+        return await promote_opportunities_sweep(
+            pool=await pool_factory(), publisher=_pub(), scope=scope,
         )
 
     return router

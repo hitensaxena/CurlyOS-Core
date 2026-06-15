@@ -1356,7 +1356,8 @@ def list_workspaces(scope: str = SCOPE):
         rows = conn.execute(
             "SELECT w.id, w.scope, w.name, w.slug, w.path, w.summary, w.kind, w.status, "
             "w.created_at, w.updated_at, "
-            "(SELECT count(*) FROM projects p WHERE p.workspace_id = w.id) AS project_count "
+            "(SELECT count(*) FROM projects p WHERE p.workspace_id = w.id "
+            " AND COALESCE(p.status,'active') <> 'archived') AS project_count "
             "FROM workspaces w WHERE w.scope = %s "
             "AND COALESCE(w.status,'active') <> 'archived' "
             "ORDER BY w.updated_at DESC",
@@ -1434,7 +1435,8 @@ def get_workspace_detail(workspace_id: str):
             "p.north_star_goal_id, p.status, "
             "(SELECT count(*) FROM goals g WHERE g.project_id = p.id) AS goal_count, "
             "(SELECT count(*) FROM artifacts a WHERE a.project_id = p.id) AS artifact_count "
-            "FROM projects p WHERE p.workspace_id = %s ORDER BY p.created_at DESC",
+            "FROM projects p WHERE p.workspace_id = %s AND COALESCE(p.status,'active') <> 'archived' "
+            "ORDER BY p.created_at DESC",
             [workspace_id],
         ).fetchall()
     return {"workspace": w, "projects": projects}
@@ -2109,6 +2111,9 @@ async def consolidation_run(body: ConsolidationRunRequest | None = None):
     # Consolidation uses positional/tuple row access — force tuple_row.
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
     redis = _make_redis()
+    # The SUMMARIZE pass distils episodes → clean memories via the LLM. Without
+    # a client it no-ops (no raw-sentence fallback), so pass one when available.
+    llm_client, llm_model = _make_llm_client()
     try:
         result = await run_consolidation(
             pool=pool,
@@ -2117,6 +2122,8 @@ async def consolidation_run(body: ConsolidationRunRequest | None = None):
             publisher=_make_publisher_sync(),
             scope=scope,
             deep=deep,
+            llm_client=llm_client,
+            llm_model=llm_model,
         )
         return result
     except Exception as e:
@@ -2657,17 +2664,21 @@ def _scheduler_jobs():
         )
 
     async def _orchestrator_autoplan_job() -> dict:
-        # Pull active goals that have no plan and decompose them (capped per
-        # sweep); each new plan is delivered to the inbox. Respects auto_plan.
-        from orchestration.orchestrator import autoplan_sweep
+        # The autonomous lifecycle tick, in order:
+        #   1) promote high-scoring opportunities → goals (respects auto_promote)
+        #   2) decompose active unplanned goals → plans in the inbox (respects auto_plan)
+        # Promotion runs first so a freshly-promoted goal is planned the same tick.
+        from orchestration.orchestrator import autoplan_sweep, promote_opportunities_sweep
 
-        return await autoplan_sweep(
-            pool=await _get_async_pool(row_factory=psycopg.rows.tuple_row),
-            publisher=_make_publisher_sync(),
-            llm=_runner_llm(),
-            scope=SCOPE,
-            max_goals=3,
+        pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+        pub = _make_publisher_sync()
+        promoted = await promote_opportunities_sweep(
+            pool=pool, publisher=pub, scope=SCOPE, max_promote=2,
         )
+        planned = await autoplan_sweep(
+            pool=pool, publisher=pub, llm=_runner_llm(), scope=SCOPE, max_goals=3,
+        )
+        return {"promoted": promoted, "planned": planned}
 
     return [
         Job("decision_review_nudge", DailyAt("09:00"), _decision_review_nudge_job),

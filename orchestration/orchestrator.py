@@ -320,6 +320,55 @@ async def execute_plan(
 
 # ── autonomous planning sweep ─────────────────────────────────────────────────
 
+async def promote_opportunities_sweep(
+    *, pool: Any, publisher: Any, scope: str, max_promote: int = 2,
+    min_score: float = 0.6,
+) -> dict:
+    """Turn high-scoring opportunities into goals — the front of the autonomous
+    lifecycle (opportunity → goal → plan → execute → verify → achieved).
+
+    Pulls `scored` opportunities at/above `min_score` that haven't become a goal
+    yet, creates a goal from each (capped per sweep), and marks the opportunity
+    accepted with resolution = the new goal id. Respects the `auto_promote`
+    setting (default on). Push/deploy stay gated downstream — this only creates
+    goals, it doesn't execute anything itself."""
+    from shared.settings import get_setting
+    from goals import create_goal, resolve_opportunity
+    if not await get_setting(pool, "auto_promote", True):
+        return {"skipped": "auto_promote_off", "promoted": []}
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, title, description, score FROM opportunities "
+                "WHERE scope=%s AND status='scored' AND resolution IS NULL "
+                "AND COALESCE(score, 0) >= %s "
+                "ORDER BY score DESC NULLS LAST, detected_at ASC LIMIT %s",
+                (scope, min_score, max_promote),
+            )
+            rows = await cur.fetchall()
+
+    promoted = []
+    for opp_id, title, description, score in rows:
+        try:
+            g = await create_goal(
+                pool, publisher, scope, title=title,
+                description=description or None, horizon="month",
+                success_criteria=f"The opportunity \"{title}\" is realized.",
+            )
+            await resolve_opportunity(pool, publisher, scope, opp_id,
+                                      accept=True, resolution=g["id"])
+            promoted.append({"opp_id": opp_id, "goal_id": g["id"], "title": title,
+                             "score": score})
+            log.info("promote: opportunity %s → goal %s (%.2f)", opp_id, g["id"],
+                     score or 0.0)
+        except Exception as e:  # noqa: BLE001 — one bad opp shouldn't stop the sweep
+            log.info("promote: skip %s (%s)", opp_id, e)
+    if promoted:
+        log.info("promote: %d opportunity(ies) → goals", len(promoted))
+    return {"promoted": promoted, "candidates": len(rows)}
+
+
 async def autoplan_sweep(
     *, pool: Any, publisher: Any, llm: Any, scope: str, max_goals: int = 3,
 ) -> dict:

@@ -127,6 +127,66 @@ def _prj_row(r) -> dict:
             "path": r[5], "summary": r[6], "north_star_goal_id": r[7], "status": r[8]}
 
 
+# ── life-area routing ─────────────────────────────────────────────────────────
+# A goal is placed into a life-area workspace (not one undifferentiated bucket).
+# Routing is keyword-based: deterministic, free, and predictable. The taxonomy is
+# ordered — the first area whose keywords match wins — so more specific areas
+# (career, content) are checked before broad ones (building). Falls back to
+# "Personal & Ops". Phase 2 may later refine borderline cases with the LLM.
+
+_LIFE_AREAS: list[tuple[str, str, tuple[str, ...]]] = [
+    ("Career & Job Search", "career",
+     ("apply", "job", "role", "resume", "cv", "interview", "recruiter",
+      "hiring", "hire", "application", "linkedin", "salary", "offer")),
+    ("Content & Brand", "content",
+     ("case study", "case-study", "narrative", "article", "blog", "post",
+      "portfolio", "write-up", "writeup", "content", "brand", "story",
+      "storytelling", "essay", "newsletter")),
+    ("Product & Engineering", "building",
+     ("build", "ship", "app", "feature", "code", "deploy", "bug", "api",
+      "system", "refactor", "migrate", "curlyos", "jobpilot", "agent",
+      "webapp", "backend", "frontend", "database", "integration")),
+    ("Learning & Research", "learning",
+     ("learn", "study", "research", "course", "read", "explore", "understand",
+      "investigate", "evaluate")),
+    ("Health & Wellbeing", "health",
+     ("health", "fitness", "sleep", "exercise", "workout", "diet", "nutrition",
+      "meditat", "wellbeing", "wellness")),
+    ("Finance", "finance",
+     ("finance", "money", "budget", "invest", "expense", "cost", "revenue",
+      "pricing", "income", "savings")),
+]
+_DEFAULT_AREA = ("Personal & Ops", "personal")
+
+
+def _kw_match(haystack: str, keyword: str) -> bool:
+    """Match a keyword on word boundaries (so 'job' doesn't hit 'jobpilot' and
+    'post' doesn't hit 'postgres'). Multi-word phrases match as substrings."""
+    if " " in keyword or "-" in keyword:
+        return keyword in haystack
+    return re.search(rf"\b{re.escape(keyword)}\b", haystack) is not None
+
+
+def route_life_area(title: str, description: str | None = None) -> tuple[str, str]:
+    """Return (workspace_name, slug) for a goal, by keyword match over the taxonomy."""
+    hay = f"{title or ''} {description or ''}".lower()
+    for name, slug, keywords in _LIFE_AREAS:
+        if any(_kw_match(hay, k) for k in keywords):
+            return name, slug
+    return _DEFAULT_AREA
+
+
+_AREA_SUMMARY = {
+    "career": "Job search, applications, and positioning.",
+    "content": "Case studies, writing, and brand narrative.",
+    "building": "Products, code, and systems you're shipping.",
+    "learning": "Research, study, and exploration.",
+    "health": "Health, fitness, and wellbeing.",
+    "finance": "Money, budgeting, and investing.",
+    "personal": "Everything else — personal projects and ops.",
+}
+
+
 # ── goal placement ────────────────────────────────────────────────────────────
 
 async def place_goal(pool: Any, *, scope: str, goal_id: str) -> dict | None:
@@ -164,11 +224,12 @@ async def place_goal(pool: Any, *, scope: str, goal_id: str) -> dict | None:
                             "studio_dir": str(Path(project["path"]) / "studio")}
 
     title = g[1] or "Untitled goal"
-    # Workspace = the life-area bucket. Default to a single "Goals" workspace per
-    # scope; richer routing (per identity area) comes in Phase 2.
+    # Workspace = the goal's life area (career / content / building / …), routed
+    # by keyword so related goals cluster into the same workspace.
+    ws_name, ws_slug = route_life_area(title, g[1])
     workspace = await ensure_workspace(
-        pool, scope=scope, name="Goals", slug="goals",
-        summary="Auto-managed home for goal-driven work.")
+        pool, scope=scope, name=ws_name, slug=ws_slug, kind="life_area",
+        summary=_AREA_SUMMARY.get(ws_slug, "Goal-driven work."))
     project = await ensure_project(
         pool, scope=scope, workspace_id=workspace["id"],
         workspace_slug=workspace["slug"], name=title,
