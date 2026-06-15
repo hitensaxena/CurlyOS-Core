@@ -83,7 +83,7 @@ async def discovery_scan(*, pool: Any, publisher: Any, embedder: Any, redis: Any
     mem_lines: list[str] = []
     try:
         res = await retrieve(req, pool, embedder, redis=redis)
-        mem_lines = [f"- [{i.id}] {i.content[:240]}" for i in res.items[:14]]
+        mem_lines = [f"- [{i.id}] {i.text[:240]}" for i in res.items[:14]]
     except Exception:  # noqa: BLE001
         log.warning("discovery: divergent retrieval failed", exc_info=True)
 
@@ -115,7 +115,13 @@ async def discovery_scan(*, pool: Any, publisher: Any, embedder: Any, redis: Any
                      + "; ".join(open_titles) if open_titles else ""))
 
     # 2. propose
-    raw = _json_block(await llm(_DISCOVERY_SYSTEM, user_block)) or []
+    llm_text = await llm(_DISCOVERY_SYSTEM, user_block)
+    if not llm_text or not str(llm_text).strip():
+        # Empty completion — almost always the provider rate-limiting / returning
+        # nothing after retries. Surface it as a retryable error so the UI can say
+        # "try again" rather than silently reporting "0 opportunities found".
+        return {"error": "the model returned nothing (likely rate-limited) — try again shortly"}
+    raw = _json_block(llm_text) or []
 
     # 3. dedupe + write
     created: list[dict] = []
@@ -183,7 +189,7 @@ async def run_simulation(*, pool: Any, publisher: Any, embedder: Any, redis: Any
     try:
         res = await retrieve(RetrievalRequest(query=question, scope=scope, token_budget=2000),
                              pool, embedder, redis=redis)
-        ctx_lines = [f"- {i.content[:220]}" for i in res.items[:10]]
+        ctx_lines = [f"- {i.text[:220]}" for i in res.items[:10]]
     except Exception:  # noqa: BLE001
         log.warning("simulation: context retrieval failed", exc_info=True)
 

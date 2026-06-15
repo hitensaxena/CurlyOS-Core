@@ -48,7 +48,7 @@ async def _recall(deps: ToolDeps, args: dict) -> dict:
                            mode="fast", token_budget=2000)
     result = await retrieve(req, deps.pool, await deps.embedder_factory(), redis=deps.redis)
     items = [
-        {"id": i.id, "content": i.content[:400], "tier": i.tier, "score": round(i.score, 4)}
+        {"id": i.id, "content": i.text[:400], "tier": i.tier, "score": round(i.score, 4)}
         for i in result.items[:12]
     ]
     return {"items": items, "count": len(items)}
