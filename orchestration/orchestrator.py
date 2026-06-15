@@ -766,36 +766,46 @@ async def _deliver_goal_inbox(pool, scope, goal_id, goal_title, *, done: bool,
 
 async def orchestrator_chat(
     *, pool: Any, publisher: Any, llm: Any, runner: Any, scope: str,
-    message: str, goal_id: str | None = None,
+    message: str, goal_id: str | None = None, project_id: str | None = None,
 ) -> dict:
     """Interpret a natural-language command and act: decompose / approve /
-    dispatch / status / answer. Persists both sides of the exchange."""
+    dispatch / status / answer. Persists both sides of the exchange.
+
+    Scope: a goal chat (goal_id), a PROJECT chat (project_id — commands act on the
+    project's primary goal, status summarizes all its goals), or global (neither)."""
     message = (message or "").strip()
     if not message:
         return {"error": "empty message"}
-    await _save_message(pool, scope, goal_id, "user", message)
+    await _save_message(pool, scope, goal_id, "user", message, project_id=project_id)
 
-    state = await _goal_state(pool, scope, goal_id) if goal_id else None
-    action, reply = await _interpret(llm, message, state)
+    # In a project chat, actions target the project's primary goal.
+    target_goal_id = goal_id
+    project_mode = bool(project_id and not goal_id)
+    if project_mode:
+        target_goal_id = await _project_primary_goal(pool, scope, project_id)
+
+    state = await _goal_state(pool, scope, target_goal_id) if target_goal_id else None
+    project_status = await _project_status_text(pool, scope, project_id) if project_mode else None
+    action, reply = await _interpret(llm, message, state, extra_context=project_status)
 
     meta: dict = {"action": action}
-    if action == "decompose" and goal_id:
+    if action == "decompose" and target_goal_id:
         r = await decompose_goal(pool=pool, publisher=publisher, llm=llm, scope=scope,
-                                 goal_id=goal_id, guidance=message)
+                                 goal_id=target_goal_id, guidance=message)
         meta["result"] = r
         reply = (f"I couldn't build a plan: {r['error']}" if r.get("error")
                  else f"I broke this goal into {r['task_count']} tasks. Review them and say "
                       f"'approve' to let me start.")
-    elif action == "approve" and goal_id:
-        plan = await _current_plan(pool, scope, goal_id)
+    elif action == "approve" and target_goal_id:
+        plan = await _current_plan(pool, scope, target_goal_id)
         if plan and plan["status"] == "proposed":
             r = await approve_plan(pool=pool, publisher=publisher, scope=scope, plan_id=plan["id"])
             meta["result"] = r
             reply = reply or "Plan approved. Say 'start' to dispatch the workers."
         else:
             reply = "There's no proposed plan to approve — try 'break this down' first."
-    elif action == "dispatch" and goal_id:
-        plan = await _current_plan(pool, scope, goal_id)
+    elif action == "dispatch" and target_goal_id:
+        plan = await _current_plan(pool, scope, target_goal_id)
         if plan and plan["status"] in ("approved", "executing"):
             r = await dispatch_plan(pool=pool, publisher=publisher, runner=runner,
                                     scope=scope, plan_id=plan["id"])
@@ -806,18 +816,24 @@ async def orchestrator_chat(
         else:
             reply = "There's no plan to dispatch yet — try 'break this down' first."
     elif action == "status":
-        reply = _status_text(state)
+        reply = project_status if project_mode else _status_text(state)
     # action == "none" → reply stands as the LLM's answer
 
-    await _save_message(pool, scope, goal_id, "orchestrator", reply, meta=meta)
+    await _save_message(pool, scope, goal_id, "orchestrator", reply, meta=meta,
+                        project_id=project_id)
     return {"reply": reply, "action": action, "meta": meta}
 
 
-async def _interpret(llm: Any, message: str, state: dict | None) -> tuple[str, str]:
-    """Return (action, reply). LLM-classified, with a keyword fallback."""
+async def _interpret(llm: Any, message: str, state: dict | None,
+                     extra_context: str | None = None) -> tuple[str, str]:
+    """Return (action, reply). LLM-classified, with a keyword fallback.
+
+    `extra_context` (e.g. a project's goal summary) is prepended so a project chat
+    reasons over the whole project, not just its primary goal."""
     if llm is not None:
         try:
-            ctx = "CURRENT STATE:\n" + _status_text(state) if state else "No goal selected."
+            ctx = extra_context or ("CURRENT STATE:\n" + _status_text(state) if state
+                                    else "No goal selected.")
             text = await llm(CHAT_SYSTEM, f"{ctx}\n\nUSER: {message}")
             data = first_json(text) if text else None
             if isinstance(data, dict) and data.get("action"):
@@ -913,14 +929,18 @@ async def overview(pool: Any, scope: str) -> dict:
     return {"goals": goals, "active_runs": active, "pending_approvals": pending}
 
 
-async def list_messages(pool: Any, scope: str, goal_id: str | None, limit: int = 100) -> list[dict]:
+async def list_messages(pool: Any, scope: str, goal_id: str | None,
+                        project_id: str | None = None, limit: int = 100) -> list[dict]:
     where = ["scope=%s"]
     params: list = [scope]
-    if goal_id:
+    if project_id:
+        where.append("project_id=%s")
+        params.append(project_id)
+    elif goal_id:
         where.append("goal_id=%s")
         params.append(goal_id)
     else:
-        where.append("goal_id IS NULL")
+        where.append("goal_id IS NULL AND project_id IS NULL")
     params.append(min(limit, 300))
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
@@ -1024,15 +1044,56 @@ def _status_text(state: dict | None) -> str:
             + f" (progress {round((goal.get('progress') or 0) * 100)}%).")
 
 
-async def _save_message(pool, scope, goal_id, role, content, meta: dict | None = None) -> None:
+async def _project_primary_goal(pool, scope, project_id) -> str | None:
+    """The goal a project-scoped command acts on: the north star, else the
+    highest-priority active goal in the project."""
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT north_star_goal_id FROM projects WHERE id=%s", (project_id,))
+            r = await cur.fetchone()
+            if r and r[0]:
+                return r[0]
+            await cur.execute(
+                "SELECT id FROM goals WHERE project_id=%s AND scope=%s AND status='active' "
+                "AND valid_to IS NULL ORDER BY priority DESC, valid_from ASC LIMIT 1",
+                (project_id, scope),
+            )
+            r = await cur.fetchone()
+    return r[0] if r else None
+
+
+async def _project_status_text(pool, scope, project_id) -> str:
+    """A status line summarizing every goal in the project."""
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT name FROM projects WHERE id=%s", (project_id,))
+            pr = await cur.fetchone()
+            await cur.execute(
+                "SELECT title, status, progress FROM goals WHERE project_id=%s AND scope=%s "
+                "AND valid_to IS NULL ORDER BY priority DESC, valid_from ASC",
+                (project_id, scope),
+            )
+            goals = await cur.fetchall()
+    if not pr:
+        return "No project selected."
+    if not goals:
+        return f"Project '{pr[0]}' has no goals yet."
+    lines = [f"Project '{pr[0]}' — {len(goals)} goal(s):"]
+    for t, st, pg in goals:
+        lines.append(f"  • {t} [{st}, {round((pg or 0) * 100)}%]")
+    return "\n".join(lines)
+
+
+async def _save_message(pool, scope, goal_id, role, content, meta: dict | None = None,
+                        project_id: str | None = None) -> None:
     from psycopg.types.json import Jsonb
     from shared.types.ulid import mint
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO orchestrator_messages (id, scope, goal_id, role, content, meta) "
-                "VALUES (%s, %s, %s, %s, %s, %s)",
-                (mint("omsg"), scope, goal_id, role, content[:8000], Jsonb(meta or {})),
+                "INSERT INTO orchestrator_messages (id, scope, goal_id, project_id, role, content, meta) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (mint("omsg"), scope, goal_id, project_id, role, content[:8000], Jsonb(meta or {})),
             )
 
 

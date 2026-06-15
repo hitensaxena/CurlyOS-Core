@@ -65,6 +65,7 @@ class DecomposeRequest(BaseModel):
 class OrchestratorChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     goal_id: str | None = Field(default=None, max_length=60)
+    project_id: str | None = Field(default=None, max_length=60)
 
 
 class BypassRequest(BaseModel):
@@ -679,9 +680,11 @@ def make_router(
         return await overview(await pool_factory(), scope)
 
     @router.get("/orchestrator/messages")
-    async def orchestrator_messages(goal_id: str | None = None, limit: int = 100):
+    async def orchestrator_messages(goal_id: str | None = None,
+                                    project_id: str | None = None, limit: int = 100):
         from orchestration.orchestrator import list_messages
-        items = await list_messages(await pool_factory(), scope, goal_id, limit)
+        items = await list_messages(await pool_factory(), scope, goal_id,
+                                    project_id=project_id, limit=limit)
         return {"items": items, "count": len(items)}
 
     @router.post("/orchestrator/chat")
@@ -691,6 +694,7 @@ def make_router(
         result = await orchestrator_chat(
             pool=await pool_factory(), publisher=_pub(), llm=_llm(), runner=runner,
             scope=scope, message=body.message, goal_id=body.goal_id,
+            project_id=body.project_id,
         )
         if result.get("error"):
             raise HTTPException(400, result["error"])
