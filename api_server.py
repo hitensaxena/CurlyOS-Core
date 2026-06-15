@@ -1440,9 +1440,13 @@ def get_workspace_detail(workspace_id: str):
     return {"workspace": w, "projects": projects}
 
 
-@app.get("/api/projects/{project_id}")
+@app.get("/api/project/{project_id}")
 def get_project_detail(project_id: str):
-    """A project with its placed goals and produced artifacts (studio view)."""
+    """A project with its placed goals and produced artifacts (studio view).
+
+    NOTE singular `/api/project/{id}` (not `/api/projects/`): the webapp defines
+    its own `/api/projects/[slug]` route for the separate code-registry project
+    concept, which would otherwise shadow this through the proxy."""
     with get_conn() as conn:
         p = conn.execute(
             "SELECT p.id, p.workspace_id, p.scope, p.name, p.slug, p.path, p.summary, "
