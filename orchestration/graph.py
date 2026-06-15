@@ -79,6 +79,9 @@ Rules:
     edit_file. Ground the content in the results of your earlier steps.
   - After code/site changes, run_command the build or test (e.g. "npm run build")
     to CHECK your work, and fix what fails.
+  - Write deliverables into the WORKING DIRECTORY named in the task, and after
+    writing a real output (a doc, file, code change, image) call save_artifact
+    (title, path, kind) so it appears in the goal's studio.
   - Use git_commit to save changes locally. NEVER use git_push — publishing is
     gated separately.
   - Use remember/record_decision/create_sketch to persist an insight or analysis
