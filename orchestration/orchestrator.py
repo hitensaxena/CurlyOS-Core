@@ -20,7 +20,7 @@ Design:
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 from shared.llm import first_json, json_records
@@ -39,24 +39,45 @@ _TASK_STATUS = {
 # ── prompts ───────────────────────────────────────────────────────────────────
 
 DECOMPOSE_SYSTEM = """You are the Orchestrator of CurlyOS. You turn a GOAL into a small plan of
-concrete, independently-executable TASKS that worker agents will carry out.
+concrete TASKS that worker agents EXECUTE IN REALITY — they actually produce the
+work, not just notes about it.
 
-Each worker agent can: search the user's memory (recall), search their knowledge
-graph, list goals, read identity, remember new facts, record decisions, create
-sub-goals, write notes to the studio, and send the user a notification. Workers
-CANNOT browse the web or act on external systems beyond a notification.
+Each worker agent can:
+  - read the user's memory (recall), knowledge graph, identity, goals;
+  - read/list/WRITE/EDIT real files anywhere under the user's home directory
+    (e.g. write an article to a file, edit a website's source);
+  - run allowlisted build/test/git-local commands (npm/pnpm/yarn run|build|test,
+    tsc, git add|commit|status|diff) to make and CHECK real changes;
+  - research the WEB, read pages, and generate images — these are delegated to the
+    local Hermes agent (web_research / browse / generate_image);
+  - remember facts, record decisions, create sub-goals, notify the user.
+Workers CANNOT push/deploy (that needs the user's approval) and cannot install
+packages.
 
-Produce 3-6 tasks. Each task must be:
-  - self-contained and doable by one worker in a few steps,
-  - phrased as a direct instruction to the worker (e.g. "Search memory for X and
-    summarize the relevant threads", "Draft a concrete plan for…", "Record a
-    decision about…"),
-  - clearly advancing the goal.
+HARD CONSTRAINTS — a task that violates these will FAIL:
+  - Don't assume a file exists unless an EARLIER task in this same plan creates
+    it. Name the producing step explicitly.
+  - Web/research/image steps may be slower (they delegate to Hermes) — keep them
+    focused.
+
+Order the tasks so the goal is actually achieved end-to-end. A good plan for
+"write a case study and put it on my portfolio" looks like: draft & write the
+case study file → integrate it into the site source → run the build to verify →
+commit. Make tasks sequential and concrete.
+
+Produce 2-6 tasks. Each task must be:
+  - a direct instruction to one worker, naming real paths/commands where relevant
+    (e.g. "Write the case study to ~/code/folio/content/casestudy-x.md", "Add the
+    entry to src/content/site.ts and run `npm run build` in ~/code/folio");
+  - paired with a "verify" string: the concrete success test for THAT task (what
+    must be true for it to count as done — a file existing with real content, a
+    build exiting 0, a commit made).
 
 Reply ONLY JSON, no prose:
 {"rationale": "<1-2 sentences on the overall approach>",
  "tasks": [{"title": "<short label>", "task": "<instruction to the worker>",
-            "why": "<how it advances the goal>"}]}"""
+            "why": "<how it advances the goal>",
+            "verify": "<the concrete success test for this task>"}]}"""
 
 CHAT_SYSTEM = """You are the Orchestrator of CurlyOS, managing worker agents that execute the
 user's goals. The user sends a command or question about a GOAL and its plan.
@@ -122,11 +143,12 @@ async def decompose_goal(
             )
             for i, t in enumerate(tasks[:6]):
                 await cur.execute(
-                    "INSERT INTO goal_tasks (id, scope, plan_id, goal_id, seq, title, task, why) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    "INSERT INTO goal_tasks (id, scope, plan_id, goal_id, seq, title, task, why, verify) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (mint("gtk"), scope, plan_id, goal_id, i,
                      str(t.get("title") or f"Task {i + 1}")[:200],
-                     str(t["task"])[:2000], str(t.get("why", ""))[:1000]),
+                     str(t["task"])[:2000], str(t.get("why", ""))[:1000],
+                     (str(t["verify"])[:2000] if t.get("verify") else None)),
                 )
                 created.append(t["task"])
     await _emit(pool, publisher, scope, "goal.plan.proposed", goal_id,
@@ -218,26 +240,34 @@ async def dispatch_task(
     return {"task_id": task_id, "run_id": run_id, "status": "running"}
 
 
+async def _next_pending_task_id(pool, plan_id) -> str | None:
+    """The lowest-seq task still waiting to run — the next link in the chain."""
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id FROM goal_tasks WHERE plan_id=%s AND status='pending' "
+                "ORDER BY seq LIMIT 1",
+                (plan_id,),
+            )
+            r = await cur.fetchone()
+    return r[0] if r else None
+
+
 async def dispatch_plan(
     *, pool: Any, publisher: Any, runner: Any, scope: str, plan_id: str,
     autonomy: str | None = None,
 ) -> dict:
-    """Dispatch every still-pending task in an approved plan."""
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT id FROM goal_tasks WHERE plan_id=%s AND scope=%s AND status='pending' "
-                "ORDER BY seq",
-                (plan_id, scope),
-            )
-            task_ids = [r[0] for r in await cur.fetchall()]
-    dispatched = []
-    for tid in task_ids:
-        r = await dispatch_task(pool=pool, publisher=publisher, runner=runner,
-                                scope=scope, task_id=tid, autonomy=autonomy)
-        if r.get("run_id"):
-            dispatched.append(r)
-    return {"plan_id": plan_id, "dispatched": len(dispatched), "runs": dispatched}
+    """Start the plan as a SEQUENTIAL pipeline: dispatch only the first pending
+    task. Each task that passes verification dispatches the next one (in
+    on_worker_done) — so a goal whose steps depend on each other (write → update →
+    check → done) executes in order, with a verify gate between every step."""
+    tid = await _next_pending_task_id(pool, plan_id)
+    if tid is None:
+        return {"plan_id": plan_id, "dispatched": 0, "runs": []}
+    r = await dispatch_task(pool=pool, publisher=publisher, runner=runner,
+                            scope=scope, task_id=tid, autonomy=autonomy)
+    runs = [r] if r.get("run_id") else []
+    return {"plan_id": plan_id, "dispatched": len(runs), "runs": runs, "error": r.get("error")}
 
 
 async def execute_plan(
@@ -288,8 +318,10 @@ async def autoplan_sweep(
                 "WHERE g.scope=%s AND g.status='active' AND g.valid_to IS NULL "
                 "AND NOT EXISTS (SELECT 1 FROM goal_plans p WHERE p.goal_id=g.id "
                 "                AND p.status IN ('proposed','approved','executing')) "
+                # don't re-plan a goal that has already churned through its plan budget
+                "AND (SELECT count(*) FROM goal_plans p2 WHERE p2.goal_id=g.id) < %s "
                 "ORDER BY g.progress ASC, g.valid_from ASC LIMIT %s",
-                (scope, max_goals),
+                (scope, MAX_GOAL_PLANS, max_goals),
             )
             candidates = await cur.fetchall()
 
@@ -312,6 +344,8 @@ async def autoplan_sweep(
 _WRITE_TOOLS = {
     "remember": "memory", "record_decision": "decision", "review_decision": "decision",
     "create_goal": "subgoal", "create_sketch": "sketch", "notify": "notification",
+    "write_file": "file", "edit_file": "file", "git_commit": "commit",
+    "run_command": "command",
 }
 
 
@@ -345,6 +379,12 @@ async def get_artifacts(pool: Any, scope: str, goal_id: str) -> list[dict]:
 
 def _artifact_summary(tool: str, args: Any) -> str:
     a = args if isinstance(args, dict) else {}
+    if tool in ("write_file", "edit_file"):
+        return str(a.get("path") or "")[:400]
+    if tool == "run_command":
+        return str(a.get("command") or "")[:400]
+    if tool == "git_commit":
+        return str(a.get("message") or "commit")[:400]
     key = {"remember": "statement", "record_decision": "title", "review_decision": "outcome",
            "create_goal": "title", "create_sketch": "content", "notify": "text"}.get(tool)
     val = a.get(key) if key else None
@@ -355,7 +395,7 @@ def _artifact_summary(tool: str, args: Any) -> str:
 
 def _artifact_ref(result: Any) -> str | None:
     if isinstance(result, dict):
-        for k in ("sketch_id", "dec_id", "goal_id", "mem_id", "id"):
+        for k in ("path", "sketch_id", "dec_id", "goal_id", "mem_id", "id"):
             if result.get(k):
                 return str(result[k])
     return None
@@ -363,54 +403,185 @@ def _artifact_ref(result: Any) -> str | None:
 
 # ── worker completion → progress (runner hook) ────────────────────────────────
 
+MAX_GOAL_PLANS = 3  # bound how many times a goal is auto-replanned before asking the user
+
+
 async def on_worker_done(
     pool_factory: PoolFactory, publisher_factory: Callable[[], Any],
     scope: str, run_id: str, status: str,
+    *, get_runner: Callable[[], Any] | None = None, llm: Any = None,
 ) -> None:
-    """Runner on_run_event hook: if this run is a goal-task worker, update the
-    task and recompute the goal's progress. No-op for non-goal runs. Idempotent
-    and defensive — never raises into the run loop."""
+    """Runner on_run_event hook: a goal-task worker run changed state. Instead of
+    trusting "finished == done", VERIFY the run's real outcome against the task's
+    success criteria, then:
+      * pass   → mark the task completed;
+      * fail, attempts left → re-dispatch a fresh worker with the critique as
+        context (the self-improvement loop);
+      * fail, exhausted → mark the task failed.
+    When every task is terminal, the goal itself is verified. No-op for non-goal
+    runs. Idempotent and defensive — never raises into the run loop."""
     try:
         pool = await pool_factory()
-        async with pool.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT id, goal_id, plan_id FROM goal_tasks WHERE run_id=%s", (run_id,)
-                )
-                row = await cur.fetchone()
-        if row is None:
+        task = await _load_task_full(pool, run_id)
+        if task is None:
             return  # not a goal-task worker
-        task_id, goal_id, plan_id = row
+        # Already-terminal task (a stale/duplicate hook firing) → nothing to do.
+        if task["status"] in ("completed", "failed", "skipped"):
+            return
 
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT status, result, error FROM agent_runs WHERE id=%s", (run_id,)
+                    "SELECT status, result, error, autonomy_level FROM agent_runs WHERE id=%s",
+                    (run_id,),
                 )
                 r = await cur.fetchone()
         run_status = r[0] if r else status
         summary = _extract_summary(r[1]) if r else None
         error = r[2] if r else None
-        task_status = _TASK_STATUS.get(run_status, run_status)
-
-        async with pool.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    "UPDATE goal_tasks SET status=%s, result_summary=%s, updated_at=now() "
-                    "WHERE id=%s",
-                    (task_status, (summary or error or "")[:4000], task_id),
-                )
-
+        autonomy = r[3] if r else None
         publisher = publisher_factory() if publisher_factory else None
-        if run_status in ("completed", "failed", "cancelled", "parked"):
-            await _recompute_progress(pool, publisher, scope, goal_id, plan_id)
-        log.info("orchestrator: worker %s for goal %s → task %s (%s)",
-                 run_id, goal_id, task_id, task_status)
+
+        # Parked = waiting on a human approval; not done, not failed. Reflect it
+        # and stop — the run resumes and fires this hook again on completion.
+        if run_status == "parked":
+            await _set_task(pool, task["id"], "parked", summary or error)
+            await _recompute_progress(pool, publisher, scope, task["goal_id"],
+                                      task["plan_id"], llm=llm)
+            return
+        if run_status not in ("completed", "failed", "cancelled"):
+            return  # still in flight
+        if run_status == "cancelled":
+            await _set_task(pool, task["id"], "skipped", summary or error)
+            await _recompute_progress(pool, publisher, scope, task["goal_id"],
+                                      task["plan_id"], llm=llm)
+            return
+
+        # ── VERIFY the real outcome ───────────────────────────────────────────
+        from orchestration.verify import verify_task
+        await _set_task(pool, task["id"], "verifying", summary or error)
+        now = datetime.now(timezone.utc).isoformat()
+        verdict = await verify_task(pool=pool, llm=llm, scope=scope, task=task,
+                                    run_id=run_id, run_status=run_status, now=now,
+                                    summary=summary)
+        await _store_verdict(pool, task["id"], verdict)
+
+        if verdict.get("passed"):
+            await _set_task(pool, task["id"], "completed", summary or error)
+            await _emit(pool, publisher, scope, "goal.task.verified", task["goal_id"],
+                        {"task_id": task["id"], "run_id": run_id, "passed": True})
+            log.info("orchestrator: task %s VERIFIED (run %s)", task["id"], run_id)
+            # Sequential pipeline: a verified step unlocks the next one.
+            await _advance_chain(pool, publisher, scope, task["plan_id"], autonomy, get_runner)
+        else:
+            await _handle_failed_verdict(pool, publisher, scope, task, run_id,
+                                         verdict, autonomy, get_runner)
+
+        await _recompute_progress(pool, publisher, scope, task["goal_id"],
+                                  task["plan_id"], llm=llm)
     except Exception:  # noqa: BLE001
         log.exception("orchestrator: on_worker_done failed for run %s", run_id)
 
 
-async def _recompute_progress(pool, publisher, scope, goal_id, plan_id) -> None:
+async def _handle_failed_verdict(pool, publisher, scope, task, run_id, verdict,
+                                 autonomy, get_runner) -> None:
+    """A task failed verification: re-dispatch with the critique if attempts
+    remain, else mark it failed."""
+    critique = verdict.get("critique") or "did not meet the success criteria"
+    attempt = task["attempt"]
+    runner = get_runner() if get_runner else None
+    if attempt < task["max_attempts"] and runner is not None:
+        retry_task = (
+            f"{task['task']}\n\n--- PREVIOUS ATTEMPT (#{attempt + 1}) FAILED VERIFICATION ---\n"
+            f"{critique}\n"
+            f"Fix exactly this and complete the task properly this time. "
+            f"Re-check your own work before finishing."
+        )
+        new_run = await runner.start_run(
+            retry_task, source=f"goal:{task['goal_id']}", goal_id=task["goal_id"],
+            autonomy=autonomy or "full_auto",
+        )
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE goal_tasks SET status='running', run_id=%s, attempt=attempt+1, "
+                    "result_summary=%s, updated_at=now() WHERE id=%s",
+                    (new_run, f"retry: {critique}"[:4000], task["id"]),
+                )
+        await _emit(pool, publisher, scope, "goal.task.retry", task["goal_id"],
+                    {"task_id": task["id"], "run_id": new_run,
+                     "attempt": attempt + 1, "critique": critique[:300]})
+        log.info("orchestrator: task %s FAILED verify → retry #%d (run %s): %s",
+                 task["id"], attempt + 1, new_run, critique[:120])
+    else:
+        await _set_task(pool, task["id"], "failed",
+                        f"failed verification after {attempt + 1} attempt(s): {critique}")
+        await _emit(pool, publisher, scope, "goal.task.verified", task["goal_id"],
+                    {"task_id": task["id"], "run_id": run_id, "passed": False,
+                     "exhausted": True})
+        log.info("orchestrator: task %s FAILED verify, attempts exhausted: %s",
+                 task["id"], critique[:120])
+        # A hard failure breaks the chain: later steps usually depend on this one,
+        # so skip the remaining pending tasks and let the plan finish (the goal
+        # verifier then reports the gap and may re-plan).
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE goal_tasks SET status='skipped', "
+                    "result_summary='skipped — an earlier step failed', updated_at=now() "
+                    "WHERE plan_id=%s AND status='pending'",
+                    (task["plan_id"],),
+                )
+
+
+async def _advance_chain(pool, publisher, scope, plan_id, autonomy, get_runner) -> None:
+    """Dispatch the next pending task in the plan (the sequential pipeline step)."""
+    runner = get_runner() if get_runner else None
+    if runner is None:
+        return
+    tid = await _next_pending_task_id(pool, plan_id)
+    if tid is None:
+        return  # chain complete — _recompute_progress will finalize the goal
+    r = await dispatch_task(pool=pool, publisher=publisher, runner=runner,
+                            scope=scope, task_id=tid, autonomy=autonomy or "full_auto")
+    log.info("orchestrator: chain advanced → task %s (%s)", tid, r.get("run_id") or r.get("error"))
+
+
+async def _set_task(pool, task_id, status, summary) -> None:
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE goal_tasks SET status=%s, result_summary=%s, updated_at=now() WHERE id=%s",
+                (status, (summary or "")[:4000], task_id),
+            )
+
+
+async def _store_verdict(pool, task_id, verdict: dict) -> None:
+    from psycopg.types.json import Jsonb
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE goal_tasks SET verdict=%s, updated_at=now() WHERE id=%s",
+                (Jsonb(verdict), task_id),
+            )
+
+
+async def _load_task_full(pool, run_id) -> dict | None:
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, goal_id, plan_id, title, task, verify, status, attempt, max_attempts "
+                "FROM goal_tasks WHERE run_id=%s",
+                (run_id,),
+            )
+            r = await cur.fetchone()
+    if r is None:
+        return None
+    return {"id": r[0], "goal_id": r[1], "plan_id": r[2], "title": r[3], "task": r[4],
+            "verify": r[5], "status": r[6], "attempt": r[7], "max_attempts": r[8]}
+
+
+async def _recompute_progress(pool, publisher, scope, goal_id, plan_id, *, llm=None) -> None:
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -425,6 +596,7 @@ async def _recompute_progress(pool, publisher, scope, goal_id, plan_id) -> None:
     terminal = completed + counts.get("failed", 0) + counts.get("skipped", 0)
     progress = round(completed / total, 4)
     plan_done = terminal >= total
+    just_finished = False
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -437,9 +609,89 @@ async def _recompute_progress(pool, publisher, scope, goal_id, plan_id) -> None:
                     "WHERE id=%s AND status='executing'",
                     (plan_id,),
                 )
+                just_finished = cur.rowcount > 0  # we are the one transitioning it
     await _emit(pool, publisher, scope, "goal.progress", goal_id,
                 {"progress": progress, "completed": completed, "total": total,
                  "plan_done": plan_done})
+    # The plan just completed → verify the GOAL itself and decide done vs. iterate.
+    if plan_done and just_finished:
+        await _on_plan_complete(pool, publisher, scope, goal_id, plan_id, llm)
+
+
+async def _on_plan_complete(pool, publisher, scope, goal_id, plan_id, llm) -> None:
+    """Every task is terminal. Verify the whole goal: if met, mark it achieved and
+    tell the user; if not, deliver the gap to the inbox and (bounded) re-plan."""
+    from orchestration.verify import verify_goal
+    goal = await _load_goal(pool, scope, goal_id)
+    if goal is None:
+        return
+    plan = await get_plan(pool, scope, goal_id)
+    tasks = (plan or {}).get("tasks", [])
+    artifacts = await get_artifacts(pool, scope, goal_id)
+    result = await verify_goal(pool=pool, llm=llm, scope=scope, goal=goal,
+                               tasks=tasks, artifacts=artifacts)
+
+    if result.get("passed"):
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE goals SET status='achieved', progress=1.0 "
+                    "WHERE id=%s AND scope=%s AND valid_to IS NULL",
+                    (goal_id, scope),
+                )
+        await _deliver_goal_inbox(pool, scope, goal_id, goal["title"], done=True,
+                                  note=result.get("critique") or "", artifacts=artifacts)
+        await _emit(pool, publisher, scope, "goal.achieved", goal_id,
+                    {"plan_id": plan_id, "artifacts": len(artifacts)})
+        log.info("orchestrator: goal %s ACHIEVED (%d artifact(s))", goal_id, len(artifacts))
+        return
+
+    # Not yet met. Count how many plans this goal has had; re-plan if under cap.
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT count(*) FROM goal_plans WHERE goal_id=%s", (goal_id,))
+            plan_count = (await cur.fetchone())[0]
+    gap = result.get("critique") or "the goal's success criteria are not yet fully met"
+    await _deliver_goal_inbox(pool, scope, goal_id, goal["title"], done=False,
+                              note=gap, artifacts=artifacts)
+    await _emit(pool, publisher, scope, "goal.needs_work", goal_id,
+                {"plan_id": plan_id, "critique": gap[:300], "plans": plan_count})
+    if plan_count < MAX_GOAL_PLANS and llm is not None:
+        # Self-improve at the goal level: propose a fresh plan aimed at the gap.
+        r = await decompose_goal(pool=pool, publisher=publisher, llm=llm, scope=scope,
+                                 goal_id=goal_id,
+                                 guidance=f"The previous plan finished but the goal is NOT yet "
+                                          f"met. Address specifically: {gap}",
+                                 notify_inbox=True)
+        log.info("orchestrator: goal %s not met → re-planned (%s)", goal_id,
+                 r.get("plan_id") or r.get("error"))
+    else:
+        log.info("orchestrator: goal %s not met; plan cap reached — awaiting user", goal_id)
+
+
+async def _deliver_goal_inbox(pool, scope, goal_id, goal_title, *, done: bool,
+                              note: str, artifacts: list[dict]) -> None:
+    from psycopg.types.json import Jsonb
+    from shared.types.ulid import mint
+    if done:
+        title = f"✅ Goal achieved: {goal_title}"
+        body_lines = [note.strip()] if note.strip() else ["The goal's success criteria are met."]
+    else:
+        title = f"⚠️ Goal needs more work: {goal_title}"
+        body_lines = [note.strip()] if note.strip() else ["Some success criteria aren't met yet."]
+    if artifacts:
+        body_lines.append("")
+        body_lines.append(f"Produced {len(artifacts)} artifact(s):")
+        for a in artifacts[:12]:
+            body_lines.append(f"  • [{a.get('type')}] {a.get('summary', '')[:120]}")
+    meta = {"kind": "goal_result", "goal_id": goal_id, "done": done}
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO inbox_items (id, scope, job_id, run_id, title, body, meta) "
+                "VALUES (%s, %s, NULL, NULL, %s, %s, %s)",
+                (mint("inb"), scope, title, "\n".join(body_lines)[:8000], Jsonb(meta)),
+            )
 
 
 # ── command chat ──────────────────────────────────────────────────────────────
@@ -536,7 +788,8 @@ async def get_plan(pool: Any, scope: str, goal_id: str) -> dict | None:
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                "SELECT id, seq, title, task, why, status, run_id, result_summary, updated_at "
+                "SELECT id, seq, title, task, why, status, run_id, result_summary, "
+                "attempt, max_attempts, verify, verdict, updated_at "
                 "FROM goal_tasks WHERE plan_id=%s ORDER BY seq",
                 (plan["id"],),
             )

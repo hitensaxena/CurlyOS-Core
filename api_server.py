@@ -75,15 +75,21 @@ async def lifespan(app: FastAPI):
             from shared.notify import get_notifier as _gn
 
             _ujob_pool_factory = lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row)
+            _worker_llm = _runner_llm()  # shared by the runner and the verifier
 
             async def _on_run_event(run_id: str, status: str) -> None:
                 # A run changing state fans out to both consumers; each is
                 # defensive and only acts on runs it owns.
                 #   * scheduled jobs → deliver output to the inbox
-                #   * goal-execution → update the goal_task + recompute progress
+                #   * goal-execution → VERIFY the task, retry-with-critique on a
+                #     failing verdict, and verify the goal when the plan finishes
+                #     (the feedback loop). It needs the runner (to re-dispatch) and
+                #     the llm (to judge), resolved live from app.state.
                 await deliver_run_output(_ujob_pool_factory, run_id, status)
                 await on_worker_done(
                     _ujob_pool_factory, _make_publisher_sync, SCOPE, run_id, status,
+                    get_runner=lambda: getattr(app.state, "runner", None),
+                    llm=_worker_llm,
                 )
 
             runner = Runner(
@@ -93,7 +99,7 @@ async def lifespan(app: FastAPI):
                 publisher_factory=_make_publisher_sync,
                 redis_factory=_make_redis,
                 embedder_factory=get_shared_embedder,
-                llm=_runner_llm(),
+                llm=_worker_llm,
                 notifier=_gn(),
                 on_run_event=_on_run_event,
             )

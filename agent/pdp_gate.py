@@ -51,7 +51,7 @@ log = logging.getLogger("curlyos-core.agent.pdp_gate")
 # the Phase-A confirm_each ceiling it clamps to REQUIRE_APPROVAL — writes
 # park for approval like memory writes do.
 PHASE_A_GRANTED_TOOLS = ["read", "memory_write", "memory_forget_hard", "file_edit",
-                         "external_post"]
+                         "code_exec", "net_egress", "external_post"]
 
 # Chat/runs are user-scoped (not bound to a workspace); identity only.
 _USER_SCOPE_WORKSPACE_ID = "ws_user_scope"
@@ -128,6 +128,8 @@ async def evaluate(
     approval_id: str | None = None,
     create_approval: bool = True,
     force_dry_run: bool = False,
+    host: str | None = None,
+    egress_allow: list[str] | None = None,
 ) -> PDPDecision:
     """Resolve ambient state, run the pure PDP, and (on REQUIRE_APPROVAL) record the approval.
 
@@ -158,6 +160,8 @@ async def evaluate(
         kill_unreadable=kill_unreadable,
         force_dry_run=force_dry_run,
         approval_state=appr_state,
+        host=host,
+        egress_allow=egress_allow or [],
     )
     decision = decide(req)
 

@@ -36,6 +36,7 @@ class Tool:
     description: str          # one line, planner-facing
     params: str               # compact signature, planner-facing
     fn: Callable[[ToolDeps, dict], Awaitable[dict]]
+    egress_host: str | None = None   # for net_egress tools: the allowed host (PDP)
 
 
 # ── read tools ────────────────────────────────────────────────────────────────
@@ -194,6 +195,207 @@ async def _notify(deps: ToolDeps, args: dict) -> dict:
     return {"delivered": bool(delivered)}
 
 
+# ── real-world tools (file_edit / code_exec / external_post) ───────────────────
+# These let a worker actually DO the goal in reality — write the case study,
+# update the portfolio repo, run the build to check it — not just record notes.
+# Every path/command is forced through orchestration.sandbox (home-confined +
+# allowlisted) BELOW the PDP, so even a bypass run can't escape the boundary.
+
+async def _read_file(deps: ToolDeps, args: dict) -> dict:
+    from orchestration.sandbox import resolve_in_home
+    try:
+        p = resolve_in_home(str(args.get("path", "")))
+    except ValueError as e:
+        return {"error": str(e)}
+    if not p.is_file():
+        return {"error": f"not a file: {args.get('path')}"}
+    try:
+        text = p.read_text("utf-8", "replace")
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"read failed: {e}"}
+    return {"path": str(p), "bytes": len(text), "content": text[:30_000],
+            "truncated": len(text) > 30_000}
+
+
+async def _list_dir(deps: ToolDeps, args: dict) -> dict:
+    from orchestration.sandbox import resolve_in_home
+    try:
+        p = resolve_in_home(str(args.get("path", ".")))
+    except ValueError as e:
+        return {"error": str(e)}
+    if not p.is_dir():
+        return {"error": f"not a directory: {args.get('path')}"}
+    entries = []
+    for child in sorted(p.iterdir())[:200]:
+        entries.append({"name": child.name, "dir": child.is_dir()})
+    return {"path": str(p), "entries": entries, "count": len(entries)}
+
+
+async def _write_file(deps: ToolDeps, args: dict) -> dict:
+    """Create or overwrite a file (its parent dirs are created as needed)."""
+    from orchestration.sandbox import resolve_in_home
+    try:
+        p = resolve_in_home(str(args.get("path", "")))
+    except ValueError as e:
+        return {"error": str(e)}
+    content = str(args.get("content", ""))
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        existed = p.exists()
+        p.write_text(content, "utf-8")
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"write failed: {e}"}
+    return {"path": str(p), "bytes": len(content), "action": "overwrote" if existed else "created"}
+
+
+async def _edit_file(deps: ToolDeps, args: dict) -> dict:
+    """Replace an exact, UNIQUE substring in a file (surgical edit)."""
+    from orchestration.sandbox import resolve_in_home
+    try:
+        p = resolve_in_home(str(args.get("path", "")))
+    except ValueError as e:
+        return {"error": str(e)}
+    if not p.is_file():
+        return {"error": f"not a file: {args.get('path')}"}
+    find = str(args.get("find", ""))
+    replace = str(args.get("replace", ""))
+    if not find:
+        return {"error": "edit_file: 'find' is required"}
+    try:
+        text = p.read_text("utf-8")
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"read failed: {e}"}
+    n = text.count(find)
+    if n == 0:
+        return {"error": "edit_file: 'find' string not present in file"}
+    if n > 1:
+        return {"error": f"edit_file: 'find' string is not unique ({n} matches) — add context"}
+    p.write_text(text.replace(find, replace, 1), "utf-8")
+    return {"path": str(p), "replacements": 1}
+
+
+async def _run_command(deps: ToolDeps, args: dict) -> dict:
+    """Run an allowlisted build/test/git-local command and return its output."""
+    from orchestration.sandbox import run_command
+    return await run_command(str(args.get("command", "")), cwd=args.get("cwd"))
+
+
+async def _git_commit(deps: ToolDeps, args: dict) -> dict:
+    """Stage everything and commit in a repo (local only — never pushes)."""
+    from orchestration.sandbox import run_command, resolve_in_home
+    cwd = args.get("cwd")
+    if not cwd:
+        return {"error": "git_commit: 'cwd' (repo path) is required"}
+    try:
+        resolve_in_home(str(cwd))
+    except ValueError as e:
+        return {"error": str(e)}
+    message = str(args.get("message", "")).strip() or "curlyos: agent changes"
+    add = await run_command("git add -A", cwd=cwd)
+    if add.get("error") or add.get("exit_code") not in (0, None):
+        return {"error": "git add failed", "detail": add}
+    # shlex-safe commit message via -m with quoting handled by the allowlist runner
+    import shlex as _shlex
+    commit = await run_command(f"git commit -m {_shlex.quote(message)}", cwd=cwd)
+    return {"committed": commit.get("exit_code") == 0, "commit": commit, "add": add}
+
+
+async def _git_push(deps: ToolDeps, args: dict) -> dict:
+    """Push to a remote — DEPLOYS LIVE. Classed external_post so the PDP forces
+    human approval even under bypass; only runs after the user grants it."""
+    from orchestration.sandbox import resolve_in_home
+    cwd = args.get("cwd")
+    if not cwd:
+        return {"error": "git_push: 'cwd' (repo path) is required"}
+    try:
+        resolve_in_home(str(cwd))
+    except ValueError as e:
+        return {"error": str(e)}
+    remote = str(args.get("remote", "origin")).strip() or "origin"
+    branch = str(args.get("branch", "")).strip()
+    # git_push is the ONE place push is permitted — call the binary directly,
+    # bypassing the allowlist's push ban (the PDP approval is the gate here).
+    import asyncio as _asyncio
+    import os as _os
+    argv = ["git", "push", remote] + ([branch] if branch else [])
+    try:
+        p = resolve_in_home(str(cwd))
+        proc = await _asyncio.create_subprocess_exec(
+            *argv, cwd=str(p),
+            stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
+            env={**_os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+        out, err = await _asyncio.wait_for(proc.communicate(), timeout=120)
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"push failed: {e}"}
+    return {"pushed": proc.returncode == 0, "exit_code": proc.returncode,
+            "stdout": out.decode("utf-8", "replace")[:4000],
+            "stderr": err.decode("utf-8", "replace")[:4000]}
+
+
+# ── Hermes delegation (net_egress) ─────────────────────────────────────────────
+# CurlyOS workers have no native web/browser/image tools. Instead they DELEGATE
+# those sub-tasks to the local Hermes agent (:8642), which autonomously uses its
+# full toolset and returns the result. The actual internet egress happens inside
+# Hermes; from CurlyOS this is a localhost call (egress_host = 127.0.0.1).
+
+_HERMES_HOST = "127.0.0.1"
+
+
+async def _web_research(deps: ToolDeps, args: dict) -> dict:
+    """Delegate a web-research sub-task to Hermes (which searches + reads the web)."""
+    from hermes_integration.hermes_client import complete
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return {"error": "web_research: 'query' is required"}
+    r = await complete(
+        f"Research this on the web and return a thorough, well-sourced summary "
+        f"(include key facts, figures, and source URLs):\n\n{query}",
+        system="You are a research assistant. Use your web tools to find current, "
+               "accurate information and report concisely with sources.",
+    )
+    return {"query": query, **({"findings": r["text"]} if r.get("ok") else {"error": r.get("error")})}
+
+
+async def _browse(deps: ToolDeps, args: dict) -> dict:
+    """Delegate 'visit this URL and extract X' to Hermes' browser."""
+    from hermes_integration.hermes_client import complete
+    url = str(args.get("url", "")).strip()
+    goal = str(args.get("goal", "extract the main content")).strip()
+    if not url:
+        return {"error": "browse: 'url' is required"}
+    r = await complete(
+        f"Visit {url} and {goal}. Return what you found.",
+        system="You are a browsing assistant. Use your browser tools to load the "
+               "page and extract exactly what was asked.",
+    )
+    return {"url": url, **({"result": r["text"]} if r.get("ok") else {"error": r.get("error")})}
+
+
+async def _generate_image(deps: ToolDeps, args: dict) -> dict:
+    """Delegate image generation to Hermes; it returns a path/URL to the image."""
+    from hermes_integration.hermes_client import complete
+    prompt = str(args.get("prompt", "")).strip()
+    if not prompt:
+        return {"error": "generate_image: 'prompt' is required"}
+    r = await complete(
+        f"Generate an image for this prompt and tell me the saved file path or URL:\n\n{prompt}",
+        system="You are an image-generation assistant. Generate the image and "
+               "report the resulting file path or URL.",
+    )
+    return {"prompt": prompt, **({"result": r["text"]} if r.get("ok") else {"error": r.get("error")})}
+
+
+async def _delegate_to_hermes(deps: ToolDeps, args: dict) -> dict:
+    """General escape hatch: hand any sub-task to the Hermes agent."""
+    from hermes_integration.hermes_client import complete
+    task = str(args.get("task", "")).strip()
+    if not task:
+        return {"error": "delegate_to_hermes: 'task' is required"}
+    r = await complete(task)
+    return {"task": task[:200], **({"result": r["text"]} if r.get("ok") else {"error": r.get("error")})}
+
+
 REGISTRY: dict[str, Tool] = {
     t.name: t for t in [
         Tool("recall", "read", "Search the user's memory (hybrid semantic+keyword).",
@@ -225,6 +427,43 @@ REGISTRY: dict[str, Tool] = {
              "content: str, studio_id?: str, studio_title?: str", _create_sketch),
         Tool("notify", "external_post", "Send the user a notification message.",
              "text: str", _notify),
+        # real-world tools — actually do the work, not just record it
+        Tool("read_file", "read", "Read a UTF-8 file under your home directory.",
+             "path: str", _read_file),
+        Tool("list_dir", "read", "List the entries of a directory under home.",
+             "path: str", _list_dir),
+        Tool("write_file", "file_edit",
+             "Create or overwrite a file (parent dirs auto-created). Use to write real "
+             "output: articles, code, docs.",
+             "path: str, content: str", _write_file),
+        Tool("edit_file", "file_edit",
+             "Replace one exact, unique substring in an existing file (surgical edit).",
+             "path: str, find: str, replace: str", _edit_file),
+        Tool("run_command", "code_exec",
+             "Run an allowlisted build/test/git-local command (npm/pnpm/yarn run|build|test, "
+             "tsc, git add|commit|status|diff, ls/cat/grep/find) and read its output. No "
+             "network installs, no push.",
+             "command: str, cwd?: str", _run_command),
+        Tool("git_commit", "code_exec",
+             "Stage all changes and commit in a repo (local only — does not push).",
+             "cwd: str (repo path), message: str", _git_commit),
+        Tool("git_push", "external_post",
+             "Push commits to a remote — DEPLOYS LIVE. Requires explicit human approval.",
+             "cwd: str (repo path), remote?: str, branch?: str", _git_push),
+        # Hermes delegation — gives workers web/browser/image via the Hermes agent
+        Tool("web_research", "net_egress",
+             "Research a topic on the WEB (delegated to the Hermes agent, which searches "
+             "and reads pages). Use for any current/external information.",
+             "query: str", _web_research, egress_host=_HERMES_HOST),
+        Tool("browse", "net_egress",
+             "Visit a URL and extract information (delegated to Hermes' browser).",
+             "url: str, goal?: str", _browse, egress_host=_HERMES_HOST),
+        Tool("generate_image", "net_egress",
+             "Generate an image from a prompt (delegated to Hermes); returns a file path/URL.",
+             "prompt: str", _generate_image, egress_host=_HERMES_HOST),
+        Tool("delegate_to_hermes", "net_egress",
+             "Hand an arbitrary sub-task to the Hermes agent (its full toolset). Escape hatch.",
+             "task: str", _delegate_to_hermes, egress_host=_HERMES_HOST),
     ]
 }
 

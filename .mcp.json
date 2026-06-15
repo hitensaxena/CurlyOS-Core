@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "hermes": {
+      "command": "python",
+      "args": ["-m", "hermes_integration.mcp_adapter"],
+      "cwd": "/Users/hitensaxena/curlyos-core"
+    }
+  }
+}
