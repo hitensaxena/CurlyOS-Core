@@ -32,6 +32,7 @@ class Runner:
         llm: Callable[[str, str], Awaitable[str]] | None,
         notifier: Any,
         max_concurrent: int = 2,
+        on_run_event: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> None:
         self.dsn = dsn
         self.scope = scope
@@ -41,6 +42,11 @@ class Runner:
         self._embedder_factory = embedder_factory
         self._llm = llm
         self._notifier = notifier
+        # Optional hook: called as on_run_event(run_id, status) when a run parks
+        # or reaches a terminal state. Lets a higher layer (scheduled jobs)
+        # deliver output without the runner knowing anything about it. Never
+        # allowed to break a run — callers wrap their own bodies defensively.
+        self._on_run_event = on_run_event
         self._sem = asyncio.Semaphore(max_concurrent)
         self._tasks: dict[str, asyncio.Task] = {}
         self._graph: Any = None
@@ -112,7 +118,8 @@ class Runner:
             self._spawn(run_id, None)  # None input → continue from checkpoint
 
     # ── public API ───────────────────────────────────────────────────────────
-    async def start_run(self, task: str, *, source: str = "api") -> str:
+    async def start_run(self, task: str, *, source: str = "api",
+                        goal_id: str | None = None) -> str:
         if self._draining:
             raise RuntimeError("runner is draining — try again after restart")
         from shared.events import build_event
@@ -126,9 +133,9 @@ class Runner:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "INSERT INTO agent_runs (id, agent, scope, task, status, autonomy_level) "
-                    "VALUES (%s, 'Executive', %s, %s, 'running', 'confirm_each')",
-                    (run_id, self.scope, task[:2000]),
+                    "INSERT INTO agent_runs (id, agent, scope, task, status, autonomy_level, goal_id) "
+                    "VALUES (%s, 'Executive', %s, %s, 'running', 'confirm_each', %s)",
+                    (run_id, self.scope, task[:2000], goal_id),
                 )
             ev = build_event(
                 short_type="agent.run.started", subject=run_id,
@@ -218,6 +225,7 @@ class Runner:
             )
         except Exception:  # noqa: BLE001
             log.warning("park notification failed for %s", run_id)
+        await self._emit_run_event(run_id, "parked")
         log.info("run %s parked on %s", run_id, apv_id)
 
     async def _finish(self, run_id: str, status: str, decision: dict | None,
@@ -251,6 +259,16 @@ class Runner:
                                             run_id=run_id)
             except Exception:  # noqa: BLE001
                 pass
+        await self._emit_run_event(run_id, status)
+
+    async def _emit_run_event(self, run_id: str, status: str) -> None:
+        """Fire the optional run-event hook, isolating its failures."""
+        if self._on_run_event is None:
+            return
+        try:
+            await self._on_run_event(run_id, status)
+        except Exception:  # noqa: BLE001 — a hook must never break the run loop
+            log.exception("run-event hook failed for %s (%s)", run_id, status)
 
     # ── observability ────────────────────────────────────────────────────────
     def snapshot(self) -> dict:

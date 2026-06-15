@@ -69,8 +69,22 @@ async def lifespan(app: FastAPI):
     runner = None
     if os.environ.get("CURLYOS_RUNNER", "1").lower() not in ("0", "false", "off"):
         try:
+            from orchestration.orchestrator import on_worker_done
             from orchestration.runner import Runner
+            from orchestration.user_jobs import deliver_run_output
             from shared.notify import get_notifier as _gn
+
+            _ujob_pool_factory = lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row)
+
+            async def _on_run_event(run_id: str, status: str) -> None:
+                # A run changing state fans out to both consumers; each is
+                # defensive and only acts on runs it owns.
+                #   * scheduled jobs → deliver output to the inbox
+                #   * goal-execution → update the goal_task + recompute progress
+                await deliver_run_output(_ujob_pool_factory, run_id, status)
+                await on_worker_done(
+                    _ujob_pool_factory, _make_publisher_sync, SCOPE, run_id, status,
+                )
 
             runner = Runner(
                 dsn=DSN,
@@ -81,12 +95,41 @@ async def lifespan(app: FastAPI):
                 embedder_factory=get_shared_embedder,
                 llm=_runner_llm(),
                 notifier=_gn(),
+                on_run_event=_on_run_event,
             )
             await runner.start()
         except Exception:
             logger.exception("runner failed to start — agent runs disabled")
             runner = None
     app.state.runner = runner
+
+    # User-defined autonomous jobs (managed from the webapp). Loaded AFTER the
+    # runner exists so each job's fn resolves it from app.state at fire time.
+    # Disabled rows are still registered (so the UI can toggle them live) but the
+    # scheduler loop only fires enabled jobs.
+    if scheduler is not None:
+        try:
+            from orchestration.user_jobs import (
+                load_user_jobs, reconcile_deliveries, register_job,
+            )
+
+            _ujob_pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+            _user_jobs = await load_user_jobs(
+                _ujob_pool,
+                get_runner=lambda: getattr(app.state, "runner", None),
+                pool_factory=lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row),
+            )
+            for _j in _user_jobs:
+                register_job(scheduler, _j)
+            logger.info("registered %d user-defined job(s) into the scheduler", len(_user_jobs))
+
+            # Catch up any delivery missed while the API was down / before the
+            # completion hook existed (heals jobs stuck mid-state on restart).
+            await reconcile_deliveries(
+                lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row)
+            )
+        except Exception:
+            logger.exception("failed to load user-defined jobs")
 
     yield
     if runner is not None:

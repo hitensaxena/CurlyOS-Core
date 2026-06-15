@@ -74,6 +74,13 @@ PREFIXES: dict[str, str] = {
     "lock": "lck",
     "correlation": "cor",
     "entity": "ent",
+    # Scheduled (user-defined) jobs + their delivery inbox
+    "scheduled_job": "sjob",
+    "inbox_item": "inb",
+    # Goal-execution orchestrator
+    "goal_plan": "gpl",
+    "goal_task": "gtk",
+    "orchestrator_message": "omsg",
 }
 
 ALL_PREFIXES: frozenset[str] = frozenset(PREFIXES.values())

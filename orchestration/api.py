@@ -39,6 +39,34 @@ class DenyReason(BaseModel):
     reason: str = Field(default="", max_length=500)
 
 
+_CADENCE_RE = "^(every|daily_at|weekly_at|monthly_at)$"
+
+
+class ScheduledJobCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    task: str = Field(min_length=1, max_length=4000)
+    cadence_type: str = Field(pattern=_CADENCE_RE)
+    cadence_json: dict = Field(default_factory=dict)
+    enabled: bool = True
+
+
+class ScheduledJobUpdate(BaseModel):
+    name: str | None = Field(default=None, max_length=120)
+    task: str | None = Field(default=None, max_length=4000)
+    cadence_type: str | None = Field(default=None, pattern=_CADENCE_RE)
+    cadence_json: dict | None = None
+    enabled: bool | None = None
+
+
+class DecomposeRequest(BaseModel):
+    guidance: str | None = Field(default=None, max_length=2000)
+
+
+class OrchestratorChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
+    goal_id: str | None = Field(default=None, max_length=60)
+
+
 def make_router(
     *,
     pool_factory: Callable[[], Awaitable[Any]],
@@ -334,5 +362,334 @@ def make_router(
         return StreamingResponse(gen(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",
                                           "X-Accel-Buffering": "no"})
+
+    # ── scheduled (user-defined) jobs ─────────────────────────────────────────
+    #
+    # Persisted in scheduled_jobs; each becomes a live scheduler.Job that routes
+    # its NL task through the Executive agent and delivers output to the inbox.
+
+    _JOB_COLS = ("id", "name", "task", "cadence_type", "cadence_json", "delivery",
+                 "enabled", "last_fired", "last_status", "last_run_id", "last_error",
+                 "created_at", "updated_at")
+
+    def _scheduler(request: Request):
+        return getattr(request.app.state, "scheduler", None)
+
+    def _job_dict(r: tuple, sched) -> dict:
+        from orchestration.user_jobs import cadence_display, find_job
+        d = dict(zip(_JOB_COLS, r))
+        for k in ("last_fired", "created_at", "updated_at"):
+            d[k] = d[k].isoformat() if d[k] else None
+        d["cadence_display"] = cadence_display(d["cadence_type"], d["cadence_json"])
+        live = find_job(sched, d["id"]) if sched is not None else None
+        d["next_due"] = live.next_due.isoformat() if live and live.next_due else None
+        d["registered"] = live is not None
+        return d
+
+    async def _fetch_job(pool, job_id: str) -> tuple | None:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    f"SELECT {', '.join(_JOB_COLS)} FROM scheduled_jobs "
+                    "WHERE id = %s AND scope = %s",
+                    (job_id, scope),
+                )
+                return await cur.fetchone()
+
+    def _register_live(request: Request, row: tuple) -> None:
+        """Best-effort live (re)registration. If the scheduler isn't up the row
+        still persists and loads at next boot."""
+        from orchestration.user_jobs import build_job, register_job
+        sched = _scheduler(request)
+        if sched is None:
+            return
+        d = dict(zip(_JOB_COLS, row))
+        if not d["enabled"]:
+            from orchestration.user_jobs import unregister_job
+            unregister_job(sched, d["id"])
+            return
+        job = build_job(
+            {"id": d["id"], "scope": scope, "name": d["name"], "task": d["task"],
+             "cadence_type": d["cadence_type"], "cadence_json": d["cadence_json"],
+             "enabled": d["enabled"]},
+            get_runner=lambda: getattr(request.app.state, "runner", None),
+            pool_factory=pool_factory,
+        )
+        register_job(sched, job)
+
+    @router.post("/scheduled-jobs")
+    async def create_job(body: ScheduledJobCreate, request: Request):
+        from orchestration.user_jobs import parse_cadence
+        from shared.types.ulid import mint
+
+        try:  # validate cadence shape up front
+            parse_cadence(body.cadence_type, body.cadence_json)
+        except (ValueError, KeyError) as e:
+            raise HTTPException(400, f"invalid cadence: {e}")
+
+        from psycopg.types.json import Jsonb
+        job_id = mint("sjob")
+        pool = await pool_factory()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                try:
+                    await cur.execute(
+                        "INSERT INTO scheduled_jobs "
+                        "(id, scope, name, task, cadence_type, cadence_json, enabled) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (job_id, scope, body.name, body.task, body.cadence_type,
+                         Jsonb(body.cadence_json), body.enabled),
+                    )
+                except Exception as e:  # noqa: BLE001 — likely the (scope,name) unique
+                    if "scheduled_jobs_scope_name" in str(e) or "duplicate key" in str(e):
+                        raise HTTPException(409, f"a job named {body.name!r} already exists")
+                    raise
+        row = await _fetch_job(pool, job_id)
+        _register_live(request, row)
+        return _job_dict(row, _scheduler(request))
+
+    @router.get("/scheduled-jobs")
+    async def list_jobs(request: Request):
+        pool = await pool_factory()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    f"SELECT {', '.join(_JOB_COLS)} FROM scheduled_jobs "
+                    "WHERE scope = %s ORDER BY created_at DESC",
+                    (scope,),
+                )
+                rows = await cur.fetchall()
+        sched = _scheduler(request)
+        return {"items": [_job_dict(r, sched) for r in rows], "count": len(rows)}
+
+    @router.get("/scheduled-jobs/{job_id}")
+    async def get_job(job_id: str, request: Request):
+        pool = await pool_factory()
+        row = await _fetch_job(pool, job_id)
+        if row is None:
+            raise HTTPException(404, f"job {job_id!r} not found")
+        return _job_dict(row, _scheduler(request))
+
+    @router.patch("/scheduled-jobs/{job_id}")
+    async def update_job(job_id: str, body: ScheduledJobUpdate, request: Request):
+        from orchestration.user_jobs import parse_cadence
+        from psycopg.types.json import Jsonb
+
+        pool = await pool_factory()
+        existing = await _fetch_job(pool, job_id)
+        if existing is None:
+            raise HTTPException(404, f"job {job_id!r} not found")
+        cur_d = dict(zip(_JOB_COLS, existing))
+
+        # Resolve the post-update cadence and validate it.
+        new_type = body.cadence_type or cur_d["cadence_type"]
+        new_json = body.cadence_json if body.cadence_json is not None else cur_d["cadence_json"]
+        if body.cadence_type is not None or body.cadence_json is not None:
+            try:
+                parse_cadence(new_type, new_json)
+            except (ValueError, KeyError) as e:
+                raise HTTPException(400, f"invalid cadence: {e}")
+
+        sets, params = [], []
+        for col, val in (("name", body.name), ("task", body.task),
+                         ("enabled", body.enabled)):
+            if val is not None:
+                sets.append(f"{col} = %s")
+                params.append(val)
+        if body.cadence_type is not None:
+            sets.append("cadence_type = %s"); params.append(body.cadence_type)
+        if body.cadence_json is not None:
+            sets.append("cadence_json = %s"); params.append(Jsonb(body.cadence_json))
+        if not sets:
+            return _job_dict(existing, _scheduler(request))
+        sets.append("updated_at = now()")
+        params += [job_id, scope]
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    f"UPDATE scheduled_jobs SET {', '.join(sets)} "
+                    "WHERE id = %s AND scope = %s",
+                    params,
+                )
+        row = await _fetch_job(pool, job_id)
+        _register_live(request, row)  # rebuilds the live job from the new row
+        return _job_dict(row, _scheduler(request))
+
+    @router.delete("/scheduled-jobs/{job_id}")
+    async def delete_job(job_id: str, request: Request):
+        from orchestration.user_jobs import unregister_job
+        pool = await pool_factory()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM scheduled_jobs WHERE id = %s AND scope = %s RETURNING id",
+                    (job_id, scope),
+                )
+                if await cur.fetchone() is None:
+                    raise HTTPException(404, f"job {job_id!r} not found")
+        sched = _scheduler(request)
+        if sched is not None:
+            unregister_job(sched, job_id)
+        return {"id": job_id, "deleted": True}
+
+    @router.post("/scheduled-jobs/{job_id}/run-now")
+    async def run_job_now(job_id: str, request: Request):
+        """Fire a job immediately (off-cadence): runs the same fn, delivers to
+        the inbox, updates last_*. Returns once the run has been STARTED."""
+        from orchestration.user_jobs import make_job_fn
+        pool = await pool_factory()
+        row = await _fetch_job(pool, job_id)
+        if row is None:
+            raise HTTPException(404, f"job {job_id!r} not found")
+        d = dict(zip(_JOB_COLS, row))
+        fn = make_job_fn(
+            job_id=d["id"], scope=scope, name=d["name"], task=d["task"],
+            get_runner=lambda: getattr(request.app.state, "runner", None),
+            pool_factory=pool_factory,
+        )
+        # Fire-and-forget: the fn polls the Executive run to completion itself.
+        asyncio.create_task(fn(), name=f"run-now-{job_id}")
+        return {"id": job_id, "status": "started"}
+
+    # ── delivery inbox ────────────────────────────────────────────────────────
+
+    @router.get("/inbox")
+    async def list_inbox(unread: bool = False, job: str | None = None, limit: int = 100):
+        pool = await pool_factory()
+        where, params = ["i.scope = %s"], [scope]
+        if unread:
+            where.append("i.read_at IS NULL")
+        if job:
+            where.append("i.job_id = %s")
+            params.append(job)
+        params.append(min(limit, 300))
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT i.id, i.job_id, j.name, i.run_id, i.title, i.body, i.meta, "
+                    "i.read_at, i.created_at "
+                    "FROM inbox_items i LEFT JOIN scheduled_jobs j ON j.id = i.job_id "
+                    f"WHERE {' AND '.join(where)} "
+                    "ORDER BY (i.read_at IS NULL) DESC, i.created_at DESC LIMIT %s",
+                    params,
+                )
+                rows = await cur.fetchall()
+        return {"items": [
+            {"id": r[0], "job_id": r[1], "job_name": r[2], "run_id": r[3], "title": r[4],
+             "body": r[5], "meta": r[6], "read": r[7] is not None,
+             "read_at": r[7].isoformat() if r[7] else None,
+             "created_at": r[8].isoformat() if r[8] else None}
+            for r in rows
+        ], "count": len(rows)}
+
+    @router.get("/inbox/unread-count")
+    async def inbox_unread_count():
+        pool = await pool_factory()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT count(*) FROM inbox_items WHERE scope = %s AND read_at IS NULL",
+                    (scope,),
+                )
+                n = (await cur.fetchone())[0]
+        return {"unread": n}
+
+    @router.post("/inbox/{item_id}/read")
+    async def mark_inbox_read(item_id: str):
+        pool = await pool_factory()
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE inbox_items SET read_at = COALESCE(read_at, now()) "
+                    "WHERE id = %s AND scope = %s RETURNING id",
+                    (item_id, scope),
+                )
+                if await cur.fetchone() is None:
+                    raise HTTPException(404, f"inbox item {item_id!r} not found")
+        return {"id": item_id, "read": True}
+
+    # ── goal-execution orchestrator ───────────────────────────────────────────
+    #
+    # Decompose a goal into a plan of tasks (proposed) → approve → dispatch
+    # workers (Executive runs tagged with goal_id) → progress aggregates back.
+
+    def _llm():
+        return llm_factory() if llm_factory else None
+
+    def _pub():
+        return publisher_factory() if publisher_factory else None
+
+    @router.post("/goals/{goal_id}/decompose")
+    async def decompose(goal_id: str, body: DecomposeRequest):
+        from orchestration.orchestrator import decompose_goal
+        result = await decompose_goal(
+            pool=await pool_factory(), publisher=_pub(), llm=_llm(),
+            scope=scope, goal_id=goal_id, guidance=body.guidance,
+        )
+        if result.get("error"):
+            code = 404 if "not found" in result["error"] else 503
+            raise HTTPException(code, result["error"])
+        return result
+
+    @router.get("/goals/{goal_id}/plan")
+    async def goal_plan(goal_id: str):
+        from orchestration.orchestrator import get_plan
+        plan = await get_plan(await pool_factory(), scope, goal_id)
+        if plan is None:
+            return {"plan": None}
+        return {"plan": plan}
+
+    @router.post("/goal-plans/{plan_id}/approve")
+    async def approve(plan_id: str):
+        from orchestration.orchestrator import approve_plan
+        result = await approve_plan(
+            pool=await pool_factory(), publisher=_pub(), scope=scope, plan_id=plan_id,
+        )
+        if result.get("error"):
+            raise HTTPException(409, result["error"])
+        return result
+
+    @router.post("/goal-tasks/{task_id}/dispatch")
+    async def dispatch_one(task_id: str, request: Request):
+        from orchestration.orchestrator import dispatch_task
+        result = await dispatch_task(
+            pool=await pool_factory(), publisher=_pub(), runner=_runner(request),
+            scope=scope, task_id=task_id,
+        )
+        if result.get("error") and not result.get("run_id"):
+            code = 404 if "not found" in result["error"] else 409
+            raise HTTPException(code, result["error"])
+        return result
+
+    @router.post("/goal-plans/{plan_id}/dispatch-all")
+    async def dispatch_all(plan_id: str, request: Request):
+        from orchestration.orchestrator import dispatch_plan
+        return await dispatch_plan(
+            pool=await pool_factory(), publisher=_pub(), runner=_runner(request),
+            scope=scope, plan_id=plan_id,
+        )
+
+    @router.get("/orchestrator/overview")
+    async def orchestrator_overview():
+        from orchestration.orchestrator import overview
+        return await overview(await pool_factory(), scope)
+
+    @router.get("/orchestrator/messages")
+    async def orchestrator_messages(goal_id: str | None = None, limit: int = 100):
+        from orchestration.orchestrator import list_messages
+        items = await list_messages(await pool_factory(), scope, goal_id, limit)
+        return {"items": items, "count": len(items)}
+
+    @router.post("/orchestrator/chat")
+    async def orchestrator_chat_route(body: OrchestratorChatRequest, request: Request):
+        from orchestration.orchestrator import orchestrator_chat
+        runner = getattr(request.app.state, "runner", None)
+        result = await orchestrator_chat(
+            pool=await pool_factory(), publisher=_pub(), llm=_llm(), runner=runner,
+            scope=scope, message=body.message, goal_id=body.goal_id,
+        )
+        if result.get("error"):
+            raise HTTPException(400, result["error"])
+        return result
 
     return router
