@@ -67,6 +67,10 @@ class OrchestratorChatRequest(BaseModel):
     goal_id: str | None = Field(default=None, max_length=60)
 
 
+class BypassRequest(BaseModel):
+    enabled: bool
+
+
 def make_router(
     *,
     pool_factory: Callable[[], Awaitable[Any]],
@@ -691,5 +695,19 @@ def make_router(
         if result.get("error"):
             raise HTTPException(400, result["error"])
         return result
+
+    # ── bypass mode (run agent side effects without approval) ─────────────────
+
+    @router.get("/settings/agent-bypass")
+    async def get_bypass():
+        from shared.settings import AGENT_BYPASS, get_setting
+        on = await get_setting(await pool_factory(), AGENT_BYPASS, False)
+        return {"bypass": bool(on)}
+
+    @router.post("/settings/agent-bypass")
+    async def set_bypass(body: BypassRequest):
+        from shared.settings import AGENT_BYPASS, set_setting
+        await set_setting(await pool_factory(), AGENT_BYPASS, bool(body.enabled))
+        return {"bypass": bool(body.enabled)}
 
     return router

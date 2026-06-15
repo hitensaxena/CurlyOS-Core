@@ -41,6 +41,7 @@ class AgentState(TypedDict, total=False):
     scope: str
     task: str
     context: str
+    autonomy: str                  # run autonomy level (confirm_each | full_auto …)
     subtasks: list[dict]           # [{tool, args, why}]
     cursor: int
     history: Annotated[list[dict], _append]   # [{cursor, tool, args, result|denied}]
@@ -170,6 +171,7 @@ def make_graph(get_deps: DepsFn, llm: LLMFn | None, checkpointer: Any):
         step = state["subtasks"][cursor]
         tool = REGISTRY[step["tool"]]
         cursor_key = str(cursor)
+        autonomy = state.get("autonomy") or RUN_AUTONOMY  # bypass runs pass full_auto
 
         # replay guard: a completed action for this cursor → reuse its observation
         async with deps.pool.connection() as conn:
@@ -188,7 +190,7 @@ def make_graph(get_deps: DepsFn, llm: LLMFn | None, checkpointer: Any):
         decision = await evaluate(
             pool=deps.pool, redis=deps.redis, publisher=deps.publisher,
             scope_text=state["scope"], run_id=state["run_id"], action_id=mint("act"),
-            action_class=tool.action_class, autonomy_level=RUN_AUTONOMY,
+            action_class=tool.action_class, autonomy_level=autonomy,
             tool=tool.name, args=step["args"], create_approval=False,
         )
 
@@ -239,7 +241,7 @@ def make_graph(get_deps: DepsFn, llm: LLMFn | None, checkpointer: Any):
                 decision = await evaluate(
                     pool=deps.pool, redis=deps.redis, publisher=deps.publisher,
                     scope_text=state["scope"], run_id=state["run_id"], action_id=mint("act"),
-                    action_class=tool.action_class, autonomy_level=RUN_AUTONOMY,
+                    action_class=tool.action_class, autonomy_level=autonomy,
                     tool=tool.name, args=step["args"],
                     approval_id=apv_id, create_approval=False,
                 )

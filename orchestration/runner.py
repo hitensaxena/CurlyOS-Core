@@ -119,13 +119,19 @@ class Runner:
 
     # ── public API ───────────────────────────────────────────────────────────
     async def start_run(self, task: str, *, source: str = "api",
-                        goal_id: str | None = None) -> str:
+                        goal_id: str | None = None, autonomy: str | None = None) -> str:
         if self._draining:
             raise RuntimeError("runner is draining — try again after restart")
         from shared.events import build_event
         from shared.types.ulid import mint
 
         from agent.pdp_gate import scope_parts
+
+        # Resolve the run's autonomy. None → read the global bypass toggle:
+        # bypass on → full_auto (side effects auto-allow, except the hard floors
+        # self_modify / memory_forget_hard / kill-switch which the PDP keeps).
+        if autonomy is None:
+            autonomy = await self._resolve_autonomy()
 
         run_id = mint("run")
         pool = await self._pool_factory()
@@ -134,8 +140,8 @@ class Runner:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "INSERT INTO agent_runs (id, agent, scope, task, status, autonomy_level, goal_id) "
-                    "VALUES (%s, 'Executive', %s, %s, 'running', 'confirm_each', %s)",
-                    (run_id, self.scope, task[:2000], goal_id),
+                    "VALUES (%s, 'Executive', %s, %s, 'running', %s, %s)",
+                    (run_id, self.scope, task[:2000], autonomy, goal_id),
                 )
             ev = build_event(
                 short_type="agent.run.started", subject=run_id,
@@ -146,8 +152,17 @@ class Runner:
             )
             await pub.stage(ev, conn)
         self._spawn(run_id, {"run_id": run_id, "scope": self.scope, "task": task,
-                             "history": [], "decision": None})
+                             "history": [], "decision": None, "autonomy": autonomy})
         return run_id
+
+    async def _resolve_autonomy(self) -> str:
+        """confirm_each by default; full_auto when the global bypass toggle is on."""
+        try:
+            from shared.settings import AGENT_BYPASS, get_setting
+            pool = await self._pool_factory()
+            return "full_auto" if await get_setting(pool, AGENT_BYPASS, False) else "confirm_each"
+        except Exception:  # noqa: BLE001 — never block a run on a settings read
+            return "confirm_each"
 
     async def resume(self, run_id: str) -> bool:
         """Wake a parked run (after grant OR deny — the act node reads the
