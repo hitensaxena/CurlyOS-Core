@@ -396,6 +396,41 @@ async def _delegate_to_hermes(deps: ToolDeps, args: dict) -> dict:
     return {"task": task[:200], **({"result": r["text"]} if r.get("ok") else {"error": r.get("error")})}
 
 
+# ── artifacts (file_edit) ──────────────────────────────────────────────────────
+# Register a tangible deliverable so it shows up in the project's studio view.
+# Resolves the goal/project from the run automatically — the worker only supplies
+# what it made.
+
+async def _save_artifact(deps: ToolDeps, args: dict) -> dict:
+    """Record a deliverable (file/doc/pdf/image/code/deploy/link) for the studio."""
+    from workspace.hierarchy import save_artifact, place_goal
+    title = str(args.get("title", "")).strip()
+    if not title:
+        return {"error": "save_artifact: 'title' is required"}
+    path = str(args.get("path", "")).strip() or None
+    url = str(args.get("url", "")).strip() or None
+    if not path and not url:
+        return {"error": "save_artifact: provide 'path' (file) or 'url' (link/deploy)"}
+    kind = str(args.get("kind", "file")).strip() or "file"
+    summary = str(args.get("summary", "")).strip() or None
+    # Resolve goal_id + project_id from the run; ensure placement exists.
+    goal_id = project_id = None
+    async with deps.pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT goal_id FROM agent_runs WHERE id=%s", (deps.run_id,))
+            r = await cur.fetchone()
+            goal_id = r[0] if r else None
+    if goal_id:
+        placement = await place_goal(deps.pool, scope=deps.scope, goal_id=goal_id)
+        if placement:
+            project_id = placement["project"]["id"]
+    res = await save_artifact(
+        deps.pool, scope=deps.scope, title=title, kind=kind, project_id=project_id,
+        goal_id=goal_id, run_id=deps.run_id, path=path, url=url, summary=summary)
+    return {"artifact_id": res["id"], "status": res["status"], "path": path, "url": url,
+            "project_id": project_id}
+
+
 REGISTRY: dict[str, Tool] = {
     t.name: t for t in [
         Tool("recall", "read", "Search the user's memory (hybrid semantic+keyword).",
@@ -447,6 +482,13 @@ REGISTRY: dict[str, Tool] = {
         Tool("git_commit", "code_exec",
              "Stage all changes and commit in a repo (local only — does not push).",
              "cwd: str (repo path), message: str", _git_commit),
+        Tool("save_artifact", "file_edit",
+             "Register a tangible deliverable (a file you wrote, a doc/pdf/image, a "
+             "code change, or a deploy/link) so it appears in the goal's studio. "
+             "Call this AFTER write_file for anything that is a real output.",
+             "title: str, path?: str, url?: str, "
+             "kind?: file|doc|pdf|image|code|deploy|link|data, summary?: str",
+             _save_artifact),
         Tool("git_push", "external_post",
              "Push commits to a remote — DEPLOYS LIVE. Requires explicit human approval.",
              "cwd: str (repo path), remote?: str, branch?: str", _git_push),

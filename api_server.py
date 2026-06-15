@@ -1354,8 +1354,12 @@ async def safety_kill_clear(agent: str | None = None):
 def list_workspaces(scope: str = SCOPE):
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, scope, name, kind, properties, created_at, updated_at "
-            "FROM workspaces WHERE scope = %s ORDER BY updated_at DESC",
+            "SELECT w.id, w.scope, w.name, w.slug, w.path, w.summary, w.kind, w.status, "
+            "w.created_at, w.updated_at, "
+            "(SELECT count(*) FROM projects p WHERE p.workspace_id = w.id) AS project_count "
+            "FROM workspaces w WHERE w.scope = %s "
+            "AND COALESCE(w.status,'active') <> 'archived' "
+            "ORDER BY w.updated_at DESC",
             [scope],
         ).fetchall()
     return {"items": rows, "count": len(rows)}
@@ -1376,17 +1380,19 @@ def create_workspace(body: CreateWorkspaceRequest):
 
 @app.get("/api/projects")
 def list_projects(workspace_id: str | None = None, scope: str = SCOPE):
+    cols = ("id, workspace_id, scope, name, slug, path, summary, north_star_goal_id, "
+            "status, created_at, "
+            "(SELECT count(*) FROM goals g WHERE g.project_id = projects.id) AS goal_count, "
+            "(SELECT count(*) FROM artifacts a WHERE a.project_id = projects.id) AS artifact_count")
     with get_conn() as conn:
         if workspace_id:
             rows = conn.execute(
-                "SELECT id, workspace_id, name, status, properties, created_at "
-                "FROM projects WHERE workspace_id = %s ORDER BY created_at DESC",
+                f"SELECT {cols} FROM projects WHERE workspace_id = %s ORDER BY created_at DESC",
                 [workspace_id],
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT id, workspace_id, name, status, properties, created_at "
-                "FROM projects ORDER BY created_at DESC",
+                f"SELECT {cols} FROM projects ORDER BY created_at DESC",
             ).fetchall()
     return {"items": rows, "count": len(rows)}
 
@@ -1406,6 +1412,78 @@ def create_project(body: CreateProjectRequest):
         ).fetchone()
     return {"id": row["id"], "workspace_id": body.workspace_id, "name": body.name,
             "status": "active", "created_at": row["created_at"].isoformat() if row else None}
+
+
+# ---------------------------------------------------------------------------
+# Hierarchy drill-down — workspace → project → goal/artifacts (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/workspaces/{workspace_id}")
+def get_workspace_detail(workspace_id: str):
+    """A workspace with its projects (goal + artifact counts) for the drill-down."""
+    with get_conn() as conn:
+        w = conn.execute(
+            "SELECT id, scope, name, slug, path, summary, kind, status "
+            "FROM workspaces WHERE id = %s", [workspace_id],
+        ).fetchone()
+        if not w:
+            raise HTTPException(404, f"Workspace not found: {workspace_id}")
+        projects = conn.execute(
+            "SELECT p.id, p.workspace_id, p.scope, p.name, p.slug, p.path, p.summary, "
+            "p.north_star_goal_id, p.status, "
+            "(SELECT count(*) FROM goals g WHERE g.project_id = p.id) AS goal_count, "
+            "(SELECT count(*) FROM artifacts a WHERE a.project_id = p.id) AS artifact_count "
+            "FROM projects p WHERE p.workspace_id = %s ORDER BY p.created_at DESC",
+            [workspace_id],
+        ).fetchall()
+    return {"workspace": w, "projects": projects}
+
+
+@app.get("/api/projects/{project_id}")
+def get_project_detail(project_id: str):
+    """A project with its placed goals and produced artifacts (studio view)."""
+    with get_conn() as conn:
+        p = conn.execute(
+            "SELECT p.id, p.workspace_id, p.scope, p.name, p.slug, p.path, p.summary, "
+            "p.north_star_goal_id, p.status, w.name AS workspace_name, w.slug AS workspace_slug "
+            "FROM projects p JOIN workspaces w ON w.id = p.workspace_id WHERE p.id = %s",
+            [project_id],
+        ).fetchone()
+        if not p:
+            raise HTTPException(404, f"Project not found: {project_id}")
+        goals = conn.execute(
+            "SELECT id, title, status, progress, horizon, success_criteria "
+            "FROM goals WHERE project_id = %s AND valid_to IS NULL "
+            "ORDER BY priority DESC, valid_from DESC", [project_id],
+        ).fetchall()
+        artifacts = conn.execute(
+            "SELECT id, scope, project_id, goal_id, run_id, task_id, kind, title, path, "
+            "url, bytes, status, summary, created_at, updated_at "
+            "FROM artifacts WHERE project_id = %s ORDER BY created_at DESC LIMIT 200",
+            [project_id],
+        ).fetchall()
+    return {"project": p, "goals": goals, "artifacts": artifacts}
+
+
+@app.get("/api/artifacts")
+def list_artifacts(project_id: str | None = None, goal_id: str | None = None,
+                   scope: str = SCOPE):
+    """Artifacts, optionally filtered by project or goal."""
+    clauses = ["scope = %s"]
+    params: list[Any] = [scope]
+    if project_id:
+        clauses.append("project_id = %s"); params.append(project_id)
+    if goal_id:
+        clauses.append("goal_id = %s"); params.append(goal_id)
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, scope, project_id, goal_id, run_id, task_id, kind, title, path, "
+            "url, bytes, status, summary, created_at, updated_at "
+            f"FROM artifacts WHERE {' AND '.join(clauses)} "
+            "ORDER BY created_at DESC LIMIT 200", params,
+        ).fetchall()
+    return {"items": rows, "count": len(rows)}
 
 
 # ---------------------------------------------------------------------------

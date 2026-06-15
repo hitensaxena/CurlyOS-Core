@@ -220,8 +220,27 @@ async def dispatch_task(
     if task["plan_status"] not in ("approved", "executing"):
         return {"error": "approve the plan before dispatching its tasks"}
 
+    # Place the goal into a workspace/project (idempotent) so the worker has a real
+    # home on disk, and prepend that working-dir context to the instruction.
+    instruction = task["task"]
+    try:
+        from workspace.hierarchy import place_goal
+        placement = await place_goal(pool, scope=scope, goal_id=task["goal_id"])
+    except Exception:  # noqa: BLE001 — placement is best-effort, never blocks dispatch
+        placement = None
+    if placement:
+        studio = placement["studio_dir"]
+        instruction = (
+            f"WORKING DIRECTORY: {studio}\n"
+            f"Write every deliverable (files, docs, code) INTO that directory "
+            f"(use write_file with absolute paths under it). After writing a real "
+            f"output, call save_artifact(title=..., path=..., kind=...) so it shows "
+            f"up in the studio. Project: {placement['project']['name']}.\n\n"
+            f"TASK: {task['task']}"
+        )
+
     run_id = await runner.start_run(
-        task["task"], source=f"goal:{task['goal_id']}", goal_id=task["goal_id"],
+        instruction, source=f"goal:{task['goal_id']}", goal_id=task["goal_id"],
         autonomy=autonomy,
     )
     async with pool.connection() as conn:
