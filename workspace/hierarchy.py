@@ -176,6 +176,34 @@ def route_life_area(title: str, description: str | None = None) -> tuple[str, st
     return _DEFAULT_AREA
 
 
+# Within a life area, related goals cluster into a SHARED project (a project
+# clubs several goals toward one north star) instead of one-project-per-goal.
+# (area_slug, project_name, project_slug, keywords). First match wins; if nothing
+# matches, the goal gets its own project named after it.
+_PROJECT_THEMES: list[tuple[str, str, str, tuple[str, ...]]] = [
+    ("content", "Portfolio & Case Studies", "portfolio",
+     ("case study", "case-study", "portfolio", "narrative", "case studies")),
+    ("content", "Writing & Articles", "writing",
+     ("article", "blog", "essay", "newsletter", "write-up", "writeup", "post")),
+    ("career", "Job Search", "job-search",
+     ("apply", "job", "role", "interview", "recruiter", "application", "offer")),
+    ("building", "CurlyOS", "curlyos",
+     ("curlyos", "curly os", "cognitive os")),
+    ("building", "JobPilot", "jobpilot", ("jobpilot", "job pilot")),
+]
+
+
+def route_project(area_slug: str, title: str, description: str | None = None) -> tuple[str, str]:
+    """Return (project_name, project_slug) — a shared theme project when the goal
+    matches one, else a per-goal project named after the goal."""
+    hay = f"{title or ''} {description or ''}".lower()
+    for a_slug, p_name, p_slug, keywords in _PROJECT_THEMES:
+        if a_slug == area_slug and any(_kw_match(hay, k) for k in keywords):
+            return p_name, p_slug
+    name = (title or "Untitled").strip()[:80]
+    return name, slugify(name)
+
+
 _AREA_SUMMARY = {
     "career": "Job search, applications, and positioning.",
     "content": "Case studies, writing, and brand narrative.",
@@ -230,9 +258,13 @@ async def place_goal(pool: Any, *, scope: str, goal_id: str) -> dict | None:
     workspace = await ensure_workspace(
         pool, scope=scope, name=ws_name, slug=ws_slug, kind="life_area",
         summary=_AREA_SUMMARY.get(ws_slug, "Goal-driven work."))
+    # A project clubs related goals (theme), not one project per goal. ensure_project
+    # is idempotent on (workspace, slug), so the first goal of a theme creates the
+    # project + becomes its north star; later related goals just join it.
+    prj_name, prj_slug = route_project(ws_slug, title, g[1])
     project = await ensure_project(
         pool, scope=scope, workspace_id=workspace["id"],
-        workspace_slug=workspace["slug"], name=title,
+        workspace_slug=workspace["slug"], name=prj_name, slug=prj_slug,
         summary=(g[1] or "")[:280], north_star_goal_id=goal_id)
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
