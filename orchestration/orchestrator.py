@@ -78,7 +78,7 @@ Consider the CURRENT STATE provided. Reply ONLY JSON:
 
 async def decompose_goal(
     *, pool: Any, publisher: Any, llm: Any, scope: str,
-    goal_id: str, guidance: str | None = None,
+    goal_id: str, guidance: str | None = None, notify_inbox: bool = True,
 ) -> dict:
     """LLM-decompose a goal into a proposed plan of worker tasks."""
     from shared.types.ulid import mint
@@ -131,9 +131,34 @@ async def decompose_goal(
                 created.append(t["task"])
     await _emit(pool, publisher, scope, "goal.plan.proposed", goal_id,
                 {"plan_id": plan_id, "tasks": len(created)})
+    if notify_inbox:
+        titles = [str(t.get("title") or t["task"])[:120] for t in tasks[:6]]
+        await _deliver_plan_inbox(pool, scope, goal_id, goal["title"], plan_id, titles, rationale)
     log.info("orchestrator: proposed plan %s for goal %s (%d tasks)", plan_id, goal_id, len(created))
     return {"plan_id": plan_id, "goal_id": goal_id, "rationale": rationale,
             "task_count": len(created)}
+
+
+async def _deliver_plan_inbox(
+    pool, scope, goal_id, goal_title, plan_id, task_titles: list[str], rationale: str,
+) -> None:
+    """Drop a 'plan ready' item in the inbox with the exact plan + an execute hook
+    (meta.kind='plan' so the inbox UI renders the task list + an Execute button)."""
+    from psycopg.types.json import Jsonb
+    from shared.types.ulid import mint
+    body_lines = [rationale.strip()] if rationale.strip() else []
+    body_lines += [f"{i + 1}. {t}" for i, t in enumerate(task_titles)]
+    body = "\n".join(body_lines) or "(plan ready)"
+    title = f"Plan ready: {goal_title} ({len(task_titles)} task{'s' if len(task_titles) != 1 else ''})"
+    meta = {"kind": "plan", "plan_id": plan_id, "goal_id": goal_id,
+            "goal_title": goal_title, "tasks": task_titles}
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO inbox_items (id, scope, job_id, run_id, title, body, meta) "
+                "VALUES (%s, %s, NULL, NULL, %s, %s, %s)",
+                (mint("inb"), scope, title, body, Jsonb(meta)),
+            )
 
 
 # ── approve / dispatch ────────────────────────────────────────────────────────
@@ -155,8 +180,14 @@ async def approve_plan(*, pool: Any, publisher: Any, scope: str, plan_id: str) -
 
 async def dispatch_task(
     *, pool: Any, publisher: Any, runner: Any, scope: str, task_id: str,
+    autonomy: str | None = None,
 ) -> dict:
-    """Start a worker (Executive run) for one task in an approved plan."""
+    """Start a worker (Executive run) for one task in an approved plan.
+
+    `autonomy` overrides the run's autonomy level (None → the global bypass
+    default). The execute-plan path passes 'full_auto' so a plan the user chose
+    to execute runs end-to-end without per-action approval.
+    """
     if runner is None:
         return {"error": "runner unavailable"}
     task = await _load_task(pool, scope, task_id)
@@ -169,6 +200,7 @@ async def dispatch_task(
 
     run_id = await runner.start_run(
         task["task"], source=f"goal:{task['goal_id']}", goal_id=task["goal_id"],
+        autonomy=autonomy,
     )
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
@@ -188,6 +220,7 @@ async def dispatch_task(
 
 async def dispatch_plan(
     *, pool: Any, publisher: Any, runner: Any, scope: str, plan_id: str,
+    autonomy: str | None = None,
 ) -> dict:
     """Dispatch every still-pending task in an approved plan."""
     async with pool.connection() as conn:
@@ -201,10 +234,131 @@ async def dispatch_plan(
     dispatched = []
     for tid in task_ids:
         r = await dispatch_task(pool=pool, publisher=publisher, runner=runner,
-                                scope=scope, task_id=tid)
+                                scope=scope, task_id=tid, autonomy=autonomy)
         if r.get("run_id"):
             dispatched.append(r)
     return {"plan_id": plan_id, "dispatched": len(dispatched), "runs": dispatched}
+
+
+async def execute_plan(
+    *, pool: Any, publisher: Any, runner: Any, scope: str, plan_id: str,
+) -> dict:
+    """Approve (if needed) and dispatch a whole plan AUTONOMOUSLY (full_auto).
+
+    The one-click path from the inbox/chat: the user chose to execute, so workers
+    run end-to-end without per-action approval regardless of the global bypass.
+    """
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE goal_plans SET status='approved', updated_at=now() "
+                "WHERE id=%s AND scope=%s AND status='proposed'",
+                (plan_id, scope),
+            )
+            await cur.execute(
+                "SELECT goal_id, status FROM goal_plans WHERE id=%s AND scope=%s",
+                (plan_id, scope),
+            )
+            row = await cur.fetchone()
+    if row is None:
+        return {"error": "plan not found"}
+    if row[1] not in ("approved", "executing"):
+        return {"error": f"plan is {row[1]} — cannot execute"}
+    await _emit(pool, publisher, scope, "goal.plan.approved", row[0], {"plan_id": plan_id})
+    return await dispatch_plan(pool=pool, publisher=publisher, runner=runner,
+                               scope=scope, plan_id=plan_id, autonomy="full_auto")
+
+
+# ── autonomous planning sweep ─────────────────────────────────────────────────
+
+async def autoplan_sweep(
+    *, pool: Any, publisher: Any, llm: Any, scope: str, max_goals: int = 3,
+) -> dict:
+    """Pull active goals that have no live plan and decompose them (capped per
+    sweep to bound LLM cost). Each new plan lands in the inbox. Respects the
+    `auto_plan` setting (default on)."""
+    from shared.settings import get_setting
+    if not await get_setting(pool, "auto_plan", True):
+        return {"skipped": "auto_plan_off", "planned": []}
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT g.id, g.title FROM goals g "
+                "WHERE g.scope=%s AND g.status='active' AND g.valid_to IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM goal_plans p WHERE p.goal_id=g.id "
+                "                AND p.status IN ('proposed','approved','executing')) "
+                "ORDER BY g.progress ASC, g.valid_from ASC LIMIT %s",
+                (scope, max_goals),
+            )
+            candidates = await cur.fetchall()
+
+    planned = []
+    for gid, _title in candidates:
+        r = await decompose_goal(pool=pool, publisher=publisher, llm=llm, scope=scope,
+                                 goal_id=gid, notify_inbox=True)
+        if not r.get("error"):
+            planned.append({"goal_id": gid, "plan_id": r["plan_id"],
+                            "task_count": r["task_count"]})
+        else:
+            log.info("autoplan: skip %s (%s)", gid, r["error"])
+    if planned:
+        log.info("autoplan: planned %d/%d candidate goal(s)", len(planned), len(candidates))
+    return {"planned": planned, "candidates": len(candidates)}
+
+
+# ── artifacts produced by a goal's runs ───────────────────────────────────────
+
+_WRITE_TOOLS = {
+    "remember": "memory", "record_decision": "decision", "review_decision": "decision",
+    "create_goal": "subgoal", "create_sketch": "sketch", "notify": "notification",
+}
+
+
+async def get_artifacts(pool: Any, scope: str, goal_id: str) -> list[dict]:
+    """Everything the goal's worker runs produced — the write-tool calls with
+    their content and the id of what they created."""
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT tc.tool, tc.args, tc.created_at, a.run_id, o.result "
+                "FROM tool_calls tc JOIN actions a ON tc.action_id = a.id "
+                "JOIN agent_runs r ON r.id = a.run_id "
+                "LEFT JOIN observations o ON o.action_id = a.id "
+                "WHERE r.goal_id = %s AND r.scope = %s ORDER BY tc.created_at",
+                (goal_id, scope),
+            )
+            rows = await cur.fetchall()
+    arts = []
+    for tool, args, at, run_id, result in rows:
+        if tool not in _WRITE_TOOLS:
+            continue
+        arts.append({
+            "type": _WRITE_TOOLS[tool], "tool": tool,
+            "summary": _artifact_summary(tool, args),
+            "ref": _artifact_ref(result),
+            "run_id": run_id,
+            "created_at": at.isoformat() if at else None,
+        })
+    return arts
+
+
+def _artifact_summary(tool: str, args: Any) -> str:
+    a = args if isinstance(args, dict) else {}
+    key = {"remember": "statement", "record_decision": "title", "review_decision": "outcome",
+           "create_goal": "title", "create_sketch": "content", "notify": "text"}.get(tool)
+    val = a.get(key) if key else None
+    if not val and tool == "record_decision":
+        val = a.get("chosen")
+    return str(val or "")[:400]
+
+
+def _artifact_ref(result: Any) -> str | None:
+    if isinstance(result, dict):
+        for k in ("sketch_id", "dec_id", "goal_id", "mem_id", "id"):
+            if result.get(k):
+                return str(result[k])
+    return None
 
 
 # ── worker completion → progress (runner hook) ────────────────────────────────

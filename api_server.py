@@ -2568,9 +2568,23 @@ def _scheduler_jobs():
             scope=SCOPE,
         )
 
+    async def _orchestrator_autoplan_job() -> dict:
+        # Pull active goals that have no plan and decompose them (capped per
+        # sweep); each new plan is delivered to the inbox. Respects auto_plan.
+        from orchestration.orchestrator import autoplan_sweep
+
+        return await autoplan_sweep(
+            pool=await _get_async_pool(row_factory=psycopg.rows.tuple_row),
+            publisher=_make_publisher_sync(),
+            llm=_runner_llm(),
+            scope=SCOPE,
+            max_goals=3,
+        )
+
     return [
         Job("decision_review_nudge", DailyAt("09:00"), _decision_review_nudge_job),
         Job("discovery_scan", WeeklyAt((2,), "20:00"), _discovery_scan_job),
+        Job("orchestrator_autoplan", Every(20), _orchestrator_autoplan_job),
         # consolidation is internally locked per scope — overlap-safe at any cadence
         Job("consolidation_fast", Every(15),
             lambda: consolidation_run(ConsolidationRunRequest(mode="fast"))),

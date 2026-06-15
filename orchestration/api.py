@@ -710,4 +710,43 @@ def make_router(
         await set_setting(await pool_factory(), AGENT_BYPASS, bool(body.enabled))
         return {"bypass": bool(body.enabled)}
 
+    @router.get("/settings/auto-plan")
+    async def get_autoplan():
+        from shared.settings import get_setting
+        on = await get_setting(await pool_factory(), "auto_plan", True)
+        return {"auto_plan": bool(on)}
+
+    @router.post("/settings/auto-plan")
+    async def set_autoplan(body: BypassRequest):
+        from shared.settings import set_setting
+        await set_setting(await pool_factory(), "auto_plan", bool(body.enabled))
+        return {"auto_plan": bool(body.enabled)}
+
+    # ── plan execute / artifacts / autoplan ───────────────────────────────────
+
+    @router.post("/goal-plans/{plan_id}/execute")
+    async def execute(plan_id: str, request: Request):
+        from orchestration.orchestrator import execute_plan
+        result = await execute_plan(
+            pool=await pool_factory(), publisher=_pub(), runner=_runner(request),
+            scope=scope, plan_id=plan_id,
+        )
+        if result.get("error"):
+            code = 404 if "not found" in result["error"] else 409
+            raise HTTPException(code, result["error"])
+        return result
+
+    @router.get("/goals/{goal_id}/artifacts")
+    async def goal_artifacts(goal_id: str):
+        from orchestration.orchestrator import get_artifacts
+        items = await get_artifacts(await pool_factory(), scope, goal_id)
+        return {"items": items, "count": len(items)}
+
+    @router.post("/orchestrator/autoplan")
+    async def run_autoplan():
+        from orchestration.orchestrator import autoplan_sweep
+        return await autoplan_sweep(
+            pool=await pool_factory(), publisher=_pub(), llm=_llm(), scope=scope,
+        )
+
     return router
