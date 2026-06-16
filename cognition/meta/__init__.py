@@ -628,7 +628,7 @@ async def generate_assumptions_and_models(
     )
     resp = await llm_client.chat.completions.create(
         model=llm_model, messages=[{"role": "user", "content": prompt}],
-        temperature=0.2, max_tokens=2000,
+        temperature=0.2, max_tokens=3000,  # deep tier reasoning model headroom
     )
     data = first_json(resp.choices[0].message.content, default={})
     assumptions = data.get("assumptions", []) if isinstance(data, dict) else []

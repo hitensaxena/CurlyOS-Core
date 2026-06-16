@@ -23,6 +23,7 @@ from typing import Any, Sequence
 
 from shared.types.ulid import mint
 from shared.events import build_event
+from shared.llm import json_records
 
 log = logging.getLogger("curlyos.consolidation")
 
@@ -518,40 +519,163 @@ async def _pass_conflict_resolve(
     return result
 
 
+# Episodes-per-pass cap for distillation. Distillation runs against a cloud
+# router (OmniRoute → free providers), so it costs no local RAM/CPU and can be
+# larger than the local-model era. The NOT-EXISTS guard makes each episode
+# distil at most once, so a backlog just drains over passes (≈12/15m).
+_DISTILL_EPISODE_LIMIT = 12
+_DISTILL_MAX_FACTS = 3
+
+_DISTILL_SYSTEM = (
+    "You extract durable long-term memories about the USER and their projects from "
+    "a single conversation turn. You are extremely selective. Return JSON only."
+)
+_DISTILL_PROMPT = (
+    "From the turn below (a user message and the assistant's reply), extract only "
+    "facts that will still matter in months: the user's stable preferences, "
+    "decisions they made, concrete project/system facts, identity, or relationships.\n"
+    "STRICT RULES:\n"
+    "- Most turns contain nothing durable — then return {\"facts\":[]}.\n"
+    "- NEVER write meta-statements about the session itself (e.g. \"no new decisions "
+    "were made\", \"project state unchanged\", \"configuration not altered\").\n"
+    "- NEVER describe the assistant or its next steps. Only durable facts about the "
+    "USER and their world.\n"
+    "- NEVER invent or pad. If unsure, omit.\n"
+    "- Each fact: a concise, self-contained third-person statement (resolve pronouns; "
+    "name the subject).\n"
+    f"- Return at most {_DISTILL_MAX_FACTS}.\n"
+    'Return JSON: {"facts":[{"statement":"...","kind":"fact|preference|procedure"}]}.'
+    "\n\nTurn:\n"
+)
+
+
+async def _distill_episode_facts(
+    llm_client: Any, llm_model: str, content: str
+) -> list[tuple[str, str]] | None:
+    """LLM-distil an episode into 0..N durable (statement, kind) facts.
+
+    Returns:
+      - list of facts (possibly empty) on a successful LLM call;
+      - None when the LLM call itself FAILED (e.g. rate limit) — the caller must
+        then DEFER the episode (leave it unmarked) so it retries next pass.
+
+    We never fall back to dumping raw sentences (that was the old noise source)."""
+    try:
+        resp = await llm_client.chat.completions.create(
+            model=llm_model,
+            messages=[
+                {"role": "system", "content": _DISTILL_SYSTEM},
+                {"role": "user", "content": _DISTILL_PROMPT + content[:6000]},
+            ],
+            temperature=0.0,
+            max_tokens=1024,  # headroom for reasoning models (content after reasoning_content)
+        )
+        recs = json_records(resp.choices[0].message.content)
+    except Exception as e:
+        log.warning("distill LLM call failed (deferring episode): %s", e)
+        return None
+
+    # Flatten wrapper records: small models sometimes over-nest as
+    # {"facts":[...]} or [{"facts":[...]}] instead of a bare list of facts.
+    flat: list[dict] = []
+    for r in recs:
+        if isinstance(r, dict) and isinstance(r.get("facts"), list):
+            flat.extend(x for x in r["facts"] if isinstance(x, dict))
+        elif isinstance(r, dict):
+            flat.append(r)
+
+    facts: list[tuple[str, str]] = []
+    for r in flat:
+        stmt = (r.get("statement") or "").strip()
+        if len(stmt) < 8:
+            continue
+        kind = (r.get("kind") or "fact").strip().lower()
+        if kind not in ("fact", "preference", "procedure"):
+            kind = "fact"
+        facts.append((stmt, kind))
+    return facts[:_DISTILL_MAX_FACTS]
+
+
 async def _pass_summarize(
     pool: Any,
     redis: Any,
     embedder: Any,
     publisher: Any,
     scope_text: str,
+    llm_client: Any = None,
+    llm_model: str = "",
 ) -> dict:
-    """SUMMARIZE pass: for episodes without derived memories, extract key facts.
+    """SUMMARIZE pass: distil episodes without derived memories into clean,
+    LLM-curated facts. This is the ONLY producer of recallable memories from
+    raw turns, so it is the cleaning choke point.
 
-    Uses LLM if API key available, otherwise simple sentence extraction.
+    Skips when no LLM is available (we never regex-dump raw sentences). Episodes
+    that already have a derived memory are skipped — that includes jrnl entries,
+    which are written straight to memories at ingest and must pass through
+    untouched (also matched explicitly on source_ref as a guard).
     """
-    result = {"pass": "summarize", "episodes_processed": 0, "facts_extracted": 0, "errors": 0}
+    result = {"pass": "summarize", "episodes_processed": 0, "facts_extracted": 0,
+              "skipped_no_llm": 0, "deferred": 0, "errors": 0}
+
+    if llm_client is None:
+        result["skipped_no_llm"] = 1
+        log.info("SUMMARIZE skipped for scope %s: no LLM client", scope_text)
+        return result
+
     try:
         async with pool.connection() as cur_conn:
-            # Find episodes without derived memories
+            # Episodes with no derived memory yet, excluding jrnl (direct-to-memory).
             async with cur_conn.cursor() as cur:
                 await cur.execute(
                     "SELECT e.id, e.content FROM episodes e "
                     "WHERE e.scope = %s "
+                    "AND (e.source_ref IS NULL OR e.source_ref NOT LIKE 'jrnl:%%') "
                     "AND NOT EXISTS ("
                     "  SELECT 1 FROM memories m "
                     "  WHERE m.source_episode_id = e.id AND m.scope = %s"
                     ") "
                     "ORDER BY e.created_at "
-                    "LIMIT 50",
-                    (scope_text, scope_text),
+                    "LIMIT %s",
+                    (scope_text, scope_text, _DISTILL_EPISODE_LIMIT),
                 )
                 episodes = await cur.fetchall()
 
             for epi_id, content in episodes:
                 try:
-                    facts = _extract_facts_from_text(content)
+                    facts = await _distill_episode_facts(llm_client, llm_model, content or "")
+                    # LLM call failed (rate limit, timeout, …): DEFER — leave the
+                    # episode unmarked so the next pass retries it. Never mark a
+                    # failed call as "processed".
+                    if facts is None:
+                        # LLM unavailable — abort the whole pass for this scope
+                        # rather than hammering N failing calls. Remaining
+                        # episodes (incl. this one) stay unmarked and retry next
+                        # pass once the LLM recovers.
+                        result["deferred"] = len(episodes) - result["episodes_processed"]
+                        log.info("SUMMARIZE deferring %d episodes for scope %s (LLM unavailable)",
+                                 result["deferred"], scope_text)
+                        break
+                    # Successful empty result: a chatter-only turn. Mark it
+                    # processed so it isn't re-distilled every pass. A zero-fact
+                    # "marker" memory at tier='working' + valid_to is invisible to
+                    # recall (which reads active canonical) and satisfies NOT EXISTS.
+                    if not facts:
+                        marker_id = mint("mem")
+                        async with cur_conn.cursor() as cur:
+                            await cur.execute(
+                                "INSERT INTO memories "
+                                "(id, scope, statement, statement_key, kind, tier, "
+                                " epistemic_status, valid_from, valid_to, ingested_at, "
+                                " source_episode_id) "
+                                "VALUES (%s, %s, '(no durable facts)', %s, 'fact', "
+                                "'working', 'hypothesis', now(), now(), now(), %s) "
+                                "ON CONFLICT DO NOTHING",
+                                (marker_id, scope_text, f"_distilled:{epi_id}", epi_id),
+                            )
+                        result["episodes_processed"] += 1
+                        continue
 
-                    for fact_text in facts:
+                    for fact_text, kind in facts:
                         mem_id = mint("mem")
                         skey = re.sub(r"\s+", " ", fact_text.strip().lower()).rstrip(" .!?,;:")
 
@@ -560,10 +684,10 @@ async def _pass_summarize(
                                 "INSERT INTO memories "
                                 "(id, scope, statement, statement_key, kind, tier, "
                                 " epistemic_status, valid_from, ingested_at, source_episode_id) "
-                                "VALUES (%s, %s, %s, %s, 'fact', 'semantic', "
+                                "VALUES (%s, %s, %s, %s, %s, 'semantic', "
                                 "'canonical', now(), now(), %s) "
                                 "ON CONFLICT DO NOTHING",
-                                (mem_id, scope_text, fact_text, skey, epi_id),
+                                (mem_id, scope_text, fact_text, skey, kind, epi_id),
                             )
 
                         ev = build_event(
@@ -596,28 +720,6 @@ async def _pass_summarize(
         result["errors"] += 1
 
     return result
-
-
-def _extract_facts_from_text(text: str) -> list[str]:
-    """Simple sentence extraction for fact distillation.
-
-    Splits on sentence boundaries and filters for declarative statements.
-    """
-    # Split on sentence boundaries
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-    facts = []
-    for sent in sentences:
-        sent = sent.strip()
-        if len(sent) < 10:
-            continue
-        # Skip questions and commands
-        if sent.endswith("?") or sent.startswith(("Please", "Could", "Would", "Should")):
-            continue
-        # Skip very long sentences (likely not atomic facts)
-        if len(sent) > 500:
-            continue
-        facts.append(sent)
-    return facts[:10]  # cap at 10 facts per episode
 
 
 async def _pass_decay(
@@ -849,7 +951,10 @@ ALL_PASSES = (
     "recombine_incubate",
 )
 
+# Fast (15m) path now distils first so new episodes become clean memories
+# promptly, then dedup/conflict-resolve tidy the result in the same pass.
 FAST_PASSES = (
+    "summarize",
     "dedup",
     "conflict_resolve",
 )
@@ -864,6 +969,8 @@ async def run_consolidation(
     *,
     scope: str | None = None,
     deep: bool = False,
+    llm_client: Any = None,
+    llm_model: str = "",
 ) -> dict[str, Any]:
     """Run full consolidation pipeline for one or more scopes.
 
@@ -877,8 +984,11 @@ async def run_consolidation(
         publisher: Event publisher.
         reranker: Optional cross-encoder reranker.
         scope: Specific scope, or None for all scopes with events.
-        deep: If True, run all passes including summarize/decay/recombine.
-              If False, run only fast passes (dedup + conflict_resolve).
+        deep: If True, run all passes including decay/recombine.
+              If False, run fast passes (summarize + dedup + conflict_resolve).
+        llm_client: Optional chat client for the SUMMARIZE distiller. When None,
+              SUMMARIZE no-ops (no raw-sentence fallback).
+        llm_model: Model id for the distiller.
     """
     passes = ALL_PASSES if deep else FAST_PASSES
     scopes = [scope] if scope else await _scopes_with_events(pool)
@@ -923,7 +1033,7 @@ async def run_consolidation(
             "dedup": lambda: _pass_dedup(pool, redis, embedder, reranker, publisher, sc),
             "merge_promote": lambda: _pass_merge_promote(pool, redis, embedder, publisher, sc),
             "conflict_resolve": lambda: _pass_conflict_resolve(pool, redis, publisher, sc),
-            "summarize": lambda: _pass_summarize(pool, redis, embedder, publisher, sc),
+            "summarize": lambda: _pass_summarize(pool, redis, embedder, publisher, sc, llm_client, llm_model),
             "decay": lambda: _pass_decay(pool, redis, publisher, sc),
             "recombine_incubate": lambda: _pass_recombine_incubate(pool, redis, embedder, publisher, sc),
         }

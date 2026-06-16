@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
 import re
 import sys
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -185,9 +187,9 @@ _include_goal_router()
 
 
 def _runner_llm():
-    """The runner's LLM seam: async (system, user) -> text over the shared
-    OpenRouter client, or None (graph falls back to deterministic planning)."""
-    client, model = _make_llm_client()
+    """The runner's LLM seam: async (system, user) -> text over the AGENTIC-tier
+    client (Azure Kimi), or None (graph falls back to deterministic planning)."""
+    client, model = _make_llm_client("agentic")
     if client is None:
         return None
 
@@ -197,7 +199,7 @@ def _runner_llm():
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": user}],
             temperature=0.2,
-            max_tokens=1500,
+            max_tokens=2500,  # headroom: Kimi is a reasoning model (reasoning_content + answer)
         )
         return resp.choices[0].message.content or ""
 
@@ -488,7 +490,7 @@ def list_memories(
     elif valid is False:
         conditions.append("valid_to IS NOT NULL")
     if q:
-        conditions.append("to_tsvector('english', statement) @@ websearch_to_tsquery('english', %s)")
+        conditions.append("search_tsv @@ websearch_to_tsquery('english', %s)")  # GIN idx_memories_tsv
         params.append(q)
 
     where = " AND ".join(conditions)
@@ -745,9 +747,9 @@ def search(q: str, scope: str = SCOPE, limit: int = Query(default=20, le=50)):
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT id, statement, kind, valid_from, valid_to, source_episode_id, epistemic_status, "
-            "ts_rank(to_tsvector('english', statement), plainto_tsquery('english', %s)) AS score "
+            "ts_rank(search_tsv, plainto_tsquery('english', %s)) AS score "
             "FROM memories WHERE scope = %s AND valid_to IS NULL "
-            "AND to_tsvector('english', statement) @@ plainto_tsquery('english', %s) "
+            "AND search_tsv @@ plainto_tsquery('english', %s) "
             "ORDER BY score DESC LIMIT %s",
             [q, scope, q, limit],
         ).fetchall()
@@ -769,19 +771,50 @@ async def recall(body: RecallRequest):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from memory.retrieval import retrieve
     from shared.types import RetrievalRequest
-    from shared.embeddings.implementations import FakeReranker
+    from shared.embeddings.implementations import FakeReranker, CachingEmbedder
+
+    from shared import metrics
+    from shared.settings import get_setting_cached
 
     # memory.retrieval uses positional/tuple row access → tuple_row (see consolidation).
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    metrics.incr("recall.requests")
+    t_start = time.monotonic()
+
+    cache_enabled = bool(await get_setting_cached(pool, "recall_cache_enabled", True))
+    cache_ttl = int(await get_setting_cached(pool, "recall_cache_ttl_seconds", _RECALL_CACHE_TTL))
+    fast_followup = bool(await get_setting_cached(pool, "recall_fast_followups", False))
+
+    # Cache lookup — generation-versioned, so an ingest invalidates instantly.
+    redis = _make_redis() if cache_enabled else None
+    cache_key = None
+    if redis is not None:
+        gen = await _recall_gen(redis, scope)
+        digest = hashlib.sha256(query.encode()).hexdigest()[:16]
+        cache_key = f"cache:recall:{scope}:{gen}:{mode}:{k}:{digest}"
+        try:
+            hit = await redis.get(cache_key)
+            if hit is not None:
+                payload = hit.decode() if isinstance(hit, (bytes, bytearray)) else hit
+                cached = json.loads(payload)
+                cached["cached"] = True
+                metrics.incr("recall.cache_hits")
+                metrics.timing("recall.latency_cached", (time.monotonic() - t_start) * 1000)
+                return cached
+        except Exception:
+            pass
+    metrics.incr("recall.cache_misses")
     try:
-        emb = await get_shared_embedder()
+        # Per-request memo so the query is embedded once across the dense stage,
+        # the re-score pass below, and any agentic follow-up rounds (was 2-4x).
+        emb = CachingEmbedder(await get_shared_embedder())
         # Large token_budget so retrieve() returns its full candidate pool — its
         # assembler otherwise truncates by budget and can drop dense-strong items
         # that RRF rank-fusion ranked low. We re-rank the pool ourselves below;
         # the assembled context string is unused here.
         result = await retrieve(
             RetrievalRequest(query=query, scope=scope, mode=mode, token_budget=50000),
-            pool=pool, embedder=emb, reranker=FakeReranker(),
+            pool=pool, embedder=emb, reranker=FakeReranker(), fast_followup=fast_followup,
         )
         cand = result.items
         # Rerank by true cosine relevance using the STORED memory embeddings:
@@ -808,10 +841,24 @@ async def recall(body: RecallRequest):
              "tier": it.tier, "epistemic_status": it.epistemic_status}
             for it in cand[:k]
         ]
-        return {"results": items, "count": len(items)}
+        out = {"results": items, "count": len(items)}
+        if redis is not None and cache_key is not None:
+            try:
+                await redis.set(cache_key, json.dumps(out), ex=cache_ttl)
+            except Exception:
+                pass
+        metrics.timing("recall.latency", (time.monotonic() - t_start) * 1000)
+        return out
     except Exception as e:
+        metrics.incr("recall.errors")
         logger.exception("recall failed query=%r", query[:80])
         return {"error": str(e), "results": [], "count": 0}
+    finally:
+        if redis is not None:
+            try:
+                await redis.aclose()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -980,7 +1027,7 @@ async def compose_narrative(body: ComposeNarrativeRequest):
         text += "\n".join(parts) if parts else "(no relevant context found)"
         return text
 
-    client, model = _make_llm_client()
+    client, model = _make_llm_client("deep")
     narrative = ""
     if client and (episodes or memories):
         ctx_lines = [f"- {e['content']}" for e in episodes[:18]]
@@ -1002,7 +1049,7 @@ async def compose_narrative(body: ComposeNarrativeRequest):
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.6,
-                max_tokens=700,
+                max_tokens=3000,  # deep tier is a reasoning model — leave room past reasoning_content
             )
             narrative = (resp.choices[0].message.content or "").strip()
         except Exception:
@@ -1767,6 +1814,34 @@ def _make_redis():
         return None
 
 
+# Recall cache. The cache key embeds a per-scope generation counter so any write
+# (ingest) invalidates every prior entry instantly by bumping the counter — no
+# key scanning/deletion. A TTL is the cleanup safety net (and bounds staleness
+# from consolidation merges, which don't bump the counter).
+_RECALL_CACHE_TTL = 120
+
+
+async def _recall_gen(redis: Any, scope: str) -> str:
+    """Current cache generation for a scope (string, '0' if unset/unavailable)."""
+    if redis is None:
+        return "0"
+    try:
+        v = await redis.get(f"recall:gen:{scope}")
+        return v.decode() if isinstance(v, (bytes, bytearray)) else (str(v) if v is not None else "0")
+    except Exception:
+        return "0"
+
+
+async def _bump_recall_gen(redis: Any, scope: str) -> None:
+    """Invalidate a scope's recall cache by advancing its generation counter."""
+    if redis is None:
+        return
+    try:
+        await redis.incr(f"recall:gen:{scope}")
+    except Exception:
+        pass
+
+
 def _make_publisher_sync():
     """Create a PgNatsPublisher without NATS (PG-only staging)."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1812,42 +1887,58 @@ def _load_env_key(*names: str) -> str:
     return ""
 
 
-# Process-wide cached LLM client: the OpenRouter key is read from disk once and
-# the AsyncOpenAI client (with its httpx pool) is reused across calls.
-_LLM_CLIENT: Any = None
-_LLM_MODEL: str = ""
+# Process-wide cached LLM clients, one per task tier. Each tier reads its own
+# base_url/key/chain from env so different work routes to the right provider:
+#   fast    — high-volume, cheap (distillation, classify, KG extraction) → OmniRoute
+#   agentic — orchestration + agent runs → Azure Kimi
+#   deep    — heavy cognition (reflection/meta/narrative) → Azure gpt-oss-120b
+# See curlyos LLM routing audit. The (client, model) is cached per tier; a no-key
+# result is NOT cached so adding a key later is picked up.
+_LLM_CLIENTS: dict[str, tuple] = {}
 
 
-def _make_llm_client():
-    """Build (cached) an OpenRouter-backed AsyncOpenAI client + model, or (None, "").
+def _make_llm_client(tier: str = "fast"):
+    """Build (cached) an OpenAI-compatible AsyncOpenAI client + model for a task
+    tier, or (None, "") when no key / no SDK.
 
-    Returns (client, model). Returns (None, "") when no key is available or
-    the openai SDK is missing — callers must fall back to heuristics. The
-    no-key result is NOT cached so adding a key later is picked up.
+    tier: "fast" (default) | "agentic" | "deep". Each tier resolves
+    CURLYOS_<TIER>_BASE_URL / _API_KEY / _MODEL / _CHAIN, falling back to the
+    FAST (CURLYOS_LLM_*) config and finally OpenRouter, so an unconfigured tier
+    degrades gracefully instead of erroring.
     """
-    global _LLM_CLIENT, _LLM_MODEL
-    if _LLM_CLIENT is not None:
-        return _LLM_CLIENT, _LLM_MODEL
-    key = _load_env_key("OPENROUTER_API_KEY")
-    if not key:
-        return None, ""
+    if tier in _LLM_CLIENTS:
+        return _LLM_CLIENTS[tier]
     try:
         from openai import AsyncOpenAI
     except Exception:
         return None, ""
-    from shared.models import FallbackClient, general_chain, primary_model
-    # Fast per-model failure (no slow same-model 429 backoff) — the chain is the
-    # resilience, so we move to the next model instead of retrying a limited one.
-    raw = AsyncOpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=key,
-        timeout=60.0,
-        max_retries=0,
-    )
-    # Wrap so .chat.completions.create fails over across CURLYOS_MODEL_CHAIN.
-    client = FallbackClient(raw, general_chain())
-    model = os.environ.get("CURLYOS_LLM_MODEL") or primary_model()
-    _LLM_CLIENT, _LLM_MODEL = client, model
+    from shared.models import FallbackClient, general_chain, agentic_chain, deep_chain
+
+    if tier == "agentic":
+        key = _load_env_key("CURLYOS_AGENTIC_API_KEY", "CURLYOS_LLM_API_KEY", "OPENROUTER_API_KEY")
+        base_url = (_load_env_key("CURLYOS_AGENTIC_BASE_URL")
+                    or _load_env_key("CURLYOS_LLM_BASE_URL") or "https://openrouter.ai/api/v1")
+        chain = agentic_chain()
+        model = os.environ.get("CURLYOS_AGENTIC_MODEL") or (chain[0] if chain else "")
+    elif tier == "deep":
+        key = _load_env_key("CURLYOS_DEEP_API_KEY", "CURLYOS_LLM_API_KEY", "OPENROUTER_API_KEY")
+        base_url = (_load_env_key("CURLYOS_DEEP_BASE_URL")
+                    or _load_env_key("CURLYOS_LLM_BASE_URL") or "https://openrouter.ai/api/v1")
+        chain = deep_chain()
+        model = os.environ.get("CURLYOS_DEEP_MODEL") or (chain[0] if chain else "")
+    else:  # fast (default)
+        key = _load_env_key("CURLYOS_LLM_API_KEY", "OPENROUTER_API_KEY")
+        base_url = _load_env_key("CURLYOS_LLM_BASE_URL") or "https://openrouter.ai/api/v1"
+        chain = general_chain()
+        model = os.environ.get("CURLYOS_LLM_MODEL") or (chain[0] if chain else "")
+
+    if not key:
+        return None, ""
+    # Reasoning models (Azure Kimi/gpt-oss) are slower → generous timeout. Fast
+    # per-model failure (no slow same-model 429 backoff) — the chain is the resilience.
+    raw = AsyncOpenAI(base_url=base_url, api_key=key, timeout=120.0, max_retries=0)
+    client = FallbackClient(raw, chain, tier=tier)
+    _LLM_CLIENTS[tier] = (client, model)
     return client, model
 
 
@@ -1899,6 +1990,35 @@ async def _embed_row(pool: Any, table: str, row_id: str, text: str, embedder: An
         return False
 
 
+async def _embed_rows(pool: Any, rows: list[tuple[str, str, str]], embedder: Any) -> set[str]:
+    """Embed several rows in ONE model call, then store each vector.
+
+    `rows` is [(table, row_id, text), ...] with `table` a fixed internal literal
+    ("memories"/"episodes"). Identical texts are embedded once (one bge-m3 pass
+    instead of N). Returns the set of row_ids successfully embedded+stored.
+    """
+    pending = [(t, rid, txt) for (t, rid, txt) in rows if txt and txt.strip()]
+    if not pending:
+        return set()
+    done: set[str] = set()
+    try:
+        texts = [txt for (_, _, txt) in pending]
+        uniq = list(dict.fromkeys(texts))
+        vecs = await embedder.embed(uniq)
+        by_text = {t: "[" + ",".join(repr(float(x)) for x in v) + "]" for t, v in zip(uniq, vecs)}
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                for table, row_id, txt in pending:
+                    await cur.execute(
+                        f"UPDATE {table} SET embedding = %s::vector WHERE id = %s",
+                        (by_text[txt], row_id),
+                    )
+                    done.add(row_id)
+    except Exception:
+        logger.exception("batch embed failed rows=%d", len(pending))
+    return done
+
+
 async def _process_episode_bg(
     scope: str, epi_id: str, mem_id: str | None, text: str, extract_knowledge: bool = True,
 ) -> None:
@@ -1917,18 +2037,26 @@ async def _process_episode_bg(
         embedder = await get_shared_embedder()
 
         # Embeddings first — these make the entry dense-recallable right away.
-        done_epi = done_mem = False
+        # Episode + memory embed in ONE batched model call (identical text, the
+        # common case, embeds once); retry only the rows still missing.
+        targets = [("episodes", epi_id, text)]
+        if mem_id:
+            targets.append(("memories", mem_id, text[:4000]))
+        needed = {rid for (_, rid, _) in targets}
         for attempt in range(3):
-            done_epi = done_epi or await _embed_row(pool, "episodes", epi_id, text, embedder)
-            done_mem = done_mem or not mem_id or await _embed_row(pool, "memories", mem_id, text[:4000], embedder)
-            if done_epi and done_mem:
+            done = await _embed_rows(pool, [t for t in targets if t[1] in needed], embedder)
+            needed -= done
+            if not needed:
                 break
             logger.warning("embedding attempt %d incomplete epi=%s", attempt + 1, epi_id)
             await asyncio.sleep(2 ** attempt * 2)
 
+        from shared.settings import get_setting_cached
+
         # Classify the captured memory's epistemic status (canonical/belief/
         # hypothesis) instead of blanket canonical. Best-effort, background.
-        if mem_id:
+        # Gated by the epistemic_classify_enabled setting (an LLM call per ingest).
+        if mem_id and bool(await get_setting_cached(pool, "epistemic_classify_enabled", True)):
             try:
                 llm_client, model = _make_llm_client()
                 if llm_client:
@@ -1945,8 +2073,9 @@ async def _process_episode_bg(
             except Exception:
                 logger.exception("epistemic classify failed epi=%s", epi_id)
 
-        # Then knowledge-graph extraction (entities/edges).
-        if extract_knowledge:
+        # Then knowledge-graph extraction (entities/edges). The per-request flag
+        # AND the kg_extraction_enabled setting must both allow it.
+        if extract_knowledge and bool(await get_setting_cached(pool, "kg_extraction_enabled", True)):
             llm_client, _ = _make_llm_client()
             for attempt in range(3):
                 try:
@@ -2089,6 +2218,14 @@ async def ingest(body: IngestRequest, background_tasks: BackgroundTasks):
         background_tasks.add_task(
             _process_episode_bg, scope, epi_id, result.get("mem_id"), text, extract_knowledge,
         )
+        # Invalidate this scope's recall cache — a new memory may change results.
+        _r = _make_redis()
+        if _r is not None:
+            await _bump_recall_gen(_r, scope)
+            try:
+                await _r.aclose()
+            except Exception:
+                pass
     result["processing"] = "scheduled" if epi_id else "skipped"
     return result
 
@@ -2314,7 +2451,7 @@ async def reflection_weekly(body: ReflectionRequest | None = None):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from cognition.reflection import run_weekly_reflection
 
-    llm_client, llm_model = _make_llm_client()
+    llm_client, llm_model = _make_llm_client("deep")
     pool = await _get_async_pool()
     try:
         result = await run_weekly_reflection(
@@ -2358,7 +2495,7 @@ async def reflection_monthly(body: ReflectionRequest | None = None):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from cognition.reflection import run_monthly_reflection
 
-    llm_client, llm_model = _make_llm_client()
+    llm_client, llm_model = _make_llm_client("deep")
     pool = await _get_async_pool()
     try:
         result = await run_monthly_reflection(
@@ -2389,7 +2526,7 @@ async def meta_audit(body: MetaAuditRequest | None = None):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from cognition.meta import run_decision_audit, distill_principles
 
-    llm_client, llm_model = _make_llm_client()
+    llm_client, llm_model = _make_llm_client("deep")
     pool = await _get_async_pool()
     try:
         audit_result = await run_decision_audit(
@@ -2433,7 +2570,7 @@ async def meta_distill(body: MetaDistillRequest | None = None):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from cognition.meta import distill_principles
 
-    llm_client, llm_model = _make_llm_client()
+    llm_client, llm_model = _make_llm_client("deep")
     pool = await _get_async_pool()
     try:
         principles = await distill_principles(
@@ -2468,7 +2605,7 @@ async def narrative_generate(body: NarrativeGenerateRequest | None = None):
     from cognition.narrative import surface_themes, compose_chapters
 
     pool = await _get_async_pool()
-    llm_client, llm_model = _make_llm_client()
+    llm_client, llm_model = _make_llm_client("deep")
     try:
         themes = await surface_themes(
             pool=pool, publisher=_make_publisher_sync(),
@@ -2683,9 +2820,12 @@ def _scheduler_jobs():
     return [
         Job("decision_review_nudge", DailyAt("09:00"), _decision_review_nudge_job),
         Job("discovery_scan", WeeklyAt((2,), "20:00"), _discovery_scan_job),
-        Job("orchestrator_autoplan", Every(20), _orchestrator_autoplan_job),
+        # autoplan now runs the AGENTIC tier (Azure Kimi) when goals exist; the
+        # sweeps no-op when there's nothing to plan, so a 60m cadence avoids
+        # idle Azure calls while staying responsive enough for autonomous goals.
+        Job("orchestrator_autoplan", Every(60), _orchestrator_autoplan_job),
         # consolidation is internally locked per scope — overlap-safe at any cadence
-        Job("consolidation_fast", Every(15),
+        Job("consolidation_fast", Every(20),
             lambda: consolidation_run(ConsolidationRunRequest(mode="fast"))),
         Job("consolidation_deep", DailyAt("03:05"),
             lambda: consolidation_run(ConsolidationRunRequest(mode="deep"))),
@@ -2716,3 +2856,204 @@ async def scheduler_status(request: Request):
     if sched is None:
         return {"running": False, "reason": "CURLYOS_SCHEDULER disabled", "jobs": []}
     return sched.snapshot()
+
+
+# ---------------------------------------------------------------------------
+# Observability — live metrics for the LLM tiers, recall/cache, and the
+# write→embed→distill→graph pipeline. Counters are in-process & since-boot
+# (shared.metrics), so always read them next to uptime_seconds.
+# ---------------------------------------------------------------------------
+
+def _tier_config(tier: str) -> dict:
+    """Display config for an LLM tier (endpoint host, model, chain) — never keys."""
+    from shared.models import general_chain, agentic_chain, deep_chain
+    if tier == "agentic":
+        base = (_load_env_key("CURLYOS_AGENTIC_BASE_URL") or _load_env_key("CURLYOS_LLM_BASE_URL")
+                or "https://openrouter.ai/api/v1")
+        chain = agentic_chain()
+        model = os.environ.get("CURLYOS_AGENTIC_MODEL") or (chain[0] if chain else "")
+        has_key = bool(_load_env_key("CURLYOS_AGENTIC_API_KEY", "CURLYOS_LLM_API_KEY", "OPENROUTER_API_KEY"))
+    elif tier == "deep":
+        base = (_load_env_key("CURLYOS_DEEP_BASE_URL") or _load_env_key("CURLYOS_LLM_BASE_URL")
+                or "https://openrouter.ai/api/v1")
+        chain = deep_chain()
+        model = os.environ.get("CURLYOS_DEEP_MODEL") or (chain[0] if chain else "")
+        has_key = bool(_load_env_key("CURLYOS_DEEP_API_KEY", "CURLYOS_LLM_API_KEY", "OPENROUTER_API_KEY"))
+    else:  # fast
+        base = _load_env_key("CURLYOS_LLM_BASE_URL") or "https://openrouter.ai/api/v1"
+        chain = general_chain()
+        model = os.environ.get("CURLYOS_LLM_MODEL") or (chain[0] if chain else "")
+        has_key = bool(_load_env_key("CURLYOS_LLM_API_KEY", "OPENROUTER_API_KEY"))
+    host = base.split("//")[-1].split("/")[0]
+    return {"model": model, "endpoint": host, "chain": chain, "configured": has_key}
+
+
+def _llm_observability() -> dict:
+    """Per-tier LLM rollup: config + since-boot calls/errors/fallbacks/latency."""
+    from shared import metrics
+    snap = metrics.snapshot()
+    c, t, n = snap["counters"], snap["timings"], snap["notes"]
+    tiers = {}
+    for tier in ("fast", "agentic", "deep"):
+        cfg = _tier_config(tier)
+        calls = int(c.get(f"llm.{tier}.calls", 0))
+        errors = int(c.get(f"llm.{tier}.errors", 0))
+        lat = t.get(f"llm.{tier}.latency", {})
+        tiers[tier] = {
+            **cfg,
+            "calls": calls,
+            "errors": errors,
+            "fallbacks": int(c.get(f"llm.{tier}.fallbacks", 0)),
+            "avg_latency_ms": lat.get("avg_ms", 0.0),
+            "last_model": n.get(f"llm.{tier}.last_model"),
+            "last_error": n.get(f"llm.{tier}.last_error"),
+            "error_rate": round(errors / calls, 3) if calls else 0.0,
+        }
+    return {"tiers": tiers, "uptime_seconds": snap["uptime_seconds"]}
+
+
+@app.get("/api/observability/llm")
+async def observability_llm():
+    """LLM routing health: each tier's provider/model + since-boot usage."""
+    return _llm_observability()
+
+
+def _recall_observability() -> dict:
+    from shared import metrics
+    snap = metrics.snapshot()
+    c, t = snap["counters"], snap["timings"]
+    reqs = int(c.get("recall.requests", 0))
+    hits = int(c.get("recall.cache_hits", 0))
+    misses = int(c.get("recall.cache_misses", 0))
+    served = hits + misses
+    return {
+        "requests": reqs,
+        "cache_hits": hits,
+        "cache_misses": misses,
+        "errors": int(c.get("recall.errors", 0)),
+        "hit_rate": round(hits / served, 3) if served else 0.0,
+        "avg_latency_ms": t.get("recall.latency", {}).get("avg_ms", 0.0),
+        "avg_latency_cached_ms": t.get("recall.latency_cached", {}).get("avg_ms", 0.0),
+        "uptime_seconds": snap["uptime_seconds"],
+    }
+
+
+@app.get("/api/observability/recall")
+async def observability_recall():
+    """Recall throughput + cache hit-rate + cold/warm latency (since boot)."""
+    return _recall_observability()
+
+
+async def _pipeline_observability(scope: str) -> dict:
+    """The write→embed→distill→graph backlog + recent ingest rate, from SQL."""
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+
+    async def _one(sql: str, params: list) -> int:
+        try:
+            async with pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(sql, params)
+                    row = await cur.fetchone()
+                    return int(row[0]) if row else 0
+        except Exception:
+            return 0
+
+    unembedded_epi = await _one(
+        "SELECT count(*) FROM episodes WHERE scope=%s AND embedding IS NULL", [scope])
+    unembedded_mem = await _one(
+        "SELECT count(*) FROM memories WHERE scope=%s AND embedding IS NULL AND valid_to IS NULL", [scope])
+    # episodes with no distilled memory yet (excludes jrnl, which bypasses distillation)
+    distill_backlog = await _one(
+        "SELECT count(*) FROM episodes e WHERE e.scope=%s "
+        "AND COALESCE(e.source_ref,'') NOT LIKE 'jrnl:%%' "
+        "AND NOT EXISTS (SELECT 1 FROM memories m WHERE m.source_episode_id = e.id AND m.scope=%s)",
+        [scope, scope])
+    ingest_1h = await _one(
+        "SELECT count(*) FROM episodes WHERE scope=%s AND created_at >= now() - interval '1 hour'", [scope])
+    ingest_24h = await _one(
+        "SELECT count(*) FROM episodes WHERE scope=%s AND created_at >= now() - interval '24 hours'", [scope])
+    entities = await _one("SELECT count(*) FROM knowledge_entities WHERE scope=%s", [scope])
+    # knowledge_edges has no scope column — edges inherit scope from their src entity.
+    edges = await _one(
+        "SELECT count(*) FROM knowledge_edges ke "
+        "JOIN knowledge_entities e ON e.id = ke.src_entity_id WHERE e.scope=%s", [scope])
+    return {
+        "scope": scope,
+        "backlog": {
+            "unembedded_episodes": unembedded_epi,
+            "unembedded_memories": unembedded_mem,
+            "episodes_awaiting_distillation": distill_backlog,
+        },
+        "ingest_rate": {"last_1h": ingest_1h, "last_24h": ingest_24h},
+        "knowledge_graph": {"entities": entities, "edges": edges},
+    }
+
+
+@app.get("/api/observability/pipeline")
+async def observability_pipeline(scope: str = SCOPE):
+    """Backlog of the ingest pipeline (embed/distill) + recent ingest rate + KG size."""
+    return await _pipeline_observability(scope)
+
+
+@app.get("/api/observability/overview")
+async def observability_overview(request: Request, scope: str = SCOPE):
+    """One-call rollup for the home-page monitor: infra + counts + LLM + recall +
+    pipeline + scheduler, in a single round trip."""
+    return {
+        "timestamp": now_iso(),
+        "health": health(),
+        "counts": stats(),
+        "composition": stats_composition(scope),
+        "llm": _llm_observability(),
+        "recall": _recall_observability(),
+        "pipeline": await _pipeline_observability(scope),
+        "scheduler": _scheduler_summary(request),
+    }
+
+
+@app.post("/api/observability/reset")
+async def observability_reset():
+    """Zero the in-process metric counters (uptime is preserved)."""
+    from shared import metrics
+    metrics.reset()
+    return {"ok": True, "reset_at": now_iso()}
+
+
+# ---------------------------------------------------------------------------
+# Settings — typed, validated runtime knobs (shared.settings.SETTINGS_REGISTRY).
+# ---------------------------------------------------------------------------
+
+@app.get("/api/settings")
+async def list_settings():
+    """All settings with effective value + metadata (type/default/category/desc)."""
+    from shared.settings import all_settings
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    return {"settings": await all_settings(pool)}
+
+
+@app.get("/api/settings/{key}")
+async def get_one_setting(key: str):
+    from shared.settings import all_settings
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    s = await all_settings(pool)
+    if key not in s:
+        raise HTTPException(status_code=404, detail=f"unknown setting: {key}")
+    return {"key": key, **s[key]}
+
+
+@app.put("/api/settings/{key}")
+async def put_setting(key: str, body: dict):
+    """Update a setting. Validated/coerced against the registry. Body: {"value": ...}."""
+    from shared.settings import SETTINGS_REGISTRY, coerce_value, set_setting, all_settings
+    if "value" not in body:
+        raise HTTPException(status_code=400, detail="body must include 'value'")
+    if key not in SETTINGS_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"unknown setting: {key} (not in registry)")
+    try:
+        value = coerce_value(key, body["value"])
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    await set_setting(pool, key, value)
+    s = await all_settings(pool)
+    return {"key": key, **s[key]}

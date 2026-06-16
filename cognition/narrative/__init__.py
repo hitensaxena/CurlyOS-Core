@@ -430,7 +430,7 @@ async def compose_chapters(
                 model=llm_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.4,
-                max_tokens=160,
+                max_tokens=2000,  # deep tier reasoning model: leave room past reasoning_content
                 response_format={"type": "json_object"},
             )
             data = first_json(resp.choices[0].message.content, default={})

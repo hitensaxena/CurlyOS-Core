@@ -19,6 +19,30 @@ from shared.embeddings import Embedder, Reranker
 log = logging.getLogger(__name__)
 
 
+def _detect_device() -> str:
+    """Pick the torch device for bge-m3.
+
+    Default is CPU. We deliberately do NOT auto-select Apple MPS: measured on
+    this box, bge-m3 on MPS recompiles its kernels per input shape, so the
+    sporadic varied-length queries the recall path issues cost 200-800ms each
+    (vs a stable ~50ms on CPU's Accelerate/AMX path) — ~5x slower overall. MPS
+    only wins on large, repeated, same-shape batches. A real CUDA GPU has no
+    such pathology, so it's auto-selected. Set CURLYOS_EMBED_DEVICE=mps|cpu|cuda
+    to force a device (e.g. mps for a dedicated bulk re-embed job).
+    """
+    import os
+    forced = os.environ.get("CURLYOS_EMBED_DEVICE", "").strip().lower()
+    if forced:
+        return forced
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
 class FakeEmbedder(Embedder):
     """Zero-vector embedder for tests — no model download required."""
 
@@ -77,8 +101,8 @@ class LocalBgeM3(Embedder):
 
     _load_lock: threading.Lock = threading.Lock()
 
-    def __init__(self, device: str = "cpu"):
-        self._device = device
+    def __init__(self, device: str = "auto"):
+        self._device = _detect_device() if device == "auto" else device
         self._model = None
 
     @property
@@ -104,6 +128,40 @@ class LocalBgeM3(Embedder):
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         return await asyncio.to_thread(self._encode, texts)
+
+
+class CachingEmbedder(Embedder):
+    """Wraps a real embedder with an exact-text memo cache.
+
+    A single /api/recall embeds the query several times — once in the dense
+    first-stage, again to re-score the candidate pool, and once per agentic
+    follow-up round. On a CPU/MPS box each embed is ~50-150ms, so wrapping the
+    shared embedder per request collapses those to one real model call.
+    Unbounded by design: scope it to one request (short-lived) or to a small
+    set of repeated texts, not to a long-running process.
+    """
+
+    def __init__(self, inner: Embedder):
+        self._inner = inner
+        self._cache: dict[str, list[float]] = {}
+
+    @property
+    def dimension(self) -> int:
+        return self._inner.dimension
+
+    @property
+    def model_name(self) -> str:
+        return self._inner.model_name
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        missing = [t for t in texts if t not in self._cache]
+        if missing:
+            # de-dup the misses before the (expensive) real call
+            uniq = list(dict.fromkeys(missing))
+            vecs = await self._inner.embed(uniq)
+            for t, v in zip(uniq, vecs):
+                self._cache[t] = v
+        return [self._cache[t] for t in texts]
 
 
 class OpenAIAdapter(Embedder):

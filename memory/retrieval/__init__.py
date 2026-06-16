@@ -99,15 +99,20 @@ async def _sparse_recall(
     bt_where, bt_params = _bitemporal_where(as_of)
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
+            # Use the precomputed `search_tsv` column (maintained by the
+            # trg_memories_tsv trigger as to_tsvector('english', statement)) so
+            # this hits the idx_memories_tsv GIN index. Computing to_tsvector()
+            # inline instead forced a parallel seq scan + per-row tsvector over
+            # all ~21k rows (~0.8s each, twice with the fallback ≈ 1.6s).
             # Try plainto_tsquery first (less aggressive stemming)
             await cur.execute(
                 f"SELECT id, statement, kind, valid_from, valid_to, source_episode_id, "
-                f"epistemic_status, ts_rank(to_tsvector('english', statement), "
+                f"epistemic_status, ts_rank(search_tsv, "
                 f"plainto_tsquery('english', %s)) AS score "
                 f"FROM memories "
                 f"WHERE scope = %s AND {bt_where} "
                 f"AND epistemic_status = ANY(%s) "
-                f"AND to_tsvector('english', statement) @@ plainto_tsquery('english', %s) "
+                f"AND search_tsv @@ plainto_tsquery('english', %s) "
                 f"ORDER BY score DESC LIMIT %s",
                 [query, scope, *bt_params, list(epistemic_filter), query, k],
             )
@@ -116,12 +121,12 @@ async def _sparse_recall(
             if not rows:
                 await cur.execute(
                     f"SELECT id, statement, kind, valid_from, valid_to, source_episode_id, "
-                    f"epistemic_status, ts_rank(to_tsvector('english', statement), "
+                    f"epistemic_status, ts_rank(search_tsv, "
                     f"websearch_to_tsquery('english', %s)) AS score "
                     f"FROM memories "
                     f"WHERE scope = %s AND {bt_where} "
                     f"AND epistemic_status = ANY(%s) "
-                    f"AND to_tsvector('english', statement) @@ websearch_to_tsquery('english', %s) "
+                    f"AND search_tsv @@ websearch_to_tsquery('english', %s) "
                     f"ORDER BY score DESC LIMIT %s",
                     [query, scope, *bt_params, list(epistemic_filter), query, k],
                 )
@@ -546,6 +551,7 @@ async def retrieve(
     embedder: Any,
     reranker: Any = None,
     redis: Any = None,
+    fast_followup: bool = False,
 ) -> RetrievalResult:
     """Retrieve relevant memories for a query.
 
@@ -559,7 +565,13 @@ async def retrieve(
     ef_search = 128 if deep else 64
     k = 50 if deep else 20
     graph_hops = 2 if deep else 1
-    max_rounds = 3 if deep else 1
+    # Agentic follow-up rounds. `fast` is the latency-sensitive path (Hermes
+    # conversational prefetch) — it does NOT run a follow-up retrieval: the
+    # initial hybrid+graph pass already returns a full pool, and the coverage-
+    # gap follow-up was adding a whole extra dense+sparse round (~150-300ms) to
+    # every fast recall. Exploration stays on deep (3) and divergent (1); fast
+    # gets a follow-up only when explicitly opted in (recall_fast_followups).
+    max_rounds = 3 if deep else (1 if divergent else (1 if fast_followup else 0))
 
     # Epistemic filter based on mode
     epistemic_filter = _epistemic_filter_for_mode(mode)

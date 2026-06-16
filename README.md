@@ -76,8 +76,16 @@ single fully-connected knowledge graph · 0 orphans
 - **Capture hygiene** — ingestion strips harness/tooling scaffolding (system reminders, task notifications, command wrappers) so only genuine content becomes memory.
 - **Event sourcing** — writes emit CloudEvents; projections (like the graph) are rebuildable from the episodic log.
 
-### LLM backend
-Knowledge extraction, epistemic classification, reflection, and narrative all call an LLM through a **failover chain**. By default it uses an OpenRouter model chain (`CURLYOS_MODEL_CHAIN`); set `REFRESH_BACKEND=hermes` to route the heavy cognition passes through **hermes-bridge** and run them on a local Claude (Max) subscription — faster and higher quality for the reflective work.
+### LLM backend — tiered routing
+Every LLM call goes through a **failover chain** (`shared/models.py`), and work is routed to one of three **task tiers** so the right model does the right job:
+
+| Tier | Used by | Default backend |
+|------|---------|-----------------|
+| **fast** | per-ingest epistemic classification, KG extraction, memory distillation (high-volume) | OmniRoute / cheap fast model (`CURLYOS_LLM_*`) |
+| **agentic** | the orchestrator's ReAct runner + agent runs | `CURLYOS_AGENTIC_*` (e.g. Azure Kimi) |
+| **deep** | heavy "thinking" — reflection, meta-cognition, narrative | `CURLYOS_DEEP_*` (e.g. Azure gpt-oss-120b) |
+
+Each tier resolves its own `base_url` / key / model chain and degrades gracefully to the fast config when a tier is unset. Per-tier usage (calls, errors, fallbacks, latency) is exposed live at `/api/observability/llm`.
 
 ### Service map
 
@@ -227,7 +235,7 @@ hermes config set memory.provider curlyos
 
 ---
 
-## API reference (selected — 52 endpoints total)
+## API reference (selected — 60+ endpoints total)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -243,6 +251,17 @@ hermes config set memory.provider curlyos
 | `/api/identity` | GET/POST | Stable self-model |
 | `/api/cognition/narrative/compose` | POST | Compose a grounded first-person narrative for a query |
 | `/api/reflection/*` · `/api/meta/*` · `/api/attention/*` | POST | Run reflection, generate assumptions/models, scan attention |
+| `/api/observability/llm` | GET | Per-tier LLM health: provider, model, calls, errors, fallbacks, latency |
+| `/api/observability/recall` | GET | Recall throughput + cache hit-rate + cold/warm latency |
+| `/api/observability/pipeline` | GET | Ingest pipeline backlog (embed/distill), ingest rate, KG size |
+| `/api/observability/overview` | GET | One-call rollup (health + counts + LLM + recall + pipeline + scheduler) |
+| `/api/settings` · `/api/settings/{key}` | GET/PUT | Typed, validated runtime knobs (cache TTL, ingest toggles, autonomy) |
+
+### Observability & runtime settings
+
+A lightweight in-process metrics layer (`shared/metrics.py`, since-boot counters) instruments the single LLM choke point (`FallbackClient`) and the recall path, surfaced through the `/api/observability/*` endpoints above — per-tier LLM usage, recall cache hit-rate, and the write→embed→distill→graph backlog.
+
+Runtime behaviour is tunable **without a restart** via a typed settings registry (`shared/settings.py`). `GET /api/settings` lists every knob with its type/default/description; `PUT /api/settings/{key}` validates and applies it live. Wired knobs include `recall_cache_enabled`, `recall_cache_ttl_seconds`, `recall_fast_followups`, `epistemic_classify_enabled`, `kg_extraction_enabled`, plus the `auto_promote` / `auto_plan` autonomy toggles.
 
 ---
 
@@ -257,7 +276,10 @@ Resolved in priority order: **env vars → `~/.hermes/curlyos.yaml` → `~/.herm
 | `CURLYOS_API_PORT` | API server port | `8643` |
 | `CURLYOS_SCOPE` | Default scope for facts | `user:usr_hiten` |
 | `OPENROUTER_API_KEY` | LLM key for extraction/cognition | *(optional)* |
-| `CURLYOS_MODEL_CHAIN` | Comma-separated failover model chain | OpenRouter default |
+| `CURLYOS_LLM_BASE_URL` · `CURLYOS_LLM_API_KEY` · `CURLYOS_MODEL_CHAIN` | **fast** tier endpoint/key/chain | OpenRouter default |
+| `CURLYOS_AGENTIC_BASE_URL` · `_API_KEY` · `_MODEL` | **agentic** tier (orchestrator/agents) | falls back to fast |
+| `CURLYOS_DEEP_BASE_URL` · `_API_KEY` · `_MODEL` | **deep** tier (reflection/meta/narrative) | falls back to fast |
+| `CURLYOS_EMBED_DEVICE` | Force embedder device: `cpu` (default) · `mps` · `cuda` | `cpu` |
 | `REFRESH_BACKEND` | `chain` (OpenRouter) or `hermes` (Claude via hermes-bridge) | `chain` |
 
 ```yaml

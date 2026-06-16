@@ -599,6 +599,24 @@ async def extract_and_project(
     # 1. Extract triples
     triples = await extract_with_llm(episode_content, episode_id, llm_client=llm_client)
 
+    # Pre-embed every distinct mention in ONE model pass and memoise it, so the
+    # resolve (ANN) + create steps reuse vectors instead of re-encoding the same
+    # text twice each and once per mention serially (was up to 2N calls → 1 batch).
+    if embedder is not None and triples:
+        from shared.embeddings.implementations import CachingEmbedder
+        embedder = CachingEmbedder(embedder)
+        mentions: list[str] = []
+        for tr in triples:
+            for m in (tr.subject, tr.object):
+                if m:
+                    mentions.append(m)
+                    mentions.append(m.strip())
+        if mentions:
+            try:
+                await embedder.embed(list(dict.fromkeys(mentions)))
+            except Exception as e:  # noqa: BLE001 — pre-warm is best-effort
+                log.debug("mention pre-embed failed: %s", e)
+
     # 2. Resolve entities + project
     entities_created = 0
     entities_merged = 0
