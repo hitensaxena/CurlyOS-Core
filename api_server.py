@@ -47,6 +47,13 @@ async def lifespan(app: FastAPI):
     # Self-heal: re-embed anything a crash/restart left without embeddings.
     sweep = asyncio.create_task(_sweep_unembedded())
 
+    # Pre-warm the bge-m3 embedder in the background so the FIRST recall after a
+    # restart doesn't eat the ~12s cold model load. Non-blocking (does not delay
+    # readiness); the _EMBEDDER_LOCK dedups against a concurrent first request or
+    # the sweep above. Gated by CURLYOS_PREWARM_EMBEDDER (default on) — disable on
+    # RAM-pressure: the model is ~1.3GB resident (see macbook-ram-tuning).
+    prewarm = asyncio.create_task(_prewarm_embedder())
+
     # The cognitive heartbeat (curlyos-final/06 §3) — replaces Hermes cron.
     # CURLYOS_SCHEDULER=0 disables (tests, one-off scripts).
     scheduler = None
@@ -146,8 +153,10 @@ async def lifespan(app: FastAPI):
     if scheduler is not None:
         await scheduler.stop()
     sweep.cancel()
+    prewarm.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await sweep
+        await prewarm
     for pool in _POOLS.values():
         await pool.close()
     _POOLS.clear()
@@ -1853,8 +1862,21 @@ def _make_publisher_sync():
 
 
 async def _make_embedder():
-    """Create an embedder — try LocalBgeM3, fall back to FakeEmbedder."""
+    """Create an embedder — sidecar (if CURLYOS_EMBED_URL set), else LocalBgeM3,
+    else FakeEmbedder."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    # Opt-in: route embeddings to an out-of-process sidecar (e.g. bge-m3 on the
+    # Apple Neural Engine via Core ML). Same 1024-dim contract. Default off.
+    embed_url = os.environ.get("CURLYOS_EMBED_URL", "").strip()
+    if embed_url:
+        try:
+            from shared.embeddings.implementations import HttpEmbedder
+            emb = HttpEmbedder(embed_url)
+            await emb.embed(["warmup"])  # verify the sidecar is reachable
+            logger.info("Embedder: HTTP sidecar at %s", embed_url)
+            return emb
+        except Exception as e:
+            logger.warning("Embed sidecar %s unreachable (%s) — falling back to LocalBgeM3", embed_url, e)
     try:
         from shared.embeddings.implementations import LocalBgeM3
         emb = LocalBgeM3()
@@ -2093,6 +2115,22 @@ async def _process_episode_bg(
                         await asyncio.sleep(2 ** attempt * 2)
     except Exception:
         logger.exception("background processing failed epi=%s", epi_id)
+
+
+async def _prewarm_embedder() -> None:
+    """Background startup task: load the bge-m3 model + do one warmup encode so
+    the first user recall doesn't pay the ~12s cold load. Idempotent via the
+    shared embedder's lock. Off when CURLYOS_PREWARM_EMBEDDER is 0/false/off."""
+    if os.environ.get("CURLYOS_PREWARM_EMBEDDER", "1").lower() in ("0", "false", "off"):
+        return
+    try:
+        embedder = await get_shared_embedder()
+        await embedder.embed(["warmup"])
+        logger.info("embedder pre-warmed")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("embedder pre-warm failed")
 
 
 async def _sweep_unembedded() -> None:
@@ -2817,6 +2855,7 @@ def _scheduler_jobs():
         )
         planned = await autoplan_sweep(
             pool=pool, publisher=pub, llm=_runner_llm(), scope=SCOPE, max_goals=3,
+            runner=getattr(app.state, "runner", None),
         )
         return {"promoted": promoted, "planned": planned}
 

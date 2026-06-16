@@ -164,6 +164,49 @@ class CachingEmbedder(Embedder):
         return [self._cache[t] for t in texts]
 
 
+class HttpEmbedder(Embedder):
+    """Calls an out-of-process embedding sidecar over HTTP.
+
+    Used to run bge-m3 on the Apple Neural Engine (Core ML) in a separate
+    process — measured ~18ms/query + ~840MB RSS there vs ~200ms + ~1.3GB
+    in-process on CPU, with cos 0.99999 to the production embeddings. Keeps
+    this API process small (the 1024-dim contract is unchanged). Stdlib-only
+    (urllib) so it adds no dependency to the core venv.
+
+    Sidecar contract: POST {url}/embed {"texts": [...]} -> {"vectors": [[...]]}.
+    """
+
+    def __init__(self, url: str, model_name: str = "bge-m3-coreml-ane", timeout: float = 30.0):
+        self._url = url.rstrip("/") + "/embed"
+        self._model_name = model_name
+        self._timeout = timeout
+
+    @property
+    def dimension(self) -> int:
+        return 1024
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    def _post(self, texts: list[str]) -> list[list[float]]:
+        import json
+        import urllib.request
+
+        body = json.dumps({"texts": texts}).encode("utf-8")
+        req = urllib.request.Request(
+            self._url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        return payload["vectors"]
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        return await asyncio.to_thread(self._post, texts)
+
+
 class OpenAIAdapter(Embedder):
     """OpenAI text-embedding-3-large adapter. Returns 1024-dim (truncated)."""
 

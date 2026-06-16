@@ -596,6 +596,117 @@ async def _distill_episode_facts(
     return facts[:_DISTILL_MAX_FACTS]
 
 
+_DISTILL_BATCH = 6  # episodes distilled per LLM call (amortizes the instruction overhead)
+
+_TRIVIAL_RE = re.compile(
+    r"^[\s\W]*(?:(?:ok(?:ay)?|thanks?|thank you|yes|yep|yeah|yup|no|nope|nah|sure|"
+    r"got it|cool|nice|great|perfect|awesome|continue|go ahead|proceed|please do|"
+    r"do it|done|working|works|back|hi|hello|hey|sounds good)[\s\W]*)+$",
+    re.I,
+)
+
+
+def _is_trivial_turn(content: str) -> bool:
+    """True only for turns that cannot hold a durable fact — pure acknowledgments /
+    greetings, or near-empty. CONSERVATIVE by design: requires the WHOLE turn to be
+    content-word-free (the regex anchors ^…$), so a real short fact like "use
+    Postgres for JobPilot" is never skipped. Lets the summarize pass mark these
+    processed WITHOUT spending an LLM call."""
+    c = (content or "").strip()
+    if len(c) < 12:
+        return True
+    if len(c) <= 120 and _TRIVIAL_RE.match(c):
+        return True
+    return False
+
+
+_DISTILL_BATCH_SYSTEM = (
+    "You extract durable long-term memories about the USER and their projects from "
+    "conversation turns. You are extremely selective. Return JSON only."
+)
+
+
+def _distill_batch_prompt(items: list[tuple[str, str]]) -> str:
+    head = (
+        "Below are several conversation turns, each marked [#N]. For EACH turn, extract "
+        "only facts that will still matter in months: the user's stable preferences, "
+        "decisions they made, concrete project/system facts, identity, or relationships.\n"
+        "STRICT RULES:\n"
+        "- Most turns contain nothing durable — then give that turn an empty facts list.\n"
+        "- NEVER write meta-statements about the session itself.\n"
+        "- NEVER describe the assistant or its next steps. Only durable facts about the USER and their world.\n"
+        "- NEVER invent or pad. If unsure, omit.\n"
+        "- Each fact: a concise, self-contained third-person statement (resolve pronouns; name the subject).\n"
+        f"- At most {_DISTILL_MAX_FACTS} facts per turn.\n"
+        "- Return EXACTLY one result object per turn number N below, even when its facts list is empty.\n"
+        'Return JSON: {"results":[{"n":N,"facts":[{"statement":"...","kind":"fact|preference|procedure"}]}]}'
+        "\n\n"
+    )
+    body = "\n\n".join(f"[#{i + 1}]\n{(c or '')[:4000]}" for i, (_eid, c) in enumerate(items))
+    return head + body
+
+
+async def _distill_episodes_batch(
+    llm_client: Any, llm_model: str, items: list[tuple[str, str]]
+) -> dict[str, list[tuple[str, str]]] | None:
+    """Distil up to _DISTILL_BATCH episodes in ONE LLM call.
+
+    items: [(epi_id, content)]. Returns {epi_id: [(statement, kind), …]} ONLY for the
+    turns the model actually answered (results keyed by turn number → epi_id). Episodes
+    the model omitted are simply absent from the map → the caller leaves them unmarked
+    so they retry next pass (never lost, never mis-attributed). Returns None if the LLM
+    call itself failed → caller defers the whole batch."""
+    if not items:
+        return {}
+    try:
+        resp = await llm_client.chat.completions.create(
+            model=llm_model,
+            messages=[
+                {"role": "system", "content": _DISTILL_BATCH_SYSTEM},
+                {"role": "user", "content": _distill_batch_prompt(items)},
+            ],
+            temperature=0.0,
+            max_tokens=512 + 256 * len(items),  # headroom: per-turn facts + reasoning models
+        )
+        recs = json_records(resp.choices[0].message.content)
+    except Exception as e:
+        log.warning("batch distill LLM call failed (deferring %d episodes): %s", len(items), e)
+        return None
+
+    # Unwrap {"results":[…]} (small models sometimes nest or return a bare list).
+    rows: list[dict] = []
+    for r in recs:
+        if isinstance(r, dict) and isinstance(r.get("results"), list):
+            rows.extend(x for x in r["results"] if isinstance(x, dict))
+        elif isinstance(r, dict):
+            rows.append(r)
+
+    out: dict[str, list[tuple[str, str]]] = {}
+    for row in rows:
+        try:
+            idx = int(row.get("n")) - 1
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= idx < len(items)):
+            continue
+        epi_id = items[idx][0]
+        facts: list[tuple[str, str]] = []
+        raw = row.get("facts")
+        if isinstance(raw, list):
+            for f in raw:
+                if not isinstance(f, dict):
+                    continue
+                stmt = (f.get("statement") or "").strip()
+                if len(stmt) < 8:
+                    continue
+                kind = (f.get("kind") or "fact").strip().lower()
+                if kind not in ("fact", "preference", "procedure"):
+                    kind = "fact"
+                facts.append((stmt, kind))
+        out[epi_id] = facts[:_DISTILL_MAX_FACTS]
+    return out
+
+
 async def _pass_summarize(
     pool: Any,
     redis: Any,
@@ -615,7 +726,7 @@ async def _pass_summarize(
     untouched (also matched explicitly on source_ref as a guard).
     """
     result = {"pass": "summarize", "episodes_processed": 0, "facts_extracted": 0,
-              "skipped_no_llm": 0, "deferred": 0, "errors": 0}
+              "skipped_no_llm": 0, "deferred": 0, "prefiltered": 0, "errors": 0}
 
     if llm_client is None:
         result["skipped_no_llm"] = 1
@@ -640,80 +751,94 @@ async def _pass_summarize(
                 )
                 episodes = await cur.fetchall()
 
-            for epi_id, content in episodes:
-                try:
-                    facts = await _distill_episode_facts(llm_client, llm_model, content or "")
-                    # LLM call failed (rate limit, timeout, …): DEFER — leave the
-                    # episode unmarked so the next pass retries it. Never mark a
-                    # failed call as "processed".
-                    if facts is None:
-                        # LLM unavailable — abort the whole pass for this scope
-                        # rather than hammering N failing calls. Remaining
-                        # episodes (incl. this one) stay unmarked and retry next
-                        # pass once the LLM recovers.
-                        result["deferred"] = len(episodes) - result["episodes_processed"]
-                        log.info("SUMMARIZE deferring %d episodes for scope %s (LLM unavailable)",
-                                 result["deferred"], scope_text)
-                        break
-                    # Successful empty result: a chatter-only turn. Mark it
-                    # processed so it isn't re-distilled every pass. A zero-fact
-                    # "marker" memory at tier='working' + valid_to is invisible to
-                    # recall (which reads active canonical) and satisfies NOT EXISTS.
-                    if not facts:
-                        marker_id = mint("mem")
-                        async with cur_conn.cursor() as cur:
-                            await cur.execute(
-                                "INSERT INTO memories "
-                                "(id, scope, statement, statement_key, kind, tier, "
-                                " epistemic_status, valid_from, valid_to, ingested_at, "
-                                " source_episode_id) "
-                                "VALUES (%s, %s, '(no durable facts)', %s, 'fact', "
-                                "'working', 'hypothesis', now(), now(), now(), %s) "
-                                "ON CONFLICT DO NOTHING",
-                                (marker_id, scope_text, f"_distilled:{epi_id}", epi_id),
-                            )
-                        result["episodes_processed"] += 1
-                        continue
+            # Mark a chatter-only turn processed WITHOUT a recallable memory. A
+            # zero-fact "marker" at tier='working' + valid_to is invisible to recall
+            # (which reads active canonical) and satisfies the NOT-EXISTS guard so the
+            # episode isn't re-distilled every pass.
+            async def _mark_no_facts(epi_id: str) -> None:
+                marker_id = mint("mem")
+                async with cur_conn.cursor() as cur:
+                    await cur.execute(
+                        "INSERT INTO memories "
+                        "(id, scope, statement, statement_key, kind, tier, "
+                        " epistemic_status, valid_from, valid_to, ingested_at, "
+                        " source_episode_id) "
+                        "VALUES (%s, %s, '(no durable facts)', %s, 'fact', "
+                        "'working', 'hypothesis', now(), now(), now(), %s) "
+                        "ON CONFLICT DO NOTHING",
+                        (marker_id, scope_text, f"_distilled:{epi_id}", epi_id),
+                    )
 
-                    for fact_text, kind in facts:
-                        mem_id = mint("mem")
-                        skey = re.sub(r"\s+", " ", fact_text.strip().lower()).rstrip(" .!?,;:")
-
-                        async with cur_conn.cursor() as cur:
-                            await cur.execute(
-                                "INSERT INTO memories "
-                                "(id, scope, statement, statement_key, kind, tier, "
-                                " epistemic_status, valid_from, ingested_at, source_episode_id) "
-                                "VALUES (%s, %s, %s, %s, %s, 'semantic', "
-                                "'canonical', now(), now(), %s) "
-                                "ON CONFLICT DO NOTHING",
-                                (mem_id, scope_text, fact_text, skey, kind, epi_id),
-                            )
-
-                        ev = build_event(
-                            short_type="memory.fact.stored",
-                            subject=mem_id,
-                            scope=_scope_obj_from_text(scope_text),
-                            data={
-                                "mem_id": mem_id,
-                                "scope": scope_text,
-                                "source_episode_id": epi_id,
-                            },
-                            actor="agent:consolidation",
-                            source="curlyos-core/consolidation",
+            async def _store_facts(epi_id: str, facts: list[tuple[str, str]]) -> None:
+                for fact_text, kind in facts:
+                    mem_id = mint("mem")
+                    skey = re.sub(r"\s+", " ", fact_text.strip().lower()).rstrip(" .!?,;:")
+                    async with cur_conn.cursor() as cur:
+                        await cur.execute(
+                            "INSERT INTO memories "
+                            "(id, scope, statement, statement_key, kind, tier, "
+                            " epistemic_status, valid_from, ingested_at, source_episode_id) "
+                            "VALUES (%s, %s, %s, %s, %s, 'semantic', "
+                            "'canonical', now(), now(), %s) "
+                            "ON CONFLICT DO NOTHING",
+                            (mem_id, scope_text, fact_text, skey, kind, epi_id),
                         )
-                        try:
-                            _stored, subj, stamped = await publisher.stage(ev, cur_conn)
-                            await publisher.emit(subj, stamped)
-                        except Exception:
-                            pass
+                    ev = build_event(
+                        short_type="memory.fact.stored",
+                        subject=mem_id,
+                        scope=_scope_obj_from_text(scope_text),
+                        data={"mem_id": mem_id, "scope": scope_text, "source_episode_id": epi_id},
+                        actor="agent:consolidation",
+                        source="curlyos-core/consolidation",
+                    )
+                    try:
+                        _stored, subj, stamped = await publisher.stage(ev, cur_conn)
+                        await publisher.emit(subj, stamped)
+                    except Exception:
+                        pass
+                    result["facts_extracted"] += 1
 
-                        result["facts_extracted"] += 1
+            # ---- pre-filter: pure-acknowledgment turns can't hold a durable fact;
+            # mark them processed WITHOUT spending an LLM call ----
+            to_distill: list[tuple[str, str]] = []
+            for epi_id, content in episodes:
+                if _is_trivial_turn(content or ""):
+                    try:
+                        await _mark_no_facts(epi_id)
+                        result["episodes_processed"] += 1
+                        result["prefiltered"] += 1
+                    except Exception as e:
+                        result["errors"] += 1
+                        log.warning("SUMMARIZE prefilter-mark failed for %s: %s", epi_id, e)
+                else:
+                    to_distill.append((epi_id, content))
 
-                    result["episodes_processed"] += 1
-                except Exception as e:
-                    result["errors"] += 1
-                    log.warning("SUMMARIZE failed for episode %s: %s", epi_id, e)
+            # ---- batch the rest: up to _DISTILL_BATCH episodes per LLM call ----
+            for start in range(0, len(to_distill), _DISTILL_BATCH):
+                batch = to_distill[start:start + _DISTILL_BATCH]
+                results_map = await _distill_episodes_batch(llm_client, llm_model, batch)
+                # Whole call failed (rate limit, timeout): DEFER this batch and all
+                # that follow — leave them unmarked so the next pass retries.
+                if results_map is None:
+                    result["deferred"] += len(to_distill) - start
+                    log.info("SUMMARIZE deferring %d episodes for scope %s (LLM unavailable)",
+                             len(to_distill) - start, scope_text)
+                    break
+                for epi_id, _content in batch:
+                    if epi_id not in results_map:
+                        # model omitted this turn — leave unmarked → retries next pass
+                        result["deferred"] += 1
+                        continue
+                    try:
+                        facts = results_map[epi_id]
+                        if facts:
+                            await _store_facts(epi_id, facts)
+                        else:
+                            await _mark_no_facts(epi_id)
+                        result["episodes_processed"] += 1
+                    except Exception as e:
+                        result["errors"] += 1
+                        log.warning("SUMMARIZE failed for episode %s: %s", epi_id, e)
 
     except Exception as e:
         log.error("SUMMARIZE pass failed for scope %s: %s", scope_text, e)
