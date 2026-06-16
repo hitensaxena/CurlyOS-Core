@@ -76,7 +76,8 @@ async def lifespan(app: FastAPI):
             from orchestration.user_jobs import deliver_run_output
             from shared.notify import get_notifier as _gn
 
-            _ujob_pool_factory = lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row)
+            def _ujob_pool_factory():
+                return _get_async_pool(row_factory=psycopg.rows.tuple_row)
             _worker_llm = _runner_llm()  # shared by the runner and the verifier
 
             async def _on_run_event(run_id: str, status: str) -> None:
@@ -1526,9 +1527,11 @@ def list_artifacts(project_id: str | None = None, goal_id: str | None = None,
     clauses = ["scope = %s"]
     params: list[Any] = [scope]
     if project_id:
-        clauses.append("project_id = %s"); params.append(project_id)
+        clauses.append("project_id = %s")
+        params.append(project_id)
     if goal_id:
-        clauses.append("goal_id = %s"); params.append(goal_id)
+        clauses.append("goal_id = %s")
+        params.append(goal_id)
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT id, scope, project_id, goal_id, run_id, task_id, kind, title, path, "
