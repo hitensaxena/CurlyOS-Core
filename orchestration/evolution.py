@@ -18,7 +18,7 @@ The loop:  propose → eval gate → approval gate → activate.
   * get_active_prompt     — runtime lookup with hardcoded-default fallback;
                             the graph's plan node calls this.
 
-v1 evolves ONE prompt (executive.plan) end-to-end; the machinery is generic
+v1 evolves ONE prompt (executive.act) end-to-end; the machinery is generic
 (name-keyed), so adding prompts later is registration, not design.
 """
 from __future__ import annotations
@@ -163,7 +163,7 @@ async def evaluate_prompt(pool: Any, publisher: Any, scope: str, *,
     from shared.types.ulid import mint
 
     from orchestration.tools import planner_tool_block
-    from orchestration.graph import MAX_STEPS, _PLAN_USER
+    from orchestration.graph import MAX_STEPS, _DECIDE_USER
 
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
@@ -184,7 +184,9 @@ async def evaluate_prompt(pool: Any, publisher: Any, scope: str, *,
     details, passed = [], 0
     for case in GOLDEN_PLANNER_TASKS:
         try:
-            out = await llm(system, _PLAN_USER.format(task=case["task"], context="(eval)"))
+            out = await llm(system, _DECIDE_USER.format(
+                task=case["task"], context="(eval)", n=0,
+                max_steps=MAX_STEPS, history="", budget_nudge=""))
         except Exception as exc:  # noqa: BLE001
             out = f"LLM error: {exc}"
         ok, why = score_plan(out, case["expect"])
