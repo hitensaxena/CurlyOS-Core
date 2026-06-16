@@ -6,6 +6,8 @@ Most AI "memory" is a flat file or a pile of vectors: you dump text in, you cosi
 
 It is a standalone Python service (FastAPI, PostgreSQL + pgvector, Redis) that gives an agent a real cognitive substrate: every experience is recorded with provenance, distilled into time-aware facts, projected into a connected knowledge graph, folded into a stable self-model, and periodically re-examined by a reflection loop that distills principles, surfaces life themes, and flags its own stale assumptions. It ships as a drop-in [Hermes Agent](https://hermes-agent.nousresearch.com) memory plugin and powers a companion web UI for exploring the whole mind visually.
 
+> 📖 **Full documentation:** the complete docs — architecture, every subsystem, the 116-route REST API, the 43-table schema, integrations and operations — live in [`docs/`](docs/) and are published as a Docusaurus site (see [`docs/README.md`](docs/README.md) to build/preview, or once GitHub Pages is enabled: <https://hitensaxena.github.io/CurlyOS-Core/>).
+
 ---
 
 ## Why CurlyOS Core is different

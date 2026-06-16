@@ -1,3 +1,13 @@
+---
+title: Orchestration Design Notes
+description: Original LangGraph multi-agent orchestration design note (control plane + conversation plane).
+format: md
+---
+
+:::note
+This is the original design note for the orchestration subsystem, preserved verbatim. For the implemented behaviour, see [Orchestration](../subsystems/orchestration.md).
+:::
+
 # Multi-Agent Orchestration in CurlyOS (LangGraph) — webapp control plane + Hermes/Telegram conversation plane
 
 ## Context

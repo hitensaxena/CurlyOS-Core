@@ -1,0 +1,69 @@
+.hero {
+  padding: 5rem 0 4rem;
+  background: radial-gradient(
+      1200px 600px at 70% -10%,
+      rgba(99, 102, 241, 0.25),
+      transparent 60%
+    ),
+    var(--ifm-background-color);
+  text-align: left;
+}
+
+.heroTitle {
+  font-size: clamp(2.5rem, 6vw, 4rem);
+  margin-bottom: 0.5rem;
+  letter-spacing: -0.03em;
+}
+
+.heroSubtitle {
+  font-size: clamp(1.1rem, 2.5vw, 1.6rem);
+  color: var(--ifm-color-primary);
+  font-weight: 600;
+  margin-bottom: 1rem;
+}
+
+.heroBlurb {
+  max-width: 640px;
+  font-size: 1.1rem;
+  color: var(--ifm-color-emphasis-700);
+  margin-bottom: 2rem;
+}
+
+.buttons {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.features {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 1.25rem;
+  padding: 3rem 0 4rem;
+}
+
+.featureCard {
+  display: block;
+  padding: 1.5rem;
+  border: 1px solid var(--ifm-color-emphasis-300);
+  border-radius: 12px;
+  background: var(--ifm-card-background-color);
+  transition: border-color 0.2s ease, transform 0.2s ease;
+  color: inherit;
+  text-decoration: none;
+}
+
+.featureCard:hover {
+  border-color: var(--ifm-color-primary);
+  transform: translateY(-2px);
+  text-decoration: none;
+}
+
+.featureCard h3 {
+  margin-bottom: 0.5rem;
+}
+
+.featureCard p {
+  color: var(--ifm-color-emphasis-700);
+  margin: 0;
+}
