@@ -759,10 +759,11 @@ def make_router(
         return {"items": items, "count": len(items)}
 
     @router.post("/orchestrator/autoplan")
-    async def run_autoplan():
+    async def run_autoplan(request: Request):
         from orchestration.orchestrator import autoplan_sweep
         return await autoplan_sweep(
             pool=await pool_factory(), publisher=_pub(), llm=_llm(), scope=scope,
+            runner=_runner(request),
         )
 
     @router.post("/orchestrator/promote")

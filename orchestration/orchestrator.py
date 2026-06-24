@@ -371,10 +371,19 @@ async def promote_opportunities_sweep(
 
 async def autoplan_sweep(
     *, pool: Any, publisher: Any, llm: Any, scope: str, max_goals: int = 3,
+    runner: Any = None,
 ) -> dict:
     """Pull active goals that have no live plan and decompose them (capped per
     sweep to bound LLM cost). Each new plan lands in the inbox. Respects the
-    `auto_plan` setting (default on)."""
+    `auto_plan` setting (default on).
+
+    When `auto_execute` is on AND a runner is available, the sweep also closes
+    the loop: it approves + dispatches `proposed` plans for active goals (newly
+    decomposed ones plus any backlog), bounded per sweep. From there each task
+    chains itself via `on_worker_done` (dispatch → verify → next), and a finished
+    plan re-plans the goal if not yet achieved — so the full
+    opportunity→goal→agent→verify→repeat loop runs without a human click.
+    Per-action safety is still enforced by the PDP at execution time."""
     from shared.settings import get_setting
     if not await get_setting(pool, "auto_plan", True):
         return {"skipped": "auto_plan_off", "planned": []}
@@ -404,7 +413,36 @@ async def autoplan_sweep(
             log.info("autoplan: skip %s (%s)", gid, r["error"])
     if planned:
         log.info("autoplan: planned %d/%d candidate goal(s)", len(planned), len(candidates))
-    return {"planned": planned, "candidates": len(candidates)}
+
+    # Close the loop: dispatch proposed plans for active goals (bounded). Without
+    # this the autonomous path stalls at 'proposed' forever, waiting for a human
+    # to click Execute. Gated by `auto_execute` (default off) + a live runner.
+    executed: list[dict] = []
+    if runner is not None and await get_setting(pool, "auto_execute", False):
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT p.id FROM goal_plans p JOIN goals g ON g.id = p.goal_id "
+                    "WHERE p.scope=%s AND p.status='proposed' "
+                    "AND g.status='active' AND g.valid_to IS NULL "
+                    "ORDER BY p.created_at ASC LIMIT %s",
+                    (scope, AUTO_EXECUTE_PER_SWEEP),
+                )
+                plan_ids = [row[0] for row in await cur.fetchall()]
+        for pid in plan_ids:
+            try:
+                r = await execute_plan(pool=pool, publisher=publisher, runner=runner,
+                                       scope=scope, plan_id=pid)
+                if r.get("error"):
+                    log.info("auto-execute: skip %s (%s)", pid, r["error"])
+                else:
+                    executed.append({"plan_id": pid, "dispatched": r.get("dispatched", 0)})
+            except Exception as e:  # noqa: BLE001 — one bad plan shouldn't stop the sweep
+                log.info("auto-execute: error %s (%s)", pid, e)
+        if executed:
+            log.info("auto-execute: dispatched %d proposed plan(s)", len(executed))
+
+    return {"planned": planned, "candidates": len(candidates), "executed": executed}
 
 
 # ── artifacts produced by a goal's runs ───────────────────────────────────────
@@ -472,6 +510,7 @@ def _artifact_ref(result: Any) -> str | None:
 # ── worker completion → progress (runner hook) ────────────────────────────────
 
 MAX_GOAL_PLANS = 3  # bound how many times a goal is auto-replanned before asking the user
+AUTO_EXECUTE_PER_SWEEP = 3  # cap proposed plans auto-dispatched per sweep (avoid stampeding the runner)
 
 
 async def on_worker_done(

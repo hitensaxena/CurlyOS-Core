@@ -565,13 +565,19 @@ async def retrieve(
     ef_search = 128 if deep else 64
     k = 50 if deep else 20
     graph_hops = 2 if deep else 1
-    # Agentic follow-up rounds. `fast` is the latency-sensitive path (Hermes
-    # conversational prefetch) — it does NOT run a follow-up retrieval: the
-    # initial hybrid+graph pass already returns a full pool, and the coverage-
-    # gap follow-up was adding a whole extra dense+sparse round (~150-300ms) to
-    # every fast recall. Exploration stays on deep (3) and divergent (1); fast
-    # gets a follow-up only when explicitly opted in (recall_fast_followups).
-    max_rounds = 3 if deep else (1 if divergent else (1 if fast_followup else 0))
+    # Agentic follow-up rounds. MEASURED 2026-06-16: deep's 3 follow-up rounds
+    # were latency-only with ZERO quality gain — the /api/recall endpoint (deep's
+    # ONLY caller) re-ranks the candidate pool by true cosine to the ORIGINAL
+    # query, and round-1 dense (ef_search=128, k=50) already covers that query,
+    # so the degenerate follow-up ("what are my…", produced by truncation in
+    # _detect_coverage_gap) can only add items that never out-rank round-1 hits.
+    # Verified across 8 diverse queries: top-8 byte-identical with rounds 3→0,
+    # deep recall 815-1436ms → 236-297ms (3-4x). So deep now does 0 follow-ups;
+    # its depth comes from ef_search/k/graph_hops below, not from rounds.
+    # Divergent KEEPS its 1 round — it's consumed in fused order by
+    # orchestration/workflows.py discovery (no cosine re-rank downstream), where
+    # the extra round can still contribute. fast opts in via recall_fast_followups.
+    max_rounds = 1 if divergent else (1 if fast_followup else 0)
 
     # Epistemic filter based on mode
     epistemic_filter = _epistemic_filter_for_mode(mode)

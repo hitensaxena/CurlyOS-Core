@@ -24,6 +24,8 @@ SETTINGS_REGISTRY: dict[str, dict[str, Any]] = {
                      "description": "Promote high-scoring opportunities into goals automatically."},
     "auto_plan": {"type": "bool", "default": True, "category": "autonomy",
                   "description": "Decompose active goals into plans automatically (autoplan sweep)."},
+    "auto_execute": {"type": "bool", "default": False, "category": "autonomy",
+                     "description": "Autonomously approve + dispatch proposed goal plans, closing the full opportunity→goal→agent→verify loop without a human click. Per-action safety is still enforced by the policy gate (PDP)."},
     # safety
     "agent_bypass": {"type": "bool", "default": False, "category": "safety",
                      "description": "Run agent side effects without human approval. Use with care."},
