@@ -475,7 +475,7 @@ async def run_decision_audit(
                 await _insert_decision(stmt[:400], d.get("domain", "general"))
             async with pool.connection() as conn:
                 ev = build_event(
-                    short_type="cognition.meta.audit.completed",
+                    short_type="cognition.audit.completed",
                     subject=scope, scope={"level": "user", "user_id": scope.split(":", 1)[1] if ":" in scope else scope},
                     data={"audits": audits_created, "decisions": decisions_found, "method": "llm"},
                     actor="system", source="curlyos-core/meta",
@@ -499,7 +499,7 @@ async def run_decision_audit(
 
     async with pool.connection() as conn:
         ev = build_event(
-            short_type="cognition.meta.audit.completed",
+            short_type="cognition.audit.completed",
             subject=scope, scope={"level": "user", "user_id": scope.split(":", 1)[1] if ":" in scope else scope},
             data={"audits": audits_created, "decisions": decisions_found, "method": "regex"},
             actor="system", source="curlyos-core/meta",
