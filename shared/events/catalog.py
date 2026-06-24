@@ -34,6 +34,11 @@ EVENT_CATALOG: dict[str, str] = {
     # ── cognition (live) ─────────────────────────────────────────────────────
     "metacog.assumption.created": "MEMORY",
     "metacog.model.created": "MEMORY",
+    "cognition.reflection.completed": "MEMORY",
+    "cognition.meta.audit.completed": "MEMORY",
+    "cognition.meta.models_generated": "MEMORY",
+    "memory.consolidation.fast": "MEMORY",
+    "memory.consolidation.deep": "MEMORY",
     # ── creative / exploration (live) ────────────────────────────────────────
     "studio.created": "EVENTS",
     "studio.sketch.created": "EVENTS",
@@ -48,6 +53,15 @@ EVENT_CATALOG: dict[str, str] = {
     "goal.created": "EVENTS",
     "goal.updated": "EVENTS",
     "goal.invalidated": "EVENTS",
+    # ── autonomous loop lifecycle (opportunity → goal → plan → task → verify) ──
+    "goal.plan.proposed": "EVENTS",
+    "goal.plan.approved": "EVENTS",
+    "goal.task.dispatched": "EVENTS",
+    "goal.task.verified": "EVENTS",
+    "goal.task.retry": "EVENTS",
+    "goal.progress": "EVENTS",
+    "goal.achieved": "EVENTS",
+    "goal.needs_work": "EVENTS",
     "decision.recorded": "EVENTS",
     "decision.reviewed": "EVENTS",
     "opportunity.detected": "EVENTS",

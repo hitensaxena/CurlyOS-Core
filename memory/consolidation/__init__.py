@@ -1175,6 +1175,22 @@ async def run_consolidation(
 
         all_results.append(scope_result)
 
+    # Emit consolidation event for systems dashboard tracking
+    short_type = "memory.consolidation.deep" if deep else "memory.consolidation.fast"
+    try:
+        from shared.events import build_event
+        ev = build_event(
+            short_type=short_type,
+            subject=scope or "all",
+            scope={"level": "user", "user_id": (scope or "all").split(":", 1)[1] if ":" in (scope or "all") else (scope or "all")},
+            data={"deep": deep, "passes": list(passes), "scopes": len(all_results)},
+            actor="system", source="curlyos-core/consolidation",
+        )
+        async with pool.connection() as conn:
+            await publisher.stage(ev, conn)
+    except Exception:
+        pass
+
     return {
         "deep": deep,
         "passes_run": list(passes),

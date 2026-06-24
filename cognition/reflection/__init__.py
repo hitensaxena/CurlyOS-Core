@@ -26,6 +26,7 @@ from typing import Any, Literal
 
 from shared.types.ulid import mint
 from shared.llm import first_json
+from shared.events import build_event
 
 log = logging.getLogger("curlyos.reflection")
 
@@ -361,6 +362,20 @@ async def run_reflection(
                  f"{report_type.title()} reflection: {len(all_findings)} findings, "
                  f"{len(identity_candidates)} identity candidates"),
             )
+
+    # Emit event for systems dashboard tracking
+    try:
+        ev = build_event(
+            short_type="cognition.reflection.completed",
+            subject=rpt_id,
+            scope={"level": "user", "user_id": scope.split(":", 1)[1] if ":" in scope else scope},
+            data={"report_type": report_type, "findings": len(all_findings),
+                  "identity_candidates": len(identity_candidates)},
+            actor="system", source="curlyos-core/reflection",
+        )
+        await publisher.stage(ev, conn)
+    except Exception:
+        pass
 
     return {
         "rpt_id": rpt_id,

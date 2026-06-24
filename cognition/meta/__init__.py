@@ -128,7 +128,7 @@ async def create_assumption(
     event = build_event(
         short_type="metacog.assumption.created",
         subject=f"assumption:{aid}",
-        scope={"scope": scope},
+        scope={"level": "user", "user_id": scope.split(":", 1)[1] if ":" in scope else scope},
         data={
             "assumption_id": aid,
             "statement": statement,
@@ -251,7 +251,7 @@ async def create_mental_model(
     event = build_event(
         short_type="metacog.model.created",
         subject=f"mental_model:{mid}",
-        scope={"scope": scope},
+        scope={"level": "user", "user_id": scope.split(":", 1)[1] if ":" in scope else scope},
         data={"model_id": mid, "name": name, "domain": domain, "source_episode_id": source_episode_id},
     )
     if publisher is not None:
@@ -473,6 +473,14 @@ async def run_decision_audit(
                 if d.get("rationale"):
                     stmt = f"{stmt} (because {d['rationale']})"
                 await _insert_decision(stmt[:400], d.get("domain", "general"))
+            async with pool.connection() as conn:
+                ev = build_event(
+                    short_type="cognition.meta.audit.completed",
+                    subject=scope, scope={"level": "user", "user_id": scope.split(":", 1)[1] if ":" in scope else scope},
+                    data={"audits": audits_created, "decisions": decisions_found, "method": "llm"},
+                    actor="system", source="curlyos-core/meta",
+                )
+                await publisher.stage(ev, conn)
             return {"audits_created": audits_created, "decisions_found": decisions_found, "method": "llm"}
         except Exception as e:
             log.warning("LLM decision extraction failed, falling back to regex: %s", e)
@@ -489,6 +497,14 @@ async def run_decision_audit(
             decisions_found += 1
             await _insert_decision(decision_text)
 
+    async with pool.connection() as conn:
+        ev = build_event(
+            short_type="cognition.meta.audit.completed",
+            subject=scope, scope={"level": "user", "user_id": scope.split(":", 1)[1] if ":" in scope else scope},
+            data={"audits": audits_created, "decisions": decisions_found, "method": "regex"},
+            actor="system", source="curlyos-core/meta",
+        )
+        await publisher.stage(ev, conn)
     return {"audits_created": audits_created, "decisions_found": decisions_found, "method": "regex"}
 
 
@@ -689,6 +705,14 @@ async def generate_assumptions_and_models(
                 description=str(m.get("description", ""))[:300],
                 domain=str(m.get("domain", "general"))[:30])
             nm += 1
+    async with pool.connection() as conn:
+        ev = build_event(
+            short_type="cognition.meta.models_generated",
+            subject=scope, scope={"level": "user", "user_id": scope.split(":", 1)[1] if ":" in scope else scope},
+            data={"assumptions": na, "mental_models": nm},
+            actor="system", source="curlyos-core/meta",
+        )
+        await publisher.stage(ev, conn)
     return {"assumptions": na, "mental_models": nm}
 
 
