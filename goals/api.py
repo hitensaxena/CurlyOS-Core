@@ -78,12 +78,24 @@ class ResolveOpportunityRequest(BaseModel):
     resolution: str = Field(min_length=1, max_length=500)
 
 
+
+class DeriveGoalsRequest(BaseModel):
+    scope: str = Field(default="user:usr_hiten")
+
+
+class ExtractDecisionsRequest(BaseModel):
+    scope: str = Field(default="user:usr_hiten")
+    auto_record: bool = False
+
+
+
 def make_router(
     *,
     pool_factory: Callable[[], Awaitable[Any]],
     publisher_factory: Callable[[], Any],
     scope: str,
     embedder_factory: Callable[[], Awaitable[Any]] | None = None,
+    llm_factory: Callable[[], tuple[Any, str]] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api")
 
@@ -199,5 +211,27 @@ def make_router(
                                                        resolution=body.resolution)
         except ValueError as e:
             raise HTTPException(404 if "not found" in str(e) else 409, str(e))
+
+
+    # ── goal derivation ─────────────────────────────────────────────────────
+    @router.post("/goals/derive")
+    async def goals_derive(body: DeriveGoalsRequest | None = None):
+        body = body or DeriveGoalsRequest()
+        pool = await pool_factory()
+        llm, model = llm_factory() if llm_factory else (None, "")
+        return await goals_mod.derive_goals_from_memories(
+            pool, publisher_factory(), body.scope, llm_client=llm, llm_model=model,
+        )
+
+    # ── decision extraction ─────────────────────────────────────────────────
+    @router.post("/decisions/extract")
+    async def decisions_extract(body: ExtractDecisionsRequest | None = None):
+        body = body or ExtractDecisionsRequest()
+        pool = await pool_factory()
+        llm, model = llm_factory() if llm_factory else (None, "")
+        return await goals_mod.extract_decisions_from_memories(
+            pool, publisher_factory(), body.scope,
+            auto_record=body.auto_record, llm_client=llm, llm_model=model,
+        )
 
     return router

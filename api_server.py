@@ -191,6 +191,7 @@ def _include_goal_router() -> None:
         # Defined further down in this module but included at import time, so
         # wrap in a lambda to defer resolution — see _include_agents_router().
         embedder_factory=lambda: get_shared_embedder(),
+        llm_factory=lambda: _make_llm_client("deep"),
     ))
 
 
@@ -3107,6 +3108,23 @@ def _scheduler_jobs():
         )
         return {"promoted": promoted, "planned": planned}
 
+    async def _goal_derive_job() -> dict:
+        from goals import derive_goals_from_memories
+        pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+        llm, model = _make_llm_client("fast")
+        return await derive_goals_from_memories(
+            pool, _make_publisher_sync(), SCOPE, llm_client=llm, llm_model=model,
+        )
+
+    async def _decision_extract_job() -> dict:
+        from goals import extract_decisions_from_memories
+        pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+        llm, model = _make_llm_client("fast")
+        return await extract_decisions_from_memories(
+            pool, _make_publisher_sync(), SCOPE,
+            auto_record=True, llm_client=llm, llm_model=model,
+        )
+
     return [
         Job("decision_review_nudge", DailyAt("09:00"), _decision_review_nudge_job),
         Job("discovery_scan", WeeklyAt((2,), "20:00"), _discovery_scan_job),
@@ -3142,6 +3160,14 @@ def _scheduler_jobs():
         # mood inference — lightweight, runs after daily reflection
         Job("mood_inference", DailyAt("23:30"),
             lambda: attention_infer_mood(SCOPE)),
+        # goal derivation — weekly scan for latent goals from memories
+        Job("goal_derivation", WeeklyAt((0,), "07:00"),
+            _goal_derive_job,
+            period_guard=_table_period_guard("goals", "week")),
+        # decision extraction — daily scan for decision points
+        Job("decision_extraction", DailyAt("08:00"),
+            _decision_extract_job,
+            period_guard=_table_period_guard("decisions", "day")),
         Job("approval_silence", Every(60), _approval_silence_job),
     ]
 

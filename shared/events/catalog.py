@@ -35,7 +35,7 @@ EVENT_CATALOG: dict[str, str] = {
     "metacog.assumption.created": "MEMORY",
     "metacog.model.created": "MEMORY",
     "cognition.reflection.completed": "MEMORY",
-    "cognition.meta.audit.completed": "MEMORY",
+    "cognition.audit.completed": "MEMORY",
     "cognition.meta.models_generated": "MEMORY",
     "memory.consolidation.fast": "MEMORY",
     "memory.consolidation.deep": "MEMORY",
@@ -53,6 +53,7 @@ EVENT_CATALOG: dict[str, str] = {
     "goal.created": "EVENTS",
     "goal.updated": "EVENTS",
     "goal.invalidated": "EVENTS",
+    "goal.derived": "EVENTS",
     # ── autonomous loop lifecycle (opportunity → goal → plan → task → verify) ──
     "goal.plan.proposed": "EVENTS",
     "goal.plan.approved": "EVENTS",

@@ -17,6 +17,7 @@ Wiring (who reads/writes what):
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone, timedelta
 import logging
 from typing import Any
 
@@ -394,3 +395,186 @@ async def list_opportunities(pool: Any, scope: str, *, status: str | None = None
          "resolved_at": r[12].isoformat() if r[12] else None}
         for r in rows
     ]
+
+
+# ── Goal derivation from memories ─────────────────────────────────────────────
+
+async def derive_goals_from_memories(
+    pool: Any, publisher: Any, scope: str,
+    llm_client: Any = None, llm_model: str = "gpt-4o-mini",
+) -> dict:
+    """Scan episodes + identity for recurring themes → propose as goal candidates."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=30)
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, content, created_at FROM episodes "
+                "WHERE scope = %s AND created_at >= %s ORDER BY created_at DESC LIMIT 200",
+                (scope, cutoff),
+            )
+            episode_rows = await cur.fetchall()
+            await cur.execute(
+                "SELECT predicate, object, confidence FROM identity_facts "
+                "WHERE scope = %s AND valid_to IS NULL ORDER BY confidence DESC LIMIT 30",
+                (scope,),
+            )
+            identity_rows = await cur.fetchall()
+            await cur.execute(
+                "SELECT id, title FROM goals WHERE scope = %s AND status = 'active' "
+                "AND valid_to IS NULL", (scope,),
+            )
+            existing = {r[1].lower() for r in await cur.fetchall()}
+
+    candidates: list[dict] = []
+    if llm_client is not None:
+        try:
+            episodes_text = "\n".join(
+                f"- [{r[2].isoformat()[:10]}] {r[1][:200]}" for r in episode_rows[:60]
+            )
+            identity_text = "\n".join(
+                f"- {r[0]}: {r[1]} (conf {r[2]:.1f})" for r in identity_rows[:20]
+            )
+            existing_text = "; ".join(sorted(existing)[:10]) if existing else "(none)"
+            prompt = (
+                "From the user's recent episodes and identity below, identify 1-4 "
+                "LATENT GOALS — recurring themes/projects not yet formalized. "
+                "Skip active goals: " + existing_text + "\n\n"
+                "Return JSON: {\"goals\": [{\"title\":\"...\",\"description\":\"...\","
+                "\"horizon\":\"month|quarter|year\"}]}\n\n"
+                f"EPISODES:\n{episodes_text}\n\nIDENTITY:\n{identity_text}"
+            )
+            response = await llm_client.chat.completions.create(
+                model=llm_model, messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}, temperature=0.3,
+            )
+            from shared.llm import first_json
+            data = first_json(response.choices[0].message.content, default={})
+            raw = data if isinstance(data, list) else data.get("goals", [])
+            for c in (raw or []):
+                if isinstance(c, dict) and str(c.get("title", "")).strip():
+                    candidates.append(c)
+        except Exception as e:
+            log.warning("LLM goal derivation failed: %s", e)
+
+    if not candidates:
+        from collections import Counter
+        mentions: Counter[str] = Counter()
+        for _, content, _ in episode_rows:
+            text = (content or "").lower()
+            for kw in ["build", "create", "learn", "start", "improve", "launch", "write", "make"]:
+                if kw in text:
+                    idx = text.find(kw)
+                    snippet = text[idx:idx + 60].strip()
+                    if snippet and snippet != " ":
+                        mentions[snippet] += 1
+        for snippet, count in mentions.most_common(4):
+            if count >= 3 and snippet.lower() not in existing:
+                candidates.append({
+                    "title": snippet[:80].title(),
+                    "description": f"Mentioned {count}x in recent episodes.",
+                    "horizon": "month",
+                })
+
+    created = []
+    for c in candidates:
+        title = str(c.get("title", ""))[:300]
+        if title.lower() in existing:
+            continue
+        goal = await create_goal(
+            pool, publisher, scope, title=title,
+            description=str(c.get("description", ""))[:4000],
+            horizon=c.get("horizon") if c.get("horizon") in ("month", "quarter", "year") else "month",
+        )
+        created.append(goal)
+        existing.add(title.lower())
+    return {"candidates_found": len(candidates), "goals_created": len(created), "goals": created}
+
+
+# ── Decision extraction from memories ─────────────────────────────────────────
+
+async def extract_decisions_from_memories(
+    pool: Any, publisher: Any, scope: str, *,
+    auto_record: bool = False,
+    llm_client: Any = None, llm_model: str = "gpt-4o-mini",
+) -> dict:
+    """Scan recent episodes for decision points. Auto-records if auto_record=True."""
+    import re as _re
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=14)
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, content, created_at FROM episodes "
+                "WHERE scope = %s AND created_at >= %s ORDER BY created_at DESC LIMIT 100",
+                (scope, cutoff),
+            )
+            episode_rows = await cur.fetchall()
+    if not episode_rows:
+        return {"proposed": 0, "recorded": 0, "episodes_scanned": 0}
+
+    proposals: list[dict] = []
+    if llm_client is not None:
+        try:
+            episodes_text = "\n".join(
+                f"- [{r[2].isoformat()[:10]}] {r[1][:300]}" for r in episode_rows[:40]
+            )
+            prompt = (
+                "Extract concrete DECISIONS from the entries. "
+                "Return JSON: {\"decisions\": [{\"title\":\"...\",\"chosen\":\"...\","
+                "\"rationale\":\"...\",\"reversibility\":\"reversible|costly|one_way\"}]}\n\n"
+                + episodes_text
+            )
+            response = await llm_client.chat.completions.create(
+                model=llm_model, messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}, temperature=0.2,
+            )
+            from shared.llm import first_json
+            data = first_json(response.choices[0].message.content, default={})
+            raw = data if isinstance(data, list) else data.get("decisions", [])
+            for d in raw:
+                if isinstance(d, dict) and d.get("title") and d.get("chosen"):
+                    proposals.append(d)
+        except Exception as e:
+            log.warning("LLM decision extraction failed: %s", e)
+
+    if not proposals:
+        for epi_id, content, _ in episode_rows:
+            text = content or ""
+            for match in _re.finditer(
+                r"(?:decided|chose|picked|went with|switched to|committed to)\s+(.+?)(?:\.|,|;|$)",
+                text, _re.IGNORECASE,
+            ):
+                choice = match.group(1).strip()
+                if len(choice) < 5:
+                    continue
+                proposals.append({
+                    "title": choice[:80], "chosen": choice[:200],
+                    "rationale": "", "reversibility": "reversible",
+                })
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT title FROM decisions WHERE scope = %s", (scope,),
+            )
+            existing_titles = {r[0].lower() for r in await cur.fetchall()}
+
+    recorded = 0
+    for p in proposals:
+        if p["title"].lower() in existing_titles:
+            continue
+        existing_titles.add(p["title"].lower())
+        if auto_record:
+            try:
+                await record_decision(
+                    pool, publisher, scope,
+                    title=p["title"], chosen=p["chosen"],
+                    rationale=p.get("rationale", ""),
+                    reversibility=p.get("reversibility", "reversible"),
+                )
+                recorded += 1
+            except Exception as e:
+                log.warning("Failed to record decision %r: %s", p.get("title"), e)
+    return {"proposed": len(proposals), "recorded": recorded,
+            "proposals": proposals[:5], "episodes_scanned": len(episode_rows)}
