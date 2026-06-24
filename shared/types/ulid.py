@@ -70,6 +70,8 @@ PREFIXES: dict[str, str] = {
     "prompt_version": "pmt",
     # Reflection
     "insight_report": "rpt",
+    # Mood / attention
+    "mood_log": "moo",
     # Infrastructure
     "lock": "lck",
     "correlation": "cor",

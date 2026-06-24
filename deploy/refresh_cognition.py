@@ -18,9 +18,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import psycopg
 import api_server
-from cognition.reflection import run_weekly_reflection, run_monthly_reflection
+from cognition.reflection import run_reflection, run_weekly_reflection, run_monthly_reflection
 from cognition.narrative import surface_themes, compose_chapters
-from cognition.attention import detect_alignment_gaps, get_allocation, estimate_cognitive_load
+from cognition.attention import detect_alignment_gaps, get_allocation, estimate_cognitive_load, extract_mood_from_episode, health_signals
 from cognition.meta import run_decision_audit, distill_principles, generate_assumptions_and_models
 
 DSN = os.environ["CURLYOS_DATABASE_URL"]
@@ -79,8 +79,16 @@ async def main():
     sg2 = await api_server._sync_goals_from_reflection(pool, SCOPE)
     log(f"monthly reflection: {rm} | identity_sync={sid2} goal_sync={sg2}")
 
+    # 2b. Daily reflection (lightweight, no LLM).
+    rd = await run_reflection(pool=pool, publisher=pub, scope=SCOPE, report_type="daily")
+    log(f"daily reflection: {rd}")
+
+    # 2c. Mood inference + health signals from recent episodes.
+    mood = await extract_mood_from_episode(pool=pool, scope=SCOPE, llm_client=llm)
+    health = await health_signals(pool=pool, scope=SCOPE, days=14)
+    log(f"mood={mood.get('mood')} health_sleep={health.get('sleep', {}).get('mentions', 0)}")
+
     # 3. Narrative (supersedes old themes + chapters).
-    themes = await surface_themes(pool=pool, publisher=pub, scope=SCOPE, min_frequency=3)
     chapters = await compose_chapters(pool=pool, publisher=pub, scope=SCOPE,
                                       llm_client=llm, llm_model=model)
     log(f"narrative: themes={len(themes)} chapters={len(chapters)} top={[t.get('name') for t in themes[:8]]}")

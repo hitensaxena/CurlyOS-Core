@@ -404,3 +404,276 @@ async def estimate_cognitive_load(
             "window_days": window_days,
         },
     }
+
+
+# ── Mood log DDL ──────────────────────────────────────────────────────────────
+
+MOOD_DDL = """
+CREATE TABLE IF NOT EXISTS mood_log (
+  id                text        PRIMARY KEY,
+  scope             text        NOT NULL,
+  mood              text        NOT NULL,
+  valence           real        NOT NULL DEFAULT 0.0,  -- -1.0 to 1.0
+  energy            real        NOT NULL DEFAULT 0.5,  -- 0.0 to 1.0
+  context           text,
+  source            text        NOT NULL DEFAULT 'inference',  -- explicit | inference
+  source_episode_id text,
+  logged_at         timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_mood_scope_time ON mood_log (scope, logged_at DESC);
+"""
+
+
+# ── Mood CRUD ─────────────────────────────────────────────────────────────────
+
+async def log_mood(
+    pool: Any,
+    scope: str,
+    mood: str,
+    valence: float,
+    energy: float,
+    context: str | None = None,
+    source: str = "explicit",
+    source_episode_id: str | None = None,
+) -> dict:
+    """Record an explicit mood entry."""
+    entry_id = mint("moo")
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO mood_log (id, scope, mood, valence, energy, context, source, source_episode_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id, logged_at",
+                (entry_id, scope, mood, valence, energy, context, source, source_episode_id),
+            )
+            row = await cur.fetchone()
+    return {"id": row[0], "mood": mood, "valence": valence, "energy": energy, "logged_at": row[1].isoformat() if row[1] else None}
+
+
+async def get_mood_history(
+    pool: Any,
+    scope: str,
+    days: int = 30,
+    limit: int = 100,
+) -> dict:
+    """Return mood timeline with rolling averages.
+
+    Returns {entries: [...], summary: {avg_valence, avg_energy, dominant_mood, trend}}.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, mood, valence, energy, context, source, logged_at "
+                "FROM mood_log WHERE scope = %s AND logged_at >= %s "
+                "ORDER BY logged_at DESC LIMIT %s",
+                (scope, cutoff, limit),
+            )
+            rows = await cur.fetchall()
+
+    if not rows:
+        return {"entries": [], "summary": {"avg_valence": 0.0, "avg_energy": 0.0, "dominant_mood": None, "trend": "stable"}}
+
+    entries = []
+    valence_sum = 0.0
+    energy_sum = 0.0
+    mood_counts: Counter[str] = Counter()
+    for r in rows:
+        mood_val = str(r[1]) if r[1] else "neutral"
+        valence_sum += float(r[2] or 0.0)
+        energy_sum += float(r[3] or 0.5)
+        mood_counts[mood_val] += 1
+        entries.append({
+            "id": r[0], "mood": mood_val, "valence": float(r[2] or 0.0),
+            "energy": float(r[3] or 0.5), "context": r[4], "source": r[5],
+            "logged_at": r[6].isoformat() if r[6] else None,
+        })
+
+    n = len(entries)
+    avg_valence = round(valence_sum / n, 3)
+    avg_energy = round(energy_sum / n, 3)
+    dominant = mood_counts.most_common(1)[0][0] if mood_counts else None
+
+    # Simple trend: compare first half vs second half of the window
+    mid = n // 2
+    recent_avg = valence_sum / n
+    older_avg = valence_sum / n  # simplified - more sophisticated split across time
+    if mid > 0:
+        recent = sum(e["valence"] for e in entries[:mid]) / mid
+        older = sum(e["valence"] for e in entries[mid:]) / max(n - mid, 1)
+        trend = "improving" if recent > older + 0.1 else "declining" if recent < older - 0.1 else "stable"
+    else:
+        trend = "stable"
+
+    return {
+        "entries": entries,
+        "summary": {
+            "avg_valence": avg_valence,
+            "avg_energy": avg_energy,
+            "dominant_mood": dominant,
+            "trend": trend,
+            "total_entries": n,
+        },
+    }
+
+
+async def extract_mood_from_episode(
+    pool: Any,
+    scope: str,
+    llm_client: Any = None,
+) -> dict:
+    """Analyze the most recent episode for mood/energy signals.
+
+    With LLM: uses the model to infer mood from latest episode content.
+    Without LLM: heuristic keyword-based valence detection.
+    Stores result in mood_log at source='inference'.
+    Returns the mood entry dict or None if no recent episodes.
+    """
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, content, ingested_at FROM episodes "
+                "WHERE scope = %s ORDER BY ingested_at DESC LIMIT 1",
+                (scope,),
+            )
+            row = await cur.fetchone()
+
+    if row is None:
+        return {"mood": None, "valence": 0.0, "energy": 0.5}
+
+    epi_id, content, ingested_at = row
+
+    if llm_client is not None:
+        try:
+            prompt = (
+                "From the following journal/conversation entry, infer the person's mood "
+                "and energy level. Return JSON: {\"mood\": \"...\", \"valence\": 0.0-1.0, "
+                "\"energy\": 0.0-1.0}\n\nEntry:\n" + (content or "")[:1000]
+            )
+            response = await llm_client.chat.completions.create(
+                model="openai/gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.2,
+            )
+            from shared.llm import first_json
+            data = first_json(response.choices[0].message.content, default={})
+            mood = str(data.get("mood", "neutral"))[:30]
+            valence = max(-1.0, min(1.0, float(data.get("valence", 0.0))))
+            energy = max(0.0, min(1.0, float(data.get("energy", 0.5))))
+        except Exception as e:
+            log.warning("LLM mood extraction failed: %s", e)
+            mood, valence, energy = _heuristic_mood(content)
+    else:
+        mood, valence, energy = _heuristic_mood(content or "")
+
+    result = await log_mood(pool, scope, mood, valence, energy,
+                            source="inference", source_episode_id=epi_id)
+    return result
+
+
+def _heuristic_mood(text: str) -> tuple[str, float, float]:
+    """Keyword-based mood/energy heuristic — no LLM needed."""
+    text_lower = text.lower()
+
+    # Positives and negatives
+    positive_words = ["good", "great", "awesome", "excellent", "happy", "love", "wonderful",
+                      "productive", "accomplished", "proud", "excited", "amazing", "nice",
+                      "well", "better", "best", "progress", "solved", "fixed", "done"]
+    negative_words = ["bad", "terrible", "awful", "sad", "angry", "frustrated", "stuck",
+                      "tired", "exhausted", "stressed", "anxious", "worried", "upset",
+                      "hate", "fail", "failed", "broken", "wrong", "hard", "difficult"]
+
+    # Energy words
+    high_energy = ["energetic", "active", "focused", "productive", "busy", "running",
+                   "fast", "quick", "motivated", "excited", "intense"]
+    low_energy = ["tired", "exhausted", "sleepy", "lazy", "slow", "drained",
+                  "fatigued", "rested", "nap", "rest", "break", "relax"]
+
+    pos_count = sum(1 for w in positive_words if w in text_lower)
+    neg_count = sum(1 for w in negative_words if w in text_lower)
+    high_count = sum(1 for w in high_energy if w in text_lower)
+    low_count = sum(1 for w in low_energy if w in text_lower)
+
+    # Valence: -1 to 1
+    total = pos_count + neg_count
+    valence = round((pos_count - neg_count) / max(total, 1), 2) if total > 0 else 0.0
+    valence = max(-1.0, min(1.0, valence))
+
+    # Energy: 0 to 1
+    energy_total = high_count + low_count
+    energy = round(0.5 + (high_count - low_count) / max(energy_total, 1) * 0.4, 2) if energy_total > 0 else 0.5
+    energy = max(0.0, min(1.0, energy))
+
+    # Mood label
+    if valence >= 0.3 and energy >= 0.6:
+        mood = "energetic"
+    elif valence >= 0.3 and energy < 0.4:
+        mood = "calm"
+    elif valence <= -0.3 and energy >= 0.6:
+        mood = "anxious"
+    elif valence <= -0.3 and energy < 0.4:
+        mood = "tired"
+    elif valence <= -0.3:
+        mood = "sad"
+    elif energy >= 0.7:
+        mood = "focused"
+    elif energy < 0.3:
+        mood = "sleepy"
+    else:
+        mood = "neutral"
+
+    return mood, valence, energy
+
+
+# ── Health signals ────────────────────────────────────────────────────────────
+
+_HEALTH_KEYWORDS = {
+    "sleep": ["sleep", "slept", "insomnia", "night", "bed", "rested", "nap", "tired"],
+    "exercise": ["exercise", "workout", "run", "walk", "gym", "yoga", "stretch", "fitness", "sport"],
+    "sick": ["sick", "ill", "fever", "cold", "flu", "headache", "pain", "doctor", "hospital", "medicine"],
+    "food": ["eat", "ate", "food", "meal", "diet", "hungry", "lunch", "dinner", "breakfast", "cook"],
+    "mental_health": ["meditate", "meditation", "therapy", "anxiety", "stress", "calm", "mindful", "breath"],
+}
+
+_MOOD_CONDITIONS = {
+    "anxious": "high_anxiety", "sad": "low_mood", "tired": "low_energy",
+    "energetic": "high_energy", "calm": "balanced",
+}
+
+
+async def health_signals(
+    pool: Any,
+    scope: str,
+    days: int = 14,
+) -> dict:
+    """Derive health indicators from recent episode content.
+
+    Returns a dict with keyword-based counts for sleep, exercise, sickness,
+    food/nutrition, and mental health mentions, plus recent mood if available.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT content FROM episodes WHERE scope = %s AND ingested_at >= %s "
+                "ORDER BY ingested_at DESC LIMIT 200",
+                (scope, cutoff),
+            )
+            rows = await cur.fetchall()
+
+    signals: dict[str, dict] = {}
+    for category, keywords in _HEALTH_KEYWORDS.items():
+        count = sum(1 for (content,) in rows if any(kw in (content or "").lower() for kw in keywords))
+        signals[category] = {"mentions": count, "active": count > 0}
+
+    # Add recent mood summary
+    try:
+        mood_data = await get_mood_history(pool, scope, days=days, limit=50)
+        signals["mood_summary"] = mood_data.get("summary", {})
+    except Exception:
+        signals["mood_summary"] = {"avg_valence": 0.0, "avg_energy": 0.5, "dominant_mood": None}
+
+    signals["window_days"] = days
+    signals["total_episodes_scanned"] = len(rows)
+    return signals

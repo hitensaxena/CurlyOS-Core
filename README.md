@@ -49,10 +49,10 @@ A bi-temporal self-model (`identity_facts`) — name, role, preferences, values 
 
 ### 🔍 Metacognition (the part that thinks about thinking)
 This is what makes it an *operating system* rather than a database:
-- **Reflection** — periodic weekly/monthly passes that read the clean graph and produce findings, **distilled principles**, and identity/goal updates.
+- **Reflection** — parameterized daily / weekly / monthly passes that scan episodes, produce findings, distill principles, and propose identity/goal updates. Daily is lightweight (heuristic-only, no LLM cost); weekly adds LLM-augmented identity extraction; monthly adds mental model review.
 - **Narrative** — surfaces recurring **themes** and composes **life chapters** from your own episodes (grounded only in real material, never hallucinated).
-- **Attention** — tracks focus areas, neglected entities, cognitive load, and **alignment gaps** between stated goals and actual activity.
-- **Meta** — generates working **assumptions** and **mental models**, audits past decisions.
+- **Attention** — tracks focus areas, neglected entities, cognitive load, and **alignment gaps** between stated goals and actual activity. Now includes **mood tracking** (explicit logs + episode-based inference with valence/energy dimensions) and **health signals** (sleep, exercise, sickness, nutrition from episode keyword analysis).
+- **Meta** — generates working **assumptions** and **mental models** (semantically retrievable via embedding search), audits past decisions, distills **principles** from decision history. Mental models and assumptions are available as `context()` for prompt injection, parallel to the knowledge graph `graph_context()`.
 
 ### 🎨 Studio · 🌍 Simulation · ✅ Evaluation · 🎯 Goals
 An infinite canvas for raw ideas that can *graduate* into projects; a world-modeling layer for tracked assumptions and what-if scenarios; gate-checks and scorers for quality; and goal/task containers that the reflection loop keeps honest.
@@ -252,7 +252,7 @@ hermes config set memory.provider curlyos
 | `/api/graph/{id}/expand?k=` | GET | Expand a node's neighbourhood (k hops) |
 | `/api/identity` | GET/POST | Stable self-model |
 | `/api/cognition/narrative/compose` | POST | Compose a grounded first-person narrative for a query |
-| `/api/reflection/*` · `/api/meta/*` · `/api/attention/*` | POST | Run reflection, generate assumptions/models, scan attention |
+| `/api/reflection/*` · `/api/meta/*` · `/api/attention/*` | POST/GET | Unified reflection (daily/weekly/monthly), decision audits, attention scans, mood logging, health signals, mental model context/search |
 | `/api/observability/llm` | GET | Per-tier LLM health: provider, model, calls, errors, fallbacks, latency |
 | `/api/observability/recall` | GET | Recall throughput + cache hit-rate + cold/warm latency |
 | `/api/observability/pipeline` | GET | Ingest pipeline backlog (embed/distill), ingest rate, KG size |

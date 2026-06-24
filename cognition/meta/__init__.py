@@ -14,13 +14,16 @@ See: ~/hitenos-architecture/34-meta-cognition.md
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Sequence
 
 from shared.types.ulid import mint
 from shared.events import build_event
 from shared.llm import first_json
+
+EMBED_DIM = 1024
 
 log = logging.getLogger("curlyos.metacog")
 
@@ -86,6 +89,14 @@ CREATE TABLE IF NOT EXISTS principles (
 
 CREATE INDEX IF NOT EXISTS idx_assumptions_scope ON assumptions (scope, domain) WHERE valid_to IS NULL;
 CREATE INDEX IF NOT EXISTS idx_principles_scope ON principles (scope, domain) WHERE valid_to IS NULL;
+"""
+
+# ── DDL migration: mental_models embedding column ────────────────────────────
+
+MENTAL_MODELS_EMBEDDING_DDL = """
+ALTER TABLE mental_models ADD COLUMN IF NOT EXISTS embedding vector(1024);
+CREATE INDEX IF NOT EXISTS idx_mdl_hnsw ON mental_models
+  USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=100);
 """
 
 
@@ -201,18 +212,39 @@ async def create_mental_model(
     description: str,
     domain: str = "general",
     source_episode_id: str | None = None,
+    embedder: Any = None,
 ) -> dict:
-    """Insert a new mental model."""
+    """Insert a new mental model. Optionally generates an embedding for
+    semantic similarity search when `embedder` is provided."""
     model_id = mint("mdl")
+
+    # Generate embedding if embedder is provided
+    embedding: Sequence[float] | None = None
+    if embedder is not None:
+        embed_text = f"{name}: {description}" if description else name
+        try:
+            embedding = await embedder.embed_single(embed_text)
+        except Exception as e:
+            log.warning("Embedding generation failed for mental model %s: %s", model_id, e)
+
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(
-                "INSERT INTO mental_models "
-                "  (id, scope, name, domain, description) "
-                "VALUES (%s, %s, %s, %s, %s) "
-                "RETURNING id, valid_from",
-                (model_id, scope, name, domain, description),
-            )
+            if embedding is not None:
+                await cur.execute(
+                    "INSERT INTO mental_models "
+                    "  (id, scope, name, domain, description, embedding) "
+                    "VALUES (%s, %s, %s, %s, %s, %s::vector) "
+                    "RETURNING id, valid_from",
+                    (model_id, scope, name, domain, description, str(embedding)),
+                )
+            else:
+                await cur.execute(
+                    "INSERT INTO mental_models "
+                    "  (id, scope, name, domain, description) "
+                    "VALUES (%s, %s, %s, %s, %s) "
+                    "RETURNING id, valid_from",
+                    (model_id, scope, name, domain, description),
+                )
             row = await cur.fetchone()
             mid, vf = row
 
@@ -709,3 +741,83 @@ async def add_principle(
             )
             pid, vf = await cur.fetchone()
     return {"id": pid, "statement": statement, "epistemic_status": epistemic_status}
+
+
+# ── Mental model context (prompt injection) ───────────────────────────────────
+
+async def mental_model_context(
+    pool: Any,
+    scope: str,
+    domain: str | None = None,
+    limit: int = 10,
+) -> str:
+    """Compact text summary of active mental models for prompt injection.
+
+    Returns something like:
+      "Active mental models:
+       - First Principles [tooling] — break down to fundamentals
+       - Inversion [general] — consider the opposite of what you want"
+    """
+    models = await get_mental_models(pool, scope, domain=domain)
+    if not models:
+        return ""
+    lines = ["Active mental models:"]
+    for m in models[:limit]:
+        lines.append(f"- {m['name']} [{m['domain']}] — {m['description'][:120]}")
+    return "\n".join(lines)
+
+
+async def relevant_models(
+    pool: Any,
+    scope: str,
+    query_embedding: Sequence[float],
+    limit: int = 5,
+) -> list[dict]:
+    """Retrieve mental models by embedding similarity. Requires the mental_models
+    table to have the embedding column populated (use create_mental_model with
+    embedder, or backfill). Returns models with a similarity score."""
+    vec_str = "[" + ",".join(f"{float(x):.6f}" for x in query_embedding) + "]"
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, scope, name, domain, description, confidence, version, "
+                "  1 - (embedding <=> %s::vector) AS similarity "
+                "FROM mental_models "
+                "WHERE scope = %s AND valid_to IS NULL AND embedding IS NOT NULL "
+                "ORDER BY embedding <=> %s::vector LIMIT %s",
+                (vec_str, scope, vec_str, limit),
+            )
+            rows = await cur.fetchall()
+
+    return [
+        {
+            "id": r[0], "scope": r[1], "name": r[2], "domain": r[3],
+            "description": r[4], "confidence": float(r[5]),
+            "version": r[6], "similarity": float(r[7]),
+        }
+        for r in rows
+    ]
+
+
+# ── Assumption context (prompt injection) ─────────────────────────────────────
+
+async def assumption_context(
+    pool: Any,
+    scope: str,
+    domain: str | None = None,
+    limit: int = 10,
+) -> str:
+    """Compact text summary of active assumptions for prompt injection.
+
+    Returns something like:
+      "Active assumptions:
+       - [work] CurlyOS will reach 10k users (confidence 0.7)
+       - [health] Morning runs improve focus (confidence 0.6)"
+    """
+    assumptions = await get_assumptions(pool, scope, domain=domain)
+    if not assumptions:
+        return ""
+    lines = ["Active assumptions:"]
+    for a in assumptions[:limit]:
+        lines.append(f"- [{a['domain']}] {a['statement'][:150]} (confidence {a['confidence']:.1f})")
+    return "\n".join(lines)
