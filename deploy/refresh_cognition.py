@@ -89,6 +89,7 @@ async def main():
     log(f"mood={mood.get('mood')} health_sleep={health.get('sleep', {}).get('mentions', 0)}")
 
     # 3. Narrative (supersedes old themes + chapters).
+    themes = await surface_themes(pool=pool, publisher=pub, scope=SCOPE, min_frequency=3)
     chapters = await compose_chapters(pool=pool, publisher=pub, scope=SCOPE,
                                       llm_client=llm, llm_model=model)
     log(f"narrative: themes={len(themes)} chapters={len(chapters)} top={[t.get('name') for t in themes[:8]]}")
