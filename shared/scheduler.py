@@ -170,7 +170,34 @@ class Scheduler:
                 pass
 
     # ── loop ─────────────────────────────────────────────────────────────────
+    async def _reconcile_orphaned_runs(self) -> None:
+        """Close `running` rows left behind by a crash or a kill.
+
+        A firing writes its row before the job body runs and closes it after.
+        If the process dies in between, the row stays `running` forever and the
+        heartbeat shows a job that appears to be stuck. Nothing else can be
+        writing those rows at this point — the loop has not started yet — so
+        they are all orphans.
+        """
+        try:
+            pool = await self._pool_factory()
+            async with pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE agent_runs SET status = 'failed', "
+                        "error = COALESCE(error, 'interrupted: no close record "
+                        "(process restarted or crashed mid-run)'), "
+                        "finished_at = COALESCE(finished_at, created_at) "
+                        "WHERE status = 'running'"
+                    )
+                    if cur.rowcount:
+                        log.warning("scheduler: closed %d orphaned 'running' run(s)",
+                                    cur.rowcount)
+        except Exception as exc:  # noqa: BLE001 — never block the loop on bookkeeping
+            log.warning("scheduler: could not reconcile orphaned runs (%s)", exc)
+
     async def _loop(self) -> None:
+        await self._reconcile_orphaned_runs()
         while not self._stopping.is_set():
             now = datetime.now()
             for job in self.jobs:
@@ -322,6 +349,37 @@ class Scheduler:
         except Exception:  # noqa: BLE001
             log.warning("scheduler: failure notification for %s could not be sent", job.name)
 
+    # ── manual firing ────────────────────────────────────────────────────────
+    async def trigger(self, name: str) -> dict:
+        """Fire one job now, on request.
+
+        Goes through `fire()` — the same single-flight lock, period guard,
+        agent_runs row and events as a scheduled firing — so a manual run can
+        never double-fire alongside the loop or skip bookkeeping. Returns the
+        outcome instead of raising, because "this period's output already
+        exists" is a normal answer here, not an error.
+        """
+        job = next((j for j in self.jobs if j.name == name), None)
+        if job is None:
+            raise KeyError(name)
+        if not job.enabled:
+            return {"job": name, "status": "disabled", "run_id": None,
+                    "duration_ms": None, "error": None, "result": None}
+
+        started = datetime.now()
+        result = await self.fire(job)
+        # `fire()` leaves the loop to advance next_due; do it here so a manual
+        # run doesn't leave the job due and fire it again a second later.
+        job.next_due = job.cadence.next_due(datetime.now(), job.last_fired)
+        return {
+            "job": job.name,
+            "status": job.last_status,
+            "run_id": job.last_run_id,
+            "duration_ms": int((datetime.now() - started).total_seconds() * 1000),
+            "error": job.last_error,
+            "result": result,
+        }
+
     # ── observability ────────────────────────────────────────────────────────
     def snapshot(self) -> dict:
         return {
@@ -337,6 +395,7 @@ class Scheduler:
                     "last_status": j.last_status,
                     "last_error": j.last_error,
                     "last_run_id": j.last_run_id,
+                    "last_duration_ms": None,   # filled from agent_runs by /api/scheduler
                     "consecutive_failures": j.consecutive_failures,
                 }
                 for j in self.jobs

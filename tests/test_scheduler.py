@@ -156,7 +156,7 @@ async def test_fire_success_records_run_row_and_events():
     assert result == {"did": "things"}
     assert job.last_status == "completed" and job.consecutive_failures == 0
     assert job.last_run_id and job.last_run_id.startswith("run_")
-    insert = next(s for s, _ in pool.sql_log if s.startswith("INSERT INTO agent_runs"))
+    assert any(s.startswith("INSERT INTO agent_runs") for s, _ in pool.sql_log)
     assert "workflow:" in str(pool.sql_log)
     update = next((s, p) for s, p in pool.sql_log if s.startswith("UPDATE agent_runs"))
     assert update[1][0] == "completed"
@@ -255,3 +255,91 @@ def test_snapshot_shape():
     assert snap["jobs"][0]["name"] == "snap"
     assert snap["jobs"][0]["cadence"] == "daily 03:05"
     assert snap["jobs"][0]["last_status"] == "never"
+
+
+# ── trigger() — the manual POST /api/scheduler/run/{name} path ────────────────
+@pytest.mark.asyncio
+async def test_trigger_runs_the_job_and_reports_the_outcome():
+    async def job_fn():
+        return {"found": 3}
+
+    job = Job("attention_scan", Every(15), job_fn)
+    sched, pool = _scheduler(job, redis=FakeRedis())
+    out = await sched.trigger("attention_scan")
+
+    assert out["job"] == "attention_scan"
+    assert out["status"] == "completed" and out["error"] is None
+    assert out["result"] == {"found": 3}
+    assert out["run_id"].startswith("run_")
+    assert isinstance(out["duration_ms"], int) and out["duration_ms"] >= 0
+    # Same bookkeeping as a scheduled firing: a run row was opened and closed.
+    assert any(s.startswith("INSERT INTO agent_runs") for s, _ in pool.sql_log)
+    assert any(s.startswith("UPDATE agent_runs") for s, _ in pool.sql_log)
+
+
+@pytest.mark.asyncio
+async def test_trigger_advances_next_due_so_the_loop_does_not_refire():
+    job = Job("once", Every(15), _async_return({}))
+    sched, _ = _scheduler(job, redis=None)
+    await sched.trigger("once")
+    assert job.next_due > datetime.now() + timedelta(minutes=14)
+
+
+@pytest.mark.asyncio
+async def test_trigger_unknown_job_raises_keyerror():
+    job = Job("known", Every(15), _async_return({}))
+    sched, _ = _scheduler(job, redis=None)
+    with pytest.raises(KeyError):
+        await sched.trigger("nope")
+
+
+@pytest.mark.asyncio
+async def test_trigger_disabled_job_does_nothing():
+    fired = []
+
+    async def job_fn():
+        fired.append(1)
+        return {}
+
+    job = Job("off", Every(15), job_fn, enabled=False)
+    sched, pool = _scheduler(job, redis=None)
+    out = await sched.trigger("off")
+    assert out["status"] == "disabled" and out["run_id"] is None
+    assert not fired and not pool.sql_log
+
+
+@pytest.mark.asyncio
+async def test_trigger_reports_a_skip_as_a_status_not_an_error():
+    async def guard():
+        return True
+
+    job = Job("guarded", WeeklyAt((0,), "06:20"), _async_return({}), period_guard=guard)
+    sched, _ = _scheduler(job, redis=FakeRedis())
+    out = await sched.trigger("guarded")
+    assert out["status"] == "skipped_period_done" and out["error"] is None
+    assert out["result"] is None
+
+
+# ── orphan reconciliation at startup ──────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_reconcile_closes_rows_left_running_by_a_crash():
+    job = Job("any", Every(15), _async_return({}))
+    sched, pool = _scheduler(job, redis=None)
+    await sched._reconcile_orphaned_runs()
+
+    sql, _ = next((s, p) for s, p in pool.sql_log if s.startswith("UPDATE agent_runs"))
+    assert "status = 'failed'" in sql
+    assert "WHERE status = 'running'" in sql
+    assert "interrupted" in sql  # the reason is recorded, not just the status
+
+
+@pytest.mark.asyncio
+async def test_reconcile_never_blocks_the_loop_when_the_db_is_down():
+    job = Job("any", Every(15), _async_return({}))
+
+    async def broken_pool():
+        raise ConnectionError("postgres down")
+
+    sched = Scheduler([job], scope=SCOPE, pool_factory=broken_pool,
+                      publisher_factory=FakePublisher, redis_factory=lambda: None)
+    await sched._reconcile_orphaned_runs()  # must not raise

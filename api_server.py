@@ -2468,13 +2468,142 @@ def _scheduler_jobs():
     ]
 
 
+def _duration_ms(start, end) -> int | None:
+    if start is None or end is None:
+        return None
+    return int((end - start).total_seconds() * 1000)
+
+
+def _scheduler_last_runs() -> dict[str, dict]:
+    """Newest `agent_runs` row per scheduled workflow, keyed by job name.
+
+    The scheduler's own `last_fired`/`last_status` live on in-memory Job
+    objects and reset on every restart, which made the heartbeat page read
+    "never" for jobs that had in fact run — the history was in Postgres the
+    whole time. This is that history, one indexed pass.
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT ON (agent) agent, id, status, error, created_at, finished_at "
+            "FROM agent_runs WHERE starts_with(agent, 'workflow:') "
+            "ORDER BY agent, created_at DESC"
+        ).fetchall()
+    out: dict[str, dict] = {}
+    for r in rows:
+        out[r["agent"].partition(":")[2]] = {
+            "run_id": r["id"],
+            "status": r["status"],
+            "error": r["error"],
+            "fired_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "duration_ms": _duration_ms(r["created_at"], r["finished_at"]),
+        }
+    return out
+
+
 @app.get("/api/scheduler")
-async def scheduler_status(request: Request):
-    """The heartbeat table: every background job, its cadence, last/next fire."""
+def scheduler_status(request: Request):
+    """The heartbeat table: every background job, its cadence, last/next fire.
+
+    Last-run fields are read from `agent_runs`, not from memory, so they
+    survive a restart. In-memory state still wins for `skipped_locked` /
+    `skipped_period_done`, because a skipped firing returns before a run row
+    is ever written and would otherwise be invisible.
+    """
     sched = getattr(request.app.state, "scheduler", None)
     if sched is None:
         return {"running": False, "reason": "CURLYOS_SCHEDULER disabled", "jobs": []}
-    return sched.snapshot()
+
+    snap = sched.snapshot()
+    try:
+        history = _scheduler_last_runs()
+    except Exception as exc:  # noqa: BLE001 — the heartbeat must render regardless
+        snap["history_error"] = str(exc)[:200]
+        history = {}
+
+    for job in snap["jobs"]:
+        row = history.get(job["name"])
+        if not row:
+            continue
+        if str(job["last_status"]).startswith("skipped_"):
+            continue
+        job["last_fired"] = row["fired_at"]
+        job["last_status"] = row["status"]
+        job["last_error"] = row["error"]
+        job["last_run_id"] = row["run_id"]
+        job["last_duration_ms"] = row["duration_ms"]
+    return snap
+
+
+@app.post("/api/scheduler/run/{name}")
+async def run_scheduler_job(name: str, request: Request):
+    """Fire one scheduled job now.
+
+    Same lock and period guard as a scheduled firing: if this period's output
+    already exists you get `skipped_period_done` back, not a duplicate run.
+    Blocks until the job finishes (seconds for most, longer for a deep
+    consolidation).
+    """
+    sched = getattr(request.app.state, "scheduler", None)
+    if sched is None:
+        raise HTTPException(status_code=503, detail="scheduler disabled (CURLYOS_SCHEDULER=0)")
+    try:
+        return await sched.trigger(name)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"no such job: {name}")
+
+
+@app.get("/api/agent-runs")
+def list_agent_runs(
+    agent: str | None = None,
+    status: str | None = None,
+    limit: int = Query(default=50, le=200),
+    offset: int = 0,
+):
+    """Background-job history: one row per firing, newest first.
+
+    Distinct from /api/scheduler (current heartbeat) — this is the record of
+    what actually happened, including firings from before the last restart.
+    """
+    conditions: list[str] = []
+    params: list[Any] = []
+    if agent:
+        conditions.append("agent = %s")
+        params.append(agent)
+    if status:
+        conditions.append("status = %s")
+        params.append(status)
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    with get_conn() as conn:
+        total = conn.execute(
+            f"SELECT count(*) AS n FROM agent_runs{where}", params
+        ).fetchone()["n"]
+        by_status = {
+            r["status"]: r["n"] for r in conn.execute(
+                "SELECT status, count(*) AS n FROM agent_runs GROUP BY status"
+            ).fetchall()
+        }
+        rows = conn.execute(
+            "SELECT id, agent, task, status, error, created_at, finished_at "
+            f"FROM agent_runs{where} ORDER BY created_at DESC LIMIT %s OFFSET %s",
+            params + [limit, offset],
+        ).fetchall()
+
+    items = [
+        {
+            "run_id": r["id"],
+            "agent": r["agent"],
+            "job": r["agent"].partition(":")[2] if r["agent"].startswith("workflow:") else None,
+            "task": r["task"],
+            "status": r["status"],
+            "error": r["error"],
+            "started_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
+            "duration_ms": _duration_ms(r["created_at"], r["finished_at"]),
+        }
+        for r in rows
+    ]
+    return {"items": items, "count": len(items), "total": total, "by_status": by_status}
 
 
 # ---------------------------------------------------------------------------

@@ -375,6 +375,8 @@ dependencies = [
 
 [package.optional-dependencies]
 all = [
+    { name = "httpx" },
+    { name = "mcp" },
     { name = "openai" },
     { name = "pgvector" },
     { name = "psycopg", extra = ["binary", "pool"] },
@@ -411,7 +413,7 @@ reranker = [
 
 [package.metadata]
 requires-dist = [
-    { name = "curlyos-core", extras = ["postgres", "redis", "embeddings", "reranker", "llm"], marker = "extra == 'all'" },
+    { name = "curlyos-core", extras = ["mcp", "postgres", "redis", "embeddings", "reranker", "llm"], marker = "extra == 'all'" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "httpx", marker = "extra == 'mcp'", specifier = ">=0.27,<1" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.26,<2" },
