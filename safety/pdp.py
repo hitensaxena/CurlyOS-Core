@@ -81,6 +81,14 @@ class SecurityRisk(str, Enum):
     HIGH = "high"
 
 
+def scope_parts(scope_text: str) -> dict[str, str]:
+    """'user:usr_hiten' → {'level': 'user', 'user_id': 'usr_hiten'} (event scope)."""
+    level, sep, rest = scope_text.partition(":")
+    if not sep:
+        return {"level": "user", "user_id": scope_text}
+    return {"level": level, "user_id": rest}
+
+
 # ---------------------------------------------------------------------------
 # Frozen PDP domain (specs/09 architecture.md §2–§3; spike-04 config.py)
 # ---------------------------------------------------------------------------

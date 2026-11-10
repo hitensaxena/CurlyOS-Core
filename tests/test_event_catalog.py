@@ -14,7 +14,7 @@ from shared.events.catalog import (
     validate_short_type,
 )
 
-_GROUPS = {"MEMORY", "AGENTS", "SAFETY", "EVENTS", "EVOLUTION"}
+_GROUPS = {"MEMORY", "AGENTS", "SAFETY", "EVENTS"}
 
 
 def test_catalog_entries_are_well_formed():
@@ -33,9 +33,12 @@ def test_every_live_emit_site_type_is_registered():
         "knowledge.entity.created", "knowledge.entity.invalidated",
         "knowledge.edge.created", "knowledge.edge.invalidated",
         "metacog.assumption.created", "metacog.model.created",
-        "studio.created", "studio.sketch.created", "studio.sketch.updated",
-        "studio.sketch.invalidated", "studio.sketch.graduated", "studio.sketches.linked",
-        "simulation.run.created", "simulation.run.completed", "simulation.run.forked",
+        "cognition.reflection.completed", "cognition.audit.completed",
+        "memory.consolidation.fast", "memory.consolidation.deep",
+        "goal.created", "goal.updated", "goal.invalidated",
+        "decision.recorded", "decision.reviewed",
+        "opportunity.detected", "opportunity.resolved",
+        "agent.run.started", "agent.run.completed", "agent.run.failed",
     ]
     for t in live:
         assert t in EVENT_CATALOG, t
@@ -55,7 +58,7 @@ def test_build_event_rejects_unregistered_type():
 
 
 def test_helpers_round_trip():
-    short = "safety.approval.requested"
+    short = "safety.kill.triggered"
     assert short_of(full_type(short)) == short
     assert subject_for(short) == "curlyos." + short
     assert group_for(short) == "SAFETY"

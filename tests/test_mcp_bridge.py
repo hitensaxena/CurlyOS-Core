@@ -13,12 +13,11 @@ from mcp_server import server
 async def test_tool_surface():
     tools = await server.mcp.list_tools()
     assert {t.name for t in tools} == {
-        "recall", "add_fact", "add_note", "invalidate", "identity", "list_goals",
-        "list_opportunities", "list_projects", "list_runs", "get_run", "list_inbox",
-        "list_approvals", "start_run", "resume_run", "cancel_run", "approve", "deny",
+        "recall", "add_fact", "add_note", "invalidate", "identity",
+        "list_goals", "list_opportunities",
     }
     assert next(t for t in tools if t.name == "recall").annotations.readOnlyHint
-    assert not next(t for t in tools if t.name == "approve").annotations.readOnlyHint
+    assert not next(t for t in tools if t.name == "add_fact").annotations.readOnlyHint
 
 
 @pytest.mark.asyncio
@@ -51,17 +50,6 @@ async def test_cached_recall_has_provenance_and_filters_invalidated(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_project_filter_preserves_scope(monkeypatch):
-    async def fake(*args, **kwargs):
-        return {"items": [{"scope": server.SCOPE, "status": "active"},
-                          {"scope": server.SCOPE, "status": "done"},
-                          {"scope": "user:other", "status": "active"}]}
-    monkeypatch.setattr(server, "_api", fake)
-    result = await server.list_projects("active")
-    assert result["items"] == [{"scope": server.SCOPE, "status": "active"}]
-
-
-@pytest.mark.asyncio
 async def test_ingest_errors_are_not_reported_as_success(monkeypatch):
     class Client:
         def __init__(self, **kwargs): pass
@@ -72,14 +60,6 @@ async def test_ingest_errors_are_not_reported_as_success(monkeypatch):
     monkeypatch.setattr(server.httpx, "AsyncClient", Client)
     with pytest.raises(ValueError, match="database write failed"):
         await server.add_fact("a real fact")
-
-
-@pytest.mark.asyncio
-async def test_approval_and_identifier_validation():
-    with pytest.raises(ValueError):
-        await server.approve("not-an-approval")
-    with pytest.raises(ValueError):
-        await server.get_run("../../api/safety/kill")
 
 
 def test_capture_excludes_system_tools_and_analysis(tmp_path):

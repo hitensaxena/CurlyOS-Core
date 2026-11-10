@@ -79,7 +79,7 @@ async def set_kill(
     await redis.set(key, set_by)
 
     if publisher is not None and pool is not None:
-        from agent.pdp_gate import scope_parts  # noqa: PLC0415
+        from safety.pdp import scope_parts  # noqa: PLC0415
         from shared.events import build_event  # noqa: PLC0415
 
         parts = scope_parts(scope_text)

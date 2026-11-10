@@ -3,12 +3,13 @@
 Adapted from the build repo's validated catalog (00b-shared-canon §8 grammar:
 `art.curlybrackets.curlyos.<short>`), with two recorded changes for curlyos-core:
 
-1. The catalog value is a DOMAIN GROUP (MEMORY / AGENTS / SAFETY / EVENTS /
-   EVOLUTION), not a NATS stream — there is no NATS here (deviation DR-C1).
-   Groups drive SSE filtering and any future bus mapping.
-2. The set is the UNION of every type curlyos-core already emits (verified by
-   grep at lift time — renaming live types would break event-log continuity)
-   plus the agent/safety types the Phase-A runtime emits.
+1. The catalog value is a DOMAIN GROUP (MEMORY / AGENTS / SAFETY / EVENTS),
+   not a NATS stream — there is no NATS here (deviation DR-C1).
+2. The set is exactly the types this repo emits today. The 2026-11-10 lean
+   refactor deleted the studio / simulation / evolution / plan-and-task event
+   families along with the packages that emitted them; historical rows with
+   those types remain in `events` and are still readable, they simply can no
+   longer be written.
 
 CLOSED means closed: `build_event()` rejects a short type not listed here.
 Adding an event type is a deliberate one-line registration in this file,
@@ -20,73 +21,43 @@ FULL_TYPE_PREFIX = "art.curlybrackets.curlyos."
 SUBJECT_PREFIX = "curlyos."
 
 # short type → domain group.
+# short type → domain group. Every entry below has a live emitter in this
+# repository; anything without one was removed in the 2026-11-10 lean refactor.
 EVENT_CATALOG: dict[str, str] = {
-    # ── memory / identity / knowledge (live) ────────────────────────────────
+    # ── memory ──────────────────────────────────────────────────────────────
     "memory.episode.recorded": "MEMORY",
     "memory.fact.stored": "MEMORY",
     "memory.fact.consolidated": "MEMORY",
     "memory.fact.invalidated": "MEMORY",
+    "memory.consolidation.fast": "MEMORY",
+    "memory.consolidation.deep": "MEMORY",
+    # ── identity ────────────────────────────────────────────────────────────
     "identity.fact.updated": "MEMORY",
+    # ── knowledge graph ─────────────────────────────────────────────────────
     "knowledge.entity.created": "MEMORY",
     "knowledge.entity.invalidated": "MEMORY",
     "knowledge.edge.created": "MEMORY",
     "knowledge.edge.invalidated": "MEMORY",
-    # ── cognition (live) ─────────────────────────────────────────────────────
+    # ── cognition ───────────────────────────────────────────────────────────
     "metacog.assumption.created": "MEMORY",
     "metacog.model.created": "MEMORY",
     "cognition.reflection.completed": "MEMORY",
     "cognition.audit.completed": "MEMORY",
     "cognition.meta.models_generated": "MEMORY",
-    "memory.consolidation.fast": "MEMORY",
-    "memory.consolidation.deep": "MEMORY",
-    # ── creative / exploration (live) ────────────────────────────────────────
-    "studio.created": "EVENTS",
-    "studio.sketch.created": "EVENTS",
-    "studio.sketch.updated": "EVENTS",
-    "studio.sketch.invalidated": "EVENTS",
-    "studio.sketch.graduated": "EVENTS",
-    "studio.sketches.linked": "EVENTS",
-    "simulation.run.created": "EVENTS",
-    "simulation.run.completed": "EVENTS",
-    "simulation.run.forked": "EVENTS",
-    # ── goal OS (Phase G) ────────────────────────────────────────────────────
+    # ── goals / decisions / opportunities ───────────────────────────────────
     "goal.created": "EVENTS",
     "goal.updated": "EVENTS",
     "goal.invalidated": "EVENTS",
-    "goal.derived": "EVENTS",
-    # ── autonomous loop lifecycle (opportunity → goal → plan → task → verify) ──
-    "goal.plan.proposed": "EVENTS",
-    "goal.plan.approved": "EVENTS",
-    "goal.task.dispatched": "EVENTS",
-    "goal.task.verified": "EVENTS",
-    "goal.task.retry": "EVENTS",
-    "goal.progress": "EVENTS",
-    "goal.achieved": "EVENTS",
-    "goal.needs_work": "EVENTS",
     "decision.recorded": "EVENTS",
     "decision.reviewed": "EVENTS",
     "opportunity.detected": "EVENTS",
     "opportunity.resolved": "EVENTS",
-    # ── agent runtime (Phase A emits; lifted from build repo) ───────────────
+    # ── scheduler bookkeeping (shared/scheduler.py) ─────────────────────────
     "agent.run.started": "AGENTS",
     "agent.run.completed": "AGENTS",
     "agent.run.failed": "AGENTS",
-    "runtime.action.executed": "AGENTS",
-    "runtime.observation.recorded": "AGENTS",
-    "tool.call.invoked": "AGENTS",
-    # ── evolution (Phase E) ──────────────────────────────────────────────────
-    "evolution.candidate.proposed": "EVOLUTION",
-    "evolution.eval.completed": "EVOLUTION",
-    "evolution.candidate.held": "EVOLUTION",
-    "evolution.prompt.activated": "EVOLUTION",
-    # ── safety (lifted from build repo) ──────────────────────────────────────
-    "safety.approval.requested": "SAFETY",
-    "safety.approval.granted": "SAFETY",
-    "safety.approval.denied": "SAFETY",
-    "safety.approval.expired": "SAFETY",
+    # ── safety (emitted only by safety/killswitch.py) ───────────────────────
     "safety.kill.triggered": "SAFETY",
-    "safety.budget.exceeded": "SAFETY",
-    "safety.pdp.unavailable": "SAFETY",
 }
 
 

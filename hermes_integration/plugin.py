@@ -150,51 +150,6 @@ IDENTITY_SCHEMA = {
     },
 }
 
-PENDING_APPROVALS_SCHEMA = {
-    "name": "curlyos_pending_approvals",
-    "description": (
-        "List CurlyOS approvals waiting on Hiten — agent actions parked until a "
-        "human grants or denies them. Use when Hiten asks what's pending, or to "
-        "find the apv_ id before curlyos_approve / curlyos_deny."
-    ),
-    "parameters": {"type": "object", "properties": {}, "required": []},
-}
-
-APPROVE_SCHEMA = {
-    "name": "curlyos_approve",
-    "description": (
-        "Grant a pending CurlyOS approval — the parked agent run resumes and "
-        "executes the gated action. ONLY call this when Hiten explicitly says to "
-        "approve/grant (e.g. 'approve apv_…'). Never approve on your own judgment. "
-        "If Hiten says 'approve' without an id, list pending approvals first and "
-        "confirm which one he means unless exactly one is pending."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "apv_id": {"type": "string", "description": "Approval id (apv_…)."},
-        },
-        "required": ["apv_id"],
-    },
-}
-
-DENY_SCHEMA = {
-    "name": "curlyos_deny",
-    "description": (
-        "Deny a pending CurlyOS approval — the parked agent run resumes, records "
-        "the denial, and skips the gated action. ONLY call this when Hiten "
-        "explicitly says to deny/reject."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "apv_id": {"type": "string", "description": "Approval id (apv_…)."},
-            "reason": {"type": "string", "description": "Why it was denied (optional)."},
-        },
-        "required": ["apv_id"],
-    },
-}
-
 
 # ---------------------------------------------------------------------------
 # CurlyOS MemoryProvider
@@ -258,15 +213,12 @@ class CurlyOSMemoryProvider(MemoryProvider):
             "- curlyos_add_note: store longer notes / reference material\n"
             "- curlyos_invalidate: soft-invalidate outdated facts (never deletes)\n"
             "- curlyos_identity: query Hiten's stable self-model\n"
-            "- curlyos_pending_approvals / curlyos_approve / curlyos_deny: agent "
-            "actions parked for Hiten's sign-off ('CurlyOS run … needs approval' "
-            "messages). Grant or deny ONLY on Hiten's explicit instruction.\n"
             "Facts are invalidated-not-deleted. Always check curlyos_recall first."
         )
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [RECALL_SCHEMA, ADD_FACT_SCHEMA, ADD_NOTE_SCHEMA, INVALIDATE_SCHEMA,
-                IDENTITY_SCHEMA, PENDING_APPROVALS_SCHEMA, APPROVE_SCHEMA, DENY_SCHEMA]
+                IDENTITY_SCHEMA]
 
     def get_config_schema(self):
         return [
@@ -331,45 +283,6 @@ class CurlyOSMemoryProvider(MemoryProvider):
                     for it in data.get("items", [])
                 ]
                 return json.dumps({"identity": identity, "count": len(identity)})
-
-            elif tool_name == "curlyos_pending_approvals":
-                data = _api("GET", "/api/approvals", timeout=15)
-                items = [
-                    {"apv_id": it.get("apv_id"), "action_class": it.get("action_class"),
-                     "origin": it.get("origin"), "run_id": it.get("run_id"),
-                     "payload": json.dumps(it.get("payload") or {})[:300],
-                     "expires_at": it.get("expires_at")}
-                    for it in data.get("items", [])
-                ]
-                return json.dumps({"pending": items, "count": len(items)})
-
-            elif tool_name == "curlyos_approve":
-                apv_id = (args.get("apv_id") or "").strip()
-                if not apv_id.startswith("apv_"):
-                    return tool_error(
-                        "curlyos_approve needs an explicit apv_… id — "
-                        "use curlyos_pending_approvals to find it")
-                data = _api("POST", f"/api/approvals/{apv_id}/grant", timeout=30)
-                return json.dumps({"result": "Approval granted.",
-                                   "apv_id": data.get("apv_id"),
-                                   "action_class": data.get("action_class"),
-                                   "run_id": data.get("run_id"),
-                                   "run_resumed": data.get("resumed", False)})
-
-            elif tool_name == "curlyos_deny":
-                apv_id = (args.get("apv_id") or "").strip()
-                if not apv_id.startswith("apv_"):
-                    return tool_error(
-                        "curlyos_deny needs an explicit apv_… id — "
-                        "use curlyos_pending_approvals to find it")
-                data = _api("POST", f"/api/approvals/{apv_id}/deny",
-                            {"reason": (args.get("reason") or "user_denied")[:500]},
-                            timeout=30)
-                return json.dumps({"result": "Approval denied.",
-                                   "apv_id": data.get("apv_id"),
-                                   "action_class": data.get("action_class"),
-                                   "run_id": data.get("run_id"),
-                                   "run_resumed": data.get("resumed", False)})
 
             return tool_error(f"Unknown tool: {tool_name}")
         except Exception as e:

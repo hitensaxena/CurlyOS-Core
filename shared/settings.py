@@ -15,20 +15,8 @@ from __future__ import annotations
 import time
 from typing import Any
 
-AGENT_BYPASS = "agent_bypass"  # bool: run agent side effects without approval
-
 # key -> (type, default, category, description). type ∈ {bool, int, float, str}.
 SETTINGS_REGISTRY: dict[str, dict[str, Any]] = {
-    # autonomy
-    "auto_promote": {"type": "bool", "default": True, "category": "autonomy",
-                     "description": "Promote high-scoring opportunities into goals automatically."},
-    "auto_plan": {"type": "bool", "default": True, "category": "autonomy",
-                  "description": "Decompose active goals into plans automatically (autoplan sweep)."},
-    "auto_execute": {"type": "bool", "default": False, "category": "autonomy",
-                     "description": "Autonomously approve + dispatch proposed goal plans, closing the full opportunity→goal→agent→verify loop without a human click. Per-action safety is still enforced by the policy gate (PDP)."},
-    # safety
-    "agent_bypass": {"type": "bool", "default": False, "category": "safety",
-                     "description": "Run agent side effects without human approval. Use with care."},
     # recall
     "recall_cache_enabled": {"type": "bool", "default": True, "category": "recall",
                              "description": "Cache /api/recall results in Redis (per-scope, generation-invalidated)."},

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from orchestration.scheduler import DailyAt, Every, Job, MonthlyAt, Scheduler, WeeklyAt
+from shared.scheduler import DailyAt, Every, Job, MonthlyAt, Scheduler, WeeklyAt
 
 SCOPE = "user:usr_test"
 T = datetime(2026, 6, 10, 14, 30)  # a Wednesday

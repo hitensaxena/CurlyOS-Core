@@ -21,7 +21,7 @@ from datetime import datetime, timezone, timedelta
 import logging
 from typing import Any
 
-from agent.pdp_gate import scope_parts
+from shared.scope import scope_parts
 from shared.events import build_event
 from shared.types.ulid import mint
 

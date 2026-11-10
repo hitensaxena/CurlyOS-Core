@@ -260,7 +260,7 @@ class Scheduler:
 
     # ── run-row + event bookkeeping ──────────────────────────────────────────
     async def _open_run(self, pool: Any, pub: Any, run_id: str, job: Job) -> None:
-        from agent.pdp_gate import scope_parts
+        from shared.scope import scope_parts
         from shared.events import build_event
 
         async with pool.connection() as conn:
@@ -281,7 +281,7 @@ class Scheduler:
 
     async def _close_run(self, pool: Any, pub: Any, run_id: str, job: Job,
                          result: Any, error: str | None) -> None:
-        from agent.pdp_gate import scope_parts
+        from shared.scope import scope_parts
         from psycopg.types.json import Jsonb
         from shared.events import build_event
 
