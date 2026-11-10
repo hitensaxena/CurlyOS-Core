@@ -9,8 +9,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
       # Tests mock their DB pools (AsyncMock) — no service containers needed.
       # Heavy extras (embeddings/torch, neo4j, nats) deliberately excluded.
       # `mcp` is needed by tests/test_mcp_bridge.py (FastMCP client needs httpx).
