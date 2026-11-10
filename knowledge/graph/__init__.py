@@ -17,6 +17,7 @@ from typing import Any
 
 from shared.types.ulid import mint, is_valid
 from shared.events import build_event
+from shared.scope import scope_parts
 
 log = logging.getLogger("curlyos.knowledge.graph")
 
@@ -293,13 +294,16 @@ async def create_edge(
 
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
-            # Validate source entity exists
+            # Validate source entity exists, and take its scope for the event:
+            # an edge belongs to the same scope as the entity it starts from.
             await cur.execute(
-                "SELECT id FROM knowledge_entities WHERE id = %s AND valid_to IS NULL",
+                "SELECT id, scope FROM knowledge_entities WHERE id = %s AND valid_to IS NULL",
                 (src_entity_id,),
             )
-            if await cur.fetchone() is None:
+            src_row = await cur.fetchone()
+            if src_row is None:
                 raise ValueError(f"Source entity {src_entity_id} not found or invalidated")
+            edge_scope = src_row[1] or ""
 
             # Validate destination entity exists
             await cur.execute(
@@ -326,7 +330,7 @@ async def create_edge(
         event = build_event(
             short_type="knowledge.edge.created",
             subject=edge_id,
-            scope={"level": "user"},
+            scope=scope_parts(edge_scope),
             data={
                 "edge_id": edge_id,
                 "src_entity_id": src_entity_id,

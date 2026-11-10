@@ -3,7 +3,7 @@
 import pytest
 
 from shared.events import build_event, full_type, short_type, EventPublisher
-from shared.events.implementations import PgOnlyPublisher, PgNatsPublisher
+from shared.events.implementations import PgOnlyPublisher, PgNatsPublisher, _stored_scope
 
 
 FULL_PREFIX = "art.curlybrackets.curlyos."
@@ -98,3 +98,71 @@ class TestPgNatsPublisher:
         pub = PgNatsPublisher(nats_client=FakeNats(), stream="CURLYOS_TEST")
         assert pub._nats is not None
         assert pub._stream == "CURLYOS_TEST"
+
+
+class TestStoredScope:
+    """`events.scope` must carry the full "level:id" string.
+
+    A row stored as bare "user" never matches the scoped query behind /api/events,
+    so it is written successfully and silently invisible. 34k rows were lost this
+    way — mostly knowledge.edge.created.
+    """
+
+    def test_envelope_parts(self):
+        assert _stored_scope({"level": "user", "user_id": "usr_hiten"}, {}) == "user:usr_hiten"
+
+    def test_legacy_envelope_shape(self):
+        assert _stored_scope({"scope": "user:usr_hiten"}, {}) == "user:usr_hiten"
+
+    def test_bare_level_never_beats_a_full_string_in_data(self):
+        assert _stored_scope({"level": "user"}, {"scope": "user:usr_hiten"}) == "user:usr_hiten"
+
+    def test_bare_string_envelope(self):
+        assert _stored_scope("user:usr_hiten", {}) == "user:usr_hiten"
+
+    def test_no_scope_anywhere_falls_back_to_level(self):
+        assert _stored_scope(None, {}) == "user"
+
+
+class _ScopeCursor:
+    def __init__(self, log):
+        self.log = log
+
+    async def execute(self, sql, params=None):
+        self.log.append(params)
+
+    async def fetchone(self):
+        return (1,)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _ScopeConn:
+    def __init__(self, log):
+        self.log = log
+
+    def cursor(self):
+        return _ScopeCursor(self.log)
+
+
+@pytest.mark.asyncio
+async def test_stage_writes_the_full_scope_for_every_legacy_shape():
+    shapes = [
+        {"level": "user", "user_id": "usr_hiten"},
+        {"scope": "user:usr_hiten"},
+        "user:usr_hiten",
+    ]
+    for shape in shapes:
+        log: list = []
+        ev = build_event(
+            short_type="identity.fact.updated",
+            subject="identity_fact:idf_TEST",
+            scope=shape,
+            data={"idf_id": "idf_TEST"},
+        )
+        await PgOnlyPublisher().stage(ev, _ScopeConn(log))
+        assert log[0][3] == "user:usr_hiten", shape

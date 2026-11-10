@@ -17,6 +17,7 @@ from typing import Any
 
 from shared.types.ulid import mint, is_valid
 from shared.events import build_event
+from shared.scope import scope_parts
 
 
 # ── Confidence thresholds ───────────────────────────────────────────────────
@@ -106,7 +107,7 @@ async def propose_identity_fact(
         event = build_event(
             short_type="identity.fact.updated",
             subject=f"identity_fact:{idf_id}",
-            scope={"scope": scope_text},
+            scope=scope_parts(scope_text),
             data={
                 "idf_id": idf_id,
                 "predicate": predicate,
@@ -202,7 +203,7 @@ async def invalidate_identity_fact(
         event = build_event(
             short_type="identity.fact.updated",
             subject=f"identity_fact:{fact_id}",
-            scope={"scope": scope_text},
+            scope=scope_parts(scope_text),
             data={
                 "idf_id": fact_id,
                 "action_taken": "invalidated",

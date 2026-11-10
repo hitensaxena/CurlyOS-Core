@@ -18,6 +18,35 @@ from shared.events import EventPublisher
 log = logging.getLogger(__name__)
 
 
+def _stored_scope(scope_obj: Any, data: Any) -> str:
+    """Resolve the `events.scope` text for one event.
+
+    Accepts every shape the call sites have ever produced, because a mismatch
+    here is silent: the row is written and simply never matches a scoped query.
+      {"level": "user", "user_id": "usr_x"}   → "user:usr_x"   (canonical)
+      {"scope": "user:usr_x"}                 → "user:usr_x"   (legacy envelope)
+      "user:usr_x"                            → "user:usr_x"   (bare string)
+    A bare level (no id) is only used when nothing carries a user id — never in
+    preference to one, which is how 34k events ended up scoped to "user".
+    """
+    if isinstance(scope_obj, str) and ":" in scope_obj:
+        return scope_obj
+    scope_obj = scope_obj if isinstance(scope_obj, dict) else {}
+    level = scope_obj.get("level") or "user"
+    uid = scope_obj.get("user_id") or ""
+    if uid:
+        return f"{level}:{uid}"
+    nested = scope_obj.get("scope")
+    if isinstance(nested, str) and ":" in nested:
+        return nested
+    data_scope = data.get("scope") if isinstance(data, dict) else None
+    if isinstance(data_scope, str) and ":" in data_scope:
+        return data_scope
+    if isinstance(data_scope, dict) and data_scope.get("user_id"):
+        return f"{data_scope.get('level') or 'user'}:{data_scope['user_id']}"
+    return level
+
+
 class PgNatsPublisher(EventPublisher):
     """Postgres-first event publisher with optional NATS spine.
 
@@ -35,13 +64,7 @@ class PgNatsPublisher(EventPublisher):
         evt_type = event.get("type", "")
         subject = event.get("subject", "")
         data = event.get("data", {})
-        # Use full scope string from data if available, otherwise reconstruct from scope object
-        scope = data.get("scope") if isinstance(data, dict) else None
-        if not scope:
-            scope_obj = event.get("scope") or {}
-            level = scope_obj.get("level", "user")
-            uid = scope_obj.get("user_id", "")
-            scope = f"{level}:{uid}" if uid else level
+        scope = _stored_scope(event.get("scope"), data)
 
         async with conn.cursor() as cur:
             await cur.execute(

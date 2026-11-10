@@ -272,15 +272,24 @@ def health():
     else:
         result["redis"] = {"ok": False, "error": "No Redis URL configured"}
 
-    # Embedder
-    try:
-        from shared.embeddings import get_embedder
-        emb = get_embedder()
-        result["embedder"] = {"ok": True, "model": getattr(emb, "model", "unknown")}
-    except Exception:
-        result["embedder"] = {"ok": True, "model": "n/a"}
+    result["embedder"] = _embedder_health()
 
     return result
+
+
+def _embedder_health() -> dict[str, Any]:
+    """Report the real embedder state, not a hopeful one.
+
+    A FakeEmbedder fallback returns zero vectors; reporting it as healthy hid a
+    silent failure mode where dense recall degraded and nothing said so.
+    """
+    from shared.embeddings.implementations import FakeEmbedder
+    emb = _EMBEDDER
+    if emb is None:
+        return {"ok": False, "model": "not loaded"}
+    if isinstance(emb, FakeEmbedder):
+        return {"ok": False, "model": "fake (real embedder unavailable)"}
+    return {"ok": True, "model": getattr(emb, "model_name", "unknown")}
 
 
 # Fixed allowlist of tables /api/stats may count — table names are interpolated
@@ -1339,6 +1348,12 @@ async def _make_embedder():
         await emb.embed(["warmup"])
         return emb
     except Exception:
+        # Loud on purpose: a silent FakeEmbedder is how zero vectors get written
+        # into memories/episodes and never repaired (the sweep only fills NULLs).
+        logger.exception(
+            "LocalBgeM3 unavailable — falling back to FakeEmbedder; "
+            "embeddings will be refused until a real model loads"
+        )
         from shared.embeddings.implementations import FakeEmbedder
         return FakeEmbedder()
 
@@ -1455,6 +1470,12 @@ async def _embed_row(pool: Any, table: str, row_id: str, text: str, embedder: An
     """
     if not text or not text.strip():
         return False
+    from shared.embeddings.implementations import FakeEmbedder
+    if isinstance(embedder, FakeEmbedder):
+        # Leave the column NULL so _sweep_unembedded can repair it later; a
+        # stored zero vector is invisible to the sweep and poisons dense recall.
+        logger.error("refusing to store a FakeEmbedder vector table=%s id=%s", table, row_id)
+        return False
     try:
         vec = (await embedder.embed([text]))[0]
         literal = "[" + ",".join(repr(float(x)) for x in vec) + "]"
@@ -1479,6 +1500,10 @@ async def _embed_rows(pool: Any, rows: list[tuple[str, str, str]], embedder: Any
     """
     pending = [(t, rid, txt) for (t, rid, txt) in rows if txt and txt.strip()]
     if not pending:
+        return set()
+    from shared.embeddings.implementations import FakeEmbedder
+    if isinstance(embedder, FakeEmbedder):
+        logger.error("refusing to store FakeEmbedder vectors rows=%d", len(pending))
         return set()
     done: set[str] = set()
     try:
