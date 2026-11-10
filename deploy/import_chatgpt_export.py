@@ -215,11 +215,17 @@ def slugify(text: str, limit: int = 70) -> str:
     return (s[:limit].rstrip("-")) or "untitled"
 
 
+# conversation_id → "_<cid8>" suffix, filled in when two conversations on the
+# same day share a title and would otherwise overwrite one another.
+_COLLISION_SUFFIX: dict[str, str] = {}
+
+
 def mirror_path(mirror_dir: Path, conv: dict) -> Path:
     created = _ts(conv.get("create_time")) or datetime.now(tz=timezone.utc)
     month = created.strftime("%Y-%m")
     day = created.strftime("%Y-%m-%d")
-    return mirror_dir / month / f"{day}_{slugify(conv.get('title') or '')}.md"
+    suffix = _COLLISION_SUFFIX.get(conv["conversation_id"], "")
+    return mirror_dir / month / f"{day}_{slugify(conv.get('title') or '')}{suffix}.md"
 
 
 def chunk_turns(conv: dict, turns: list[tuple[str, str]], max_chars: int) -> list[str]:
@@ -419,6 +425,19 @@ async def run(args: argparse.Namespace) -> dict:
             ),
         })
 
+    # Two conversations on the same day with the same title would overwrite each
+    # other's markdown mirror. Suffix every member of such a group with its id.
+    by_key: dict[tuple[str, str], list[str]] = {}
+    for p in plan:
+        created = _ts(p["conv"].get("create_time"))
+        key = (created.strftime("%Y-%m-%d") if created else "undated",
+               slugify(p["conv"].get("title") or ""))
+        by_key.setdefault(key, []).append(p["conv_id"])
+    for _, cids in by_key.items():
+        if len(cids) > 1:
+            for cid in cids:
+                _COLLISION_SUFFIX[cid] = f"_{cid[:8]}"
+
     new = [p for p in plan if not p["skip_reason"]]
     known = [p for p in plan if p["skip_reason"]]
     total_chunks = sum(len(p["chunks"]) for p in new)
@@ -606,6 +625,10 @@ async def run(args: argparse.Namespace) -> dict:
                         )
 
         # One distilled memory per conversation (not one per chunk).
+        # On a --resummarize pass every chunk is skipped, so first_epi is unset;
+        # ground the summary on an episode this conversation already owns.
+        if first_epi is None:
+            first_epi = await asyncio.to_thread(lambda: _first_epi_sync(cid))
         mem_id = None
         if first_epi and llm is not None and not args.no_summary:
             try:
@@ -661,6 +684,14 @@ async def run(args: argparse.Namespace) -> dict:
     def _done_idx_sync(cid: str) -> set[int]:
         with psycopg.connect(dsn()) as c:
             return done_chunk_indexes(c, cid)
+
+    def _first_epi_sync(cid: str) -> str | None:
+        with psycopg.connect(dsn()) as c:
+            row = c.execute(
+                "SELECT epi_id FROM chatgpt_chunks WHERE conversation_id=%s "
+                "AND epi_id IS NOT NULL ORDER BY chunk_idx LIMIT 1", (cid,),
+            ).fetchone()
+            return row[0] if row else None
 
     def _open_chunks_sync(cid: str) -> int:
         with psycopg.connect(dsn()) as c:
