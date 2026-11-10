@@ -1,0 +1,44 @@
+# Dependabot — grouped, monthly.
+#
+# Grouped because an ungrouped lockfile this size produces a PR per package;
+# 30 open alerts turned into 30 PRs is noise nobody reviews. One grouped PR
+# per ecosystem per month is reviewable in a sitting, and CI decides.
+#
+# Monthly because this is a single-user system that is not under active
+# dependency churn: advisories matter, patch-level drift does not. Security
+# alerts themselves are unaffected by this cadence — they update continuously
+# and are what we actually triage.
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "deps"
+    groups:
+      python:
+        patterns: ["*"]
+
+  - package-ecosystem: "npm"
+    directory: "/docs"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "deps"
+    groups:
+      docs:
+        patterns: ["*"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 1
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
