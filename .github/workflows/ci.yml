@@ -13,6 +13,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       # Tests mock their DB pools (AsyncMock) — no service containers needed.
       # Heavy extras (embeddings/torch, neo4j, nats) deliberately excluded.
-      - run: uv sync --extra dev --extra postgres --extra redis
+      # `mcp` is needed by tests/test_mcp_bridge.py (FastMCP client needs httpx).
+      - run: uv sync --extra dev --extra postgres --extra redis --extra mcp
       - run: uv run ruff check api_server.py
       - run: uv run pytest -q

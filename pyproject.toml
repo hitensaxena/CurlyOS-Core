@@ -1,7 +1,7 @@
 [project]
 name = "curlyos-core"
 version = "0.1.0"
-description = "CurlyOS Core — HitenOS cognitive architecture: bi-temporal memory, knowledge graph, identity, meta-cognition, studio, simulation, evaluation"
+description = "CurlyOS Core — a memory system with a knowledge graph: bi-temporal memory, identity, cognition, goals"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -35,7 +35,7 @@ llm = [
     "openai>=1.40",
 ]
 all = [
-    "curlyos-core[postgres,redis,embeddings,reranker,llm]",
+    "curlyos-core[mcp,postgres,redis,embeddings,reranker,llm]",
 ]
 dev = [
     "pytest>=8.0",
