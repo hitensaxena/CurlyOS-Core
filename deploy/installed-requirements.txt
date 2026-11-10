@@ -15,7 +15,7 @@ cloudpickle==3.1.2
 cryptography==50.0.2
 distro==1.9.0
 fastapi==0.162.0
-filelock==4.2.4
+filelock==4.2.10
 fsspec==2026.9.0
 h11==0.16.0
 hf-xet==1.7.1
