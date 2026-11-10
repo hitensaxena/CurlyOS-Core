@@ -1,0 +1,20 @@
+{
+  "name": "curlyos-local",
+  "interface": {
+    "displayName": "CurlyOS Local"
+  },
+  "plugins": [
+    {
+      "name": "curlyos-memory",
+      "source": {
+        "source": "local",
+        "path": "./integrations/openai-plugin"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

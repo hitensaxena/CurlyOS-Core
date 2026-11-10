@@ -1,0 +1,55 @@
+{
+  "description": "Shared memory retrieval and attributed conversation capture. Does not capture tools or system prompts.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 \"${PLUGIN_ROOT}/hooks/curlyos_hook.py\"",
+            "timeout": 12,
+            "statusMessage": "Loading CurlyOS memory",
+            "additionalContextLimit": 3500
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 \"${PLUGIN_ROOT}/hooks/curlyos_hook.py\"",
+            "timeout": 25,
+            "statusMessage": "Loading CurlyOS memory",
+            "additionalContextLimit": 3500
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 \"${PLUGIN_ROOT}/hooks/curlyos_hook.py\"",
+            "timeout": 45,
+            "statusMessage": "Saving CurlyOS conversation"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 \"${PLUGIN_ROOT}/hooks/curlyos_hook.py\"",
+            "timeout": 45,
+            "statusMessage": "Saving CurlyOS conversation"
+          }
+        ]
+      }
+    ]
+  }
+}

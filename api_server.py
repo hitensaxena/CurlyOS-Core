@@ -576,14 +576,25 @@ def add_memory(body: AddMemoryRequest):
 
 
 @app.post("/api/memories/{mem_id}/invalidate")
-def invalidate_memory(mem_id: str, body: InvalidateRequest | None = None):
+async def invalidate_memory(mem_id: str, body: InvalidateRequest | None = None):
     with get_conn() as conn:
-        row = conn.execute("SELECT valid_to FROM memories WHERE id = %s", [mem_id]).fetchone()
+        row = conn.execute("SELECT valid_to, scope FROM memories WHERE id = %s", [mem_id]).fetchone()
         if not row:
             raise HTTPException(404, "Memory not found")
         if row["valid_to"] is not None:
             raise HTTPException(409, "Already invalidated")
         conn.execute("UPDATE memories SET valid_to = now() WHERE id = %s", [mem_id])
+    # Cached recall must stop returning this fact immediately, for hooks and
+    # every other REST/MCP client, not just after the cache TTL expires.
+    redis = _make_redis()
+    if redis is not None:
+        try:
+            await _bump_recall_gen(redis, row["scope"])
+        except Exception:
+            logger.warning("could not invalidate recall cache after memory update")
+        finally:
+            with contextlib.suppress(Exception):
+                await redis.aclose()
     return {"id": mem_id, "valid_to": now_iso(), "deleted": False}
 
 

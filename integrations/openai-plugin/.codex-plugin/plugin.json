@@ -1,0 +1,7 @@
+{
+  "name": "curlyos-memory",
+  "version": "0.1.3",
+  "description": "Shared CurlyOS memory: retrieve context, capture conversations, and preserve supported facts across local Codex and ChatGPT Work chats.",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json"
+}
