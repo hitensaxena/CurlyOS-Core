@@ -1,3 +1,8 @@
+# Point-in-time snapshot of the venv this machine was running (2026-10-29).
+# uv.lock is authoritative for what gets installed; this file is a record only.
+# Machine-specific editable paths are deliberately not listed: an absolute
+# local path here makes Dependabot's updater fail to fetch the file.
+
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
@@ -8,7 +13,6 @@ charset-normalizer==3.5.2
 click==8.5.0
 cloudpickle==3.1.2
 cryptography==50.0.2
--e file:///Users/crazymage/Tech%20Projects/CurlyOS-Core
 distro==1.9.0
 fastapi==0.162.0
 filelock==4.2.4
