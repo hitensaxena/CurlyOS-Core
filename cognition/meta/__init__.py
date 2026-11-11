@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Sequence
 
+from shared.scope import scope_parts
 from shared.types.ulid import mint
 from shared.events import build_event
 from shared.llm import first_json
@@ -126,7 +127,7 @@ async def create_assumption(
     event = build_event(
         short_type="metacog.assumption.created",
         subject=f"assumption:{aid}",
-        scope={"level": "user", "user_id": scope.split(":", 1)[1] if ":" in scope else scope},
+        scope=scope_parts(scope),
         data={
             "assumption_id": aid,
             "statement": statement,
@@ -248,7 +249,7 @@ async def create_mental_model(
     event = build_event(
         short_type="metacog.model.created",
         subject=f"mental_model:{mid}",
-        scope={"level": "user", "user_id": scope.split(":", 1)[1] if ":" in scope else scope},
+        scope=scope_parts(scope),
         data={"model_id": mid, "name": name, "domain": domain, "source_episode_id": source_episode_id},
     )
     if publisher is not None:
@@ -472,7 +473,7 @@ async def run_decision_audit(
             async with pool.connection() as conn:
                 ev = build_event(
                     short_type="cognition.audit.completed",
-                    subject=scope, scope={"level": "user", "user_id": scope.split(":", 1)[1] if ":" in scope else scope},
+                    subject=scope, scope=scope_parts(scope),
                     data={"audits": audits_created, "decisions": decisions_found, "method": "llm"},
                     actor="system", source="curlyos-core/meta",
                 )
@@ -496,7 +497,7 @@ async def run_decision_audit(
     async with pool.connection() as conn:
         ev = build_event(
             short_type="cognition.audit.completed",
-            subject=scope, scope={"level": "user", "user_id": scope.split(":", 1)[1] if ":" in scope else scope},
+            subject=scope, scope=scope_parts(scope),
             data={"audits": audits_created, "decisions": decisions_found, "method": "regex"},
             actor="system", source="curlyos-core/meta",
         )
@@ -702,7 +703,7 @@ async def generate_assumptions_and_models(
     async with pool.connection() as conn:
         ev = build_event(
             short_type="cognition.meta.models_generated",
-            subject=scope, scope={"level": "user", "user_id": scope.split(":", 1)[1] if ":" in scope else scope},
+            subject=scope, scope=scope_parts(scope),
             data={"assumptions": na, "mental_models": nm},
             actor="system", source="curlyos-core/meta",
         )

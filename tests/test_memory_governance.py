@@ -527,37 +527,66 @@ class TestListMemories:
 
 
 class TestScopeIsolation:
-    @pytest.mark.asyncio
-    async def test_scope_isolation(self):
-        """Episodes in different scopes should only return those matching the scope."""
-        scope_a = "user:usr_a"
-        now = datetime.now(timezone.utc)
+    """The scope filter has to reach the driver.
 
-        conn = AsyncMock()
+    The previous version of this test stubbed `fetchall` to return scope_a's
+    rows and then asserted it got scope_a's rows back — true of any
+    implementation, including one with no WHERE clause at all. It verified the
+    fake, not the query. These assert on what the cursor is actually told.
+    """
+
+    @staticmethod
+    def _recording_pool(calls, rows):
+        """A pool whose cursor records (sql, params) and returns `rows`."""
         mc = AsyncMock()
 
-        # The SQL query filters by scope, so fetchall only returns matching rows.
-        # We simulate returning only scope_a rows.
-        epi_a1 = mint("epi")
-        epi_a2 = mint("epi")
-        mc.fetchall.return_value = [
-            (epi_a1, "content a1", None, now),
-            (epi_a2, "content a2", None, now),
-        ]
+        async def _execute(sql, params=None):
+            calls.append((sql, params))
+            mc.fetchall.return_value = rows
 
+        mc.execute = AsyncMock(side_effect=_execute)
         cm = AsyncMock()
         cm.__aenter__ = AsyncMock(return_value=mc)
         cm.__aexit__ = AsyncMock(return_value=False)
+        conn = AsyncMock()
         conn.cursor = MagicMock(return_value=cm)
-
         conn_cm = AsyncMock()
         conn_cm.__aenter__ = AsyncMock(return_value=conn)
         conn_cm.__aexit__ = AsyncMock(return_value=False)
         pool = AsyncMock()
         pool.connection = MagicMock(return_value=conn_cm)
+        return pool
 
-        episodes_a = await list_episodes(pool, scope_a)
-        assert len(episodes_a) == 2
-        ids = {e["id"] for e in episodes_a}
-        assert epi_a1 in ids
-        assert epi_a2 in ids
+    @pytest.mark.asyncio
+    async def test_list_episodes_binds_the_requested_scope(self):
+        for scope in ("user:usr_a", "user:usr_b", "studio:std_x"):
+            calls: list = []
+            pool = self._recording_pool(calls, [])
+            await list_episodes(pool, scope)
+            sql, params = calls[0]
+            assert "WHERE scope = %s" in sql, "the scope predicate was dropped"
+            assert params[0] == scope, "the query is not filtered by the caller's scope"
+
+    @pytest.mark.asyncio
+    async def test_list_memories_binds_the_requested_scope(self):
+        for scope in ("user:usr_a", "user:usr_b"):
+            calls: list = []
+            pool = self._recording_pool(calls, [])
+            await list_memories(pool, scope)
+            sql, params = calls[0]
+            assert "WHERE scope = %s" in sql
+            assert params[0] == scope
+
+    @pytest.mark.asyncio
+    async def test_rows_returned_are_mapped_not_filtered_in_python(self):
+        """Filtering is the database's job — every returned row is passed through.
+
+        If someone later 'fixes' isolation by filtering in Python, this stays
+        green while the binding tests above catch the missing WHERE.
+        """
+        now = datetime.now(timezone.utc)
+        epi_a1, epi_a2 = mint("epi"), mint("epi")
+        pool = self._recording_pool(
+            [], [(epi_a1, "content a1", None, now), (epi_a2, "content a2", None, now)])
+        episodes = await list_episodes(pool, "user:usr_a")
+        assert {e["id"] for e in episodes} == {epi_a1, epi_a2}

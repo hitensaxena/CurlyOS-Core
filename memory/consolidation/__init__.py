@@ -20,6 +20,7 @@ import re
 from datetime import datetime, timezone, timedelta
 from typing import Any, Sequence
 
+from shared.scope import scope_parts
 from shared.types.ulid import mint
 from shared.events import build_event
 from shared.llm import json_records
@@ -1181,7 +1182,7 @@ async def run_consolidation(
         ev = build_event(
             short_type=short_type,
             subject=scope or "all",
-            scope={"level": "user", "user_id": (scope or "all").split(":", 1)[1] if ":" in (scope or "all") else (scope or "all")},
+            scope=scope_parts(scope or "all"),
             data={"deep": deep, "passes": list(passes), "scopes": len(all_results)},
             actor="system", source="curlyos-core/consolidation",
         )

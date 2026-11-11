@@ -134,3 +134,59 @@ class TestRetrieveAsync:
         )
         assert isinstance(result, RetrievalResult)
         assert result.items == []
+
+
+class TestStage1TaskCleanup:
+    """A failing first-stage branch must not leave its siblings running.
+
+    The three recall signals are started with create_task. Awaiting them one by
+    one means an exception in the first leaves the other two holding pool
+    connections with nobody polling them.
+    """
+
+    @staticmethod
+    def _pool():
+        cur = AsyncMock()
+        cur.fetchone = AsyncMock(return_value=(1,))  # embeddings exist
+        cur.fetchall = AsyncMock(return_value=[])
+        cm = AsyncMock()
+        cm.__aenter__ = AsyncMock(return_value=cur)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        conn = AsyncMock()
+        conn.cursor = lambda: cm
+        conn_cm = AsyncMock()
+        conn_cm.__aenter__ = AsyncMock(return_value=conn)
+        conn_cm.__aexit__ = AsyncMock(return_value=False)
+        pool = AsyncMock()
+        pool.connection = lambda: conn_cm
+        return pool
+
+    @pytest.mark.asyncio
+    async def test_failing_branch_cancels_its_siblings(self, monkeypatch):
+        import asyncio
+
+        import memory.retrieval as R
+
+        cancelled: list[str] = []
+
+        async def boom(*a, **kw):
+            raise RuntimeError("dense exploded")
+
+        def hang(name):
+            async def _run(*a, **kw):
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    cancelled.append(name)
+                    raise
+            return _run
+
+        monkeypatch.setattr(R, "_dense_recall", boom)
+        monkeypatch.setattr(R, "_sparse_recall", hang("sparse"))
+        monkeypatch.setattr(R, "_entity_match", hang("entity"))
+
+        request = RetrievalRequest(query="anything", scope="user:usr_t")
+        with pytest.raises(RuntimeError, match="dense exploded"):
+            await R.retrieve(request=request, pool=self._pool(), embedder=AsyncMock())
+
+        assert sorted(cancelled) == ["entity", "sparse"]

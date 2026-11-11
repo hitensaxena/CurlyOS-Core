@@ -24,6 +24,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any, Literal
 
+from shared.scope import scope_parts
 from shared.types.ulid import mint
 from shared.llm import first_json
 from shared.events import build_event
@@ -368,7 +369,7 @@ async def run_reflection(
         ev = build_event(
             short_type="cognition.reflection.completed",
             subject=rpt_id,
-            scope={"level": "user", "user_id": scope.split(":", 1)[1] if ":" in scope else scope},
+            scope=scope_parts(scope),
             data={"report_type": report_type, "findings": len(all_findings),
                   "identity_candidates": len(identity_candidates)},
             actor="system", source="curlyos-core/reflection",

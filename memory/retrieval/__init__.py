@@ -812,6 +812,20 @@ async def retrieve(
         )
     )
 
+    # Await them together, not one after another: `await dense_task` raising on
+    # the first branch used to leave sparse/entity running unpolled, holding
+    # pool connections until the loop closed them.
+    stage1 = [t for t in (dense_task, sparse_task, entity_task) if t is not None]
+    try:
+        dense = await dense_task if dense_task else []
+        sparse = await sparse_task
+        entity = await entity_task
+    finally:
+        for t in stage1:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*stage1, return_exceptions=True)
+
     dense = await dense_task if dense_task else []
     sparse = await sparse_task
     entity = await entity_task
