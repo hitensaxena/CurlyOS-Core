@@ -412,11 +412,24 @@ def step_chatter(conn, dry_run: bool = False) -> None:
     print("flagged now    :", one(conn, "SELECT count(*) FROM memories WHERE is_chatter"))
 
 
+# A triple is a duplicate only when its copies agree on provenance too.
+# Two rows asserting the same (src, dst, rel) from *different* episodes are
+# distinct evidence, not redundancy: collapsing them silently discards which
+# episodes supported the edge. On 2026-11-11 this predicate said `count(*) > 1`
+# and one --approve pass destroyed 3,737 rows across 1,700 multi-episode groups.
+# Groups whose copies differ only in `properties` are also left alone — deciding
+# which property set wins is a merge rule, not a dedupe rule.
+_DUP_HAVING = """
+      GROUP BY src_entity_id, dst_entity_id, rel_type
+      HAVING count(*) > 1
+         AND count(DISTINCT coalesce(source_episode_id, '')) = 1
+         AND count(DISTINCT properties) = 1"""
+
+
 def step_janitor(conn, approve: bool, merge_aliases: bool = False) -> None:
-    dup = one(conn, """
-      WITH d AS (SELECT src_entity_id, dst_entity_id, rel_type, count(*) k,
-                        min(id) keep, array_agg(id) ids
-                 FROM knowledge_edges GROUP BY 1,2,3 HAVING count(*) > 1)
+    dup = one(conn, f"""
+      WITH d AS (SELECT src_entity_id, dst_entity_id, rel_type, count(*) k
+                 FROM knowledge_edges {_DUP_HAVING})
       SELECT coalesce(sum(k-1),0) FROM d""")
     stale = one(conn, """
       SELECT count(*) FROM knowledge_edges e
@@ -431,7 +444,7 @@ def step_janitor(conn, approve: bool, merge_aliases: bool = False) -> None:
         WHERE en.name <> a.alias AND en.valid_to IS NULL""")
 
     print("\njanitor scope")
-    print(f"  duplicate edges          : {dup}")
+    print(f"  duplicate edges          : {dup}  (same triple, same episode, same properties)")
     print(f"  edges on invalid entities: {stale}")
     print(f"  entities without embedding: {noemb}")
     print(f"  orphan entities          : {orphan}")
@@ -442,9 +455,8 @@ def step_janitor(conn, approve: bool, merge_aliases: bool = False) -> None:
         return
 
     with conn.transaction():
-        n = conn.execute("""
-          WITH d AS (SELECT min(id) keep FROM knowledge_edges
-                     GROUP BY src_entity_id, dst_entity_id, rel_type HAVING count(*) > 1)
+        n = conn.execute(f"""
+          WITH d AS (SELECT min(id) keep FROM knowledge_edges {_DUP_HAVING})
           DELETE FROM knowledge_edges e USING d WHERE e.id <> d.keep
             AND EXISTS (SELECT 1 FROM knowledge_edges k WHERE k.id = d.keep
                         AND k.src_entity_id = e.src_entity_id
