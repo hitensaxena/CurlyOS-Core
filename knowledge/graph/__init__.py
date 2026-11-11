@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from shared.types.ulid import mint
@@ -63,6 +64,44 @@ CREATE INDEX IF NOT EXISTS idx_kedge_rel ON knowledge_edges (rel_type) WHERE val
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+# Extraction turns digest prose into entities, and prose contains quantities:
+# "follows 716 accounts" becomes a node named "716 accounts", "established in
+# 1957" a node named "1957". Such a node has no identity — it is a number the
+# edge already carries — so it can never merge with anything, and it pollutes
+# both graph_context and recall. Measured on the 2026-11 Instagram import:
+# 14 of 530 entities were this shape.
+_NUMERIC_ONLY = re.compile(r"^[\s\d,.+\-%]+$")
+_COUNT_NOUNS = frozenset({
+    "account", "accounts", "item", "items", "interaction", "interactions",
+    "message", "messages", "thread", "threads", "post", "posts", "save",
+    "saves", "like", "likes", "follower", "followers", "following",
+    "comment", "comments", "view", "views", "story", "stories", "reel",
+    "reels", "person", "people", "time", "times", "hour", "hours", "minute",
+    "minutes", "day", "days", "week", "weeks", "month", "months", "year",
+    "years", "percent", "chars", "characters", "words",
+})
+_QUANTITY = re.compile(r"^[\d,.]+(?:st|nd|rd|th)?\s+([a-z_]+)$")
+
+
+def is_placeholder_name(name: str | None) -> bool:
+    """True when a proposed entity name is a bare quantity, not an entity.
+
+    Only two shapes are rejected: a name with no letters at all ("716",
+    "1957", "10%"), and a number followed by a single generic count noun
+    ("40 accounts", "45 interactions"). Anything carrying its own noun is
+    left alone — "5 Rhythms" and "808 State" are names, not counts — and a
+    count noun is only rejected when it stands alone after the number, so
+    "Studio 54 nights" survives.
+    """
+    text = (name or "").strip()
+    if not text:
+        return True
+    if _NUMERIC_ONLY.match(text):
+        return True
+    match = _QUANTITY.match(text.lower())
+    return bool(match) and match.group(1) in _COUNT_NOUNS
+
+
 def _row_to_entity(row) -> dict:
     """Convert a knowledge_entities row to a dict."""
     return {
@@ -113,7 +152,13 @@ async def create_entity(
 
     Generates a ULID with 'ent' prefix, inserts into knowledge_entities,
     optionally generates an embedding, and stages a knowledge.entity.created event.
+
+    Raises ValueError for a placeholder name (see :func:`is_placeholder_name`),
+    so a quantity can never become a node. Every caller is expected to have
+    filtered those out already; this is the backstop.
     """
+    if is_placeholder_name(name):
+        raise ValueError(f"refusing to create an entity named {name!r}: not a name")
     entity_id = mint("ent")
     props = properties or {}
 
@@ -611,7 +656,7 @@ async def extract_and_project(
         mentions: list[str] = []
         for tr in triples:
             for m in (tr.subject, tr.object):
-                if m:
+                if m and not is_placeholder_name(m):
                     mentions.append(m)
                     mentions.append(m.strip())
         if mentions:
@@ -634,6 +679,11 @@ async def extract_and_project(
         nonlocal entities_created, entities_merged
         norm = normalize_mention(mention)
         if len(norm) < 2:
+            return None
+        # A bare quantity ("716 accounts") is skipped here rather than paid for
+        # in an embedding + ANN resolve, and its triple is dropped: with no
+        # object node there is no true edge to record.
+        if is_placeholder_name(mention):
             return None
         if norm in seen:
             entities_merged += 1
