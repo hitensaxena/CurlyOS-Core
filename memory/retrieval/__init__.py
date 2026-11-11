@@ -17,6 +17,9 @@ import asyncio
 import logging
 import math
 import hashlib
+import re
+import time
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
 
@@ -540,6 +543,197 @@ def _mmr_diversify(
         selected.append(remaining.pop(best_idx))
 
     return selected
+
+
+# ── Episode diversity ──────────────────────────────────────────────────────
+# Bulk imports (the 2026-06 ChatGPT import, phase 4 repair, phase 5 documents)
+# wrote many memories per source episode: one conversation can hold tens of
+# ~2 KB transcript chunks plus one distilled summary. Cosine re-ranking alone
+# fills every result slot from one long conversation, so recall answers
+# "my approach to design" with six fragments of a single chat.
+#
+# Measured 2026-11-11 over 8 queries × top-6: 40% of slots were raw archive
+# chunks, and for 3 of the 8 no summary appeared at all. Retirement was
+# rejected (an LLM audit found 85% of chunks carry facts the summaries omit),
+# so the fix is here: cap each episode's contribution and give distilled
+# summaries a small edge over the raw text they summarise.
+_ARCHIVE_SUMMARY_PREFIXES = ("ChatGPT conversation ", "ChatGPT document ", "ChatGPT Site ")
+
+_CONV_CHUNK = re.compile(r"^ChatGPT conversation: (.+?)\s*\((\d{4}-\d{2}-\d{2})\)")
+_CONV_SUMMARY = re.compile(r'^ChatGPT conversation "(.+?)"\s*\((\d{4}-\d{2}-\d{2})\)')
+_DOC_CHUNK = re.compile(r"^ChatGPT document: (.+?)\s*\(uploaded (\d{4}-\d{2}-\d{2})\)")
+_DOC_SUMMARY = re.compile(r'^ChatGPT document "(.+?)"\s*\((\d{4}-\d{2}-\d{2})\)')
+_LEGACY_CHUNK = re.compile(
+    r"^# (?:archives/chatgpt/)?(?:\d{4}-\d{2}/)?(\d{4}-\d{2}-\d{2})_(.+?)\.md"
+)
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+
+
+def conversation_key(text: str) -> str | None:
+    """Grouping key shared by an archive item and its distilled summary.
+
+    Phase 3 imported one episode per chunk, so chunks of a single conversation
+    do NOT share a source_episode_id; the statement header is the only thing
+    that ties them together. Phase 4 chunks and their summaries DO share an
+    episode, but keying on the text works for both — and lets a legacy
+    `# archives/chatgpt/…` chunk line up with the summary written from it.
+    """
+    if not text:
+        return None
+    for rx in (_CONV_CHUNK, _CONV_SUMMARY):
+        m = rx.match(text)
+        if m:
+            return f"conv:{m.group(2)}:{_slug(m.group(1))}"
+    for rx in (_DOC_CHUNK, _DOC_SUMMARY):
+        m = rx.match(text)
+        if m:
+            return f"doc:{m.group(2)}:{_slug(m.group(1))}"
+    m = _LEGACY_CHUNK.match(text)
+    if m:
+        return f"conv:{m.group(1)}:{_slug(m.group(2))}"
+    if text.startswith("ChatGPT Site "):
+        m = re.match(r'ChatGPT Site "(.+?)"', text)
+        if m:
+            return f"site:{_slug(m.group(1))}"
+    return None
+
+
+def is_archive_summary(text: str) -> bool:
+    """True for the distilled one-memory-per-item summaries written by the
+    ChatGPT importers. Their text starts with the item kind, never '# '."""
+    return bool(text) and text.startswith(_ARCHIVE_SUMMARY_PREFIXES)
+
+
+_SUMMARY_INDEX: dict[str, Any] = {"at": 0.0, "map": {}}
+
+
+async def load_summary_index(pool: Any, scope: str, ttl: float = 300.0) -> dict[str, dict]:
+    """conversation_key → distilled summary row, cached briefly.
+
+    Keys come from two places because they disagree: a legacy chunk's statement
+    starts with the mirror FILE name (`…_cover-letter-for-product-designer-role`)
+    while its summary says `"Cover Letter for Product Designer"`. The ledger is
+    the only thing that knows both belong together, so it supplies the extra
+    keys. Summaries only change on import, and the recall cache is keyed on a
+    generation counter, so a short TTL keeps this off the hot path.
+    """
+    now = time.monotonic()
+    if now - float(_SUMMARY_INDEX["at"]) < ttl and _SUMMARY_INDEX["map"]:
+        return _SUMMARY_INDEX["map"]
+    index: dict[str, dict] = {}
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                # NB: psycopg treats a bare % as a placeholder, so LIKE patterns
+                # in a parameterised query must be written with %%.
+                "SELECT id, statement, source_episode_id, tier, epistemic_status, valid_from "
+                "FROM memories WHERE scope = %s AND valid_to IS NULL "
+                "AND (statement LIKE 'ChatGPT conversation %%' "
+                "OR statement LIKE 'ChatGPT document %%' OR statement LIKE 'ChatGPT Site %%')",
+                (scope,),
+            )
+            for rid, stmt, epi, tier, status, vfrom in await cur.fetchall():
+                entry = {"id": rid, "text": stmt, "source_episode_id": epi,
+                         "tier": tier, "epistemic_status": status, "valid_from": vfrom}
+                key = conversation_key(stmt)
+                if key:
+                    index[key] = entry
+
+            # Conversation ledger: file-name slug → its summary.
+            await cur.execute(
+                "SELECT cc.created_at, cc.title, cc.md_path, m.id, m.statement, "
+                "m.source_episode_id, m.tier, m.epistemic_status, m.valid_from "
+                "FROM chatgpt_conversations cc JOIN memories m ON m.id = cc.summary_mem_id"
+            )
+            for created, title, md_path, rid, stmt, epi, tier, status, vfrom in await cur.fetchall():
+                entry = {"id": rid, "text": stmt, "source_episode_id": epi,
+                         "tier": tier, "epistemic_status": status, "valid_from": vfrom}
+                date = created.strftime("%Y-%m-%d") if created else ""
+                names = [title]
+                if md_path:
+                    stem = Path(md_path).stem        # 2026-01-28_cover-letter-…
+                    names.append(stem[11:] if len(stem) > 11 else stem)
+                for name in names:
+                    if name:
+                        index[f"conv:{date}:{_slug(name)}"] = entry
+
+            # Document ledger: name only — the chunk header's date and the
+            # ledger's can differ (undated uploads).
+            await cur.execute(
+                "SELECT cf.file_name, m.id, m.statement, m.source_episode_id, m.tier, "
+                "m.epistemic_status, m.valid_from "
+                "FROM chatgpt_files cf JOIN memories m ON m.id = cf.summary_mem_id"
+            )
+            for file_name, rid, stmt, epi, tier, status, vfrom in await cur.fetchall():
+                index[f"doc:*:{_slug(file_name)}"] = {
+                    "id": rid, "text": stmt, "source_episode_id": epi,
+                    "tier": tier, "epistemic_status": status, "valid_from": vfrom}
+    _SUMMARY_INDEX["at"], _SUMMARY_INDEX["map"] = now, index
+    return index
+
+
+def lookup_summary(index: dict[str, dict], key: str) -> dict | None:
+    """Exact key first, then the date-insensitive document key."""
+    hit = index.get(key)
+    if hit is not None:
+        return hit
+    if key.startswith("doc:"):
+        return index.get("doc:*:" + key.split(":", 2)[-1])
+    return None
+
+
+def diversify_by_episode(
+    items: list[Any],
+    score_of: Any,
+    max_per_episode: int = 2,
+    summary_boost: float = 0.03,
+    key_of: Any = None,
+) -> list[Any]:
+    """Re-order ranked items so no single source item dominates the set.
+
+    `score_of(item) -> float` supplies relevance; `key_of(item) -> str` the
+    grouping key (defaults to source_episode_id). Items are taken greedily in
+    boosted order; a group may contribute at most `max_per_episode` items, and
+    only its summary when one is present among the candidates.
+
+    Stable: ties keep their incoming order, so callers can pass a cosine-sorted
+    list and get the same order back when nothing is capped.
+    """
+    if key_of is None:
+        key_of = lambda it: getattr(it, "source_episode_id", "") or getattr(it, "id", "")
+    decorated = [
+        ((score_of(it) + (summary_boost if is_archive_summary(getattr(it, "text", "") or "")
+                          else 0.0)), idx, it)
+        for idx, it in enumerate(items)
+    ]
+    decorated.sort(key=lambda t: (-t[0], t[1]))
+
+    has_summary: set[str] = {
+        key_of(it) for it in items
+        if is_archive_summary(getattr(it, "text", "") or "")
+    }
+    counts: dict[str, int] = {}
+    out: list[Any] = []
+    for _, _, it in decorated:
+        key = key_of(it)
+        text = getattr(it, "text", "") or ""
+        if key in has_summary:
+            # The summary is the item's representative: a chunk from the same
+            # conversation is redundant next to it, however well it scored.
+            if not is_archive_summary(text) or counts.get(key, 0):
+                continue
+            counts[key] = 1
+            out.append(it)
+            continue
+        cap = max(1, max_per_episode)
+        if counts.get(key, 0) >= cap:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+        out.append(it)
+    return out
 
 
 # ── Main entry point ───────────────────────────────────────────────────────

@@ -704,8 +704,11 @@ async def recall(body: RecallRequest):
     query, scope, mode, k = body.query, body.scope, body.mode, body.k
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from memory.retrieval import retrieve
-    from shared.types import RetrievalRequest
+    from memory.retrieval import (
+        conversation_key, diversify_by_episode, is_archive_summary, load_summary_index,
+        lookup_summary, retrieve,
+    )
+    from shared.types import RetrievalRequest, RetrievedItem
     from shared.embeddings.implementations import FakeReranker, CachingEmbedder
 
     from shared import metrics
@@ -719,6 +722,10 @@ async def recall(body: RecallRequest):
     cache_enabled = bool(await get_setting_cached(pool, "recall_cache_enabled", True))
     cache_ttl = int(await get_setting_cached(pool, "recall_cache_ttl_seconds", _RECALL_CACHE_TTL))
     fast_followup = bool(await get_setting_cached(pool, "recall_fast_followups", False))
+    # Read before the cache key: changing either must not serve a stale ranking.
+    max_per_ep = int(await get_setting_cached(pool, "recall_max_per_episode", 2))
+    summary_boost = float(await get_setting_cached(pool, "recall_summary_boost", 0.03))
+    chunk_penalty = float(await get_setting_cached(pool, "recall_chunk_penalty", 0.05))
 
     # Cache lookup — generation-versioned, so an ingest invalidates instantly.
     redis = _make_redis() if cache_enabled else None
@@ -726,7 +733,8 @@ async def recall(body: RecallRequest):
     if redis is not None:
         gen = await _recall_gen(redis, scope)
         digest = hashlib.sha256(query.encode()).hexdigest()[:16]
-        cache_key = f"cache:recall:{scope}:{gen}:{mode}:{k}:{digest}"
+        cache_key = (f"cache:recall:{scope}:{gen}:{mode}:{k}:{max_per_ep}:"
+                     f"{summary_boost}:{chunk_penalty}:{digest}")
         try:
             hit = await redis.get(cache_key)
             if hit is not None:
@@ -757,6 +765,26 @@ async def recall(body: RecallRequest):
         # re-encoding, which is far too slow on this CPU box). This surfaces the
         # dense-relevant memories that rank-fusion buries.
         sims: dict[str, float] = {}
+
+        def rank_of(it):
+            """Relevance used for ordering and for the reported score.
+
+            A raw archive chunk is literal query text, so its cosine beats the
+            distilled summary of the same conversation. Demote it so recall
+            surfaces the recall-shaped version; the raw text stays in episodes
+            and the markdown mirror.
+            """
+            sc = sims.get(it.id, it.score or 0.0)
+            if (it.text or "").startswith("# archives/chatgpt/"):
+                sc -= chunk_penalty
+            return sc
+
+        def shown_score(it):
+            """What /api/recall reports: the ordering score, boost included, so
+            the numbers read in the same order as the list."""
+            boost = summary_boost if is_archive_summary(getattr(it, "text", "") or "") else 0.0
+            return rank_of(it) + boost
+
         if cand:
             qv = (await emb.embed([query]))[0]
             qlit = "[" + ",".join(repr(float(x)) for x in qv) + "]"
@@ -770,9 +798,49 @@ async def recall(body: RecallRequest):
                     for rid, sim in await cur.fetchall():
                         sims[rid] = float(sim)
             cand = sorted(cand, key=lambda it: -sims.get(it.id, -1.0))
+
+            # A raw archive chunk is literal query text, so it out-scores the
+            # distilled summary of the same conversation — and for some queries
+            # no summary reaches the candidate pool at all. Pull the summaries
+            # for the strongest chunks so the conversation is represented by
+            # the form recall can actually use.
+            key_of = lambda it: (
+                conversation_key(getattr(it, "text", "") or "")
+                or (getattr(it, "source_episode_id", "") or it.id)
+            )
+            try:
+                summary_index = await load_summary_index(pool, scope)
+            except Exception:
+                logger.debug("summary index unavailable", exc_info=True)
+                summary_index = {}
+            best_chunk: dict[str, float] = {}
+            for it in cand[:12]:
+                ck = key_of(it)
+                if ck.startswith(("conv:", "doc:", "site:")):
+                    best_chunk[ck] = max(best_chunk.get(ck, 0.0), rank_of(it))
+            if best_chunk:
+                known = {it.id for it in cand}
+                for ck, sc in best_chunk.items():
+                    s = lookup_summary(summary_index, ck)
+                    if not s or s["id"] in known:
+                        continue
+                    cand.append(RetrievedItem(
+                        id=s["id"], tier=s["tier"] or "semantic", text=s["text"],
+                        score=sc + summary_boost, valid_from=s["valid_from"],
+                        valid_to=None, source_episode_id=s["source_episode_id"] or "",
+                        signals={"promoted_from_chunk": True},
+                        epistemic_status=s["epistemic_status"] or "canonical",
+                    ))
+            # Cosine alone lets one long conversation fill every slot: bulk
+            # imports put dozens of transcript chunks on a single item.
+            # Cap per-conversation contribution, summaries first.
+            cand = diversify_by_episode(
+                cand, rank_of,
+                max_per_episode=max_per_ep, summary_boost=summary_boost, key_of=key_of,
+            )
         items = [
             {"id": it.id, "text": it.text[:200],
-             "score": round(sims.get(it.id, it.score or 0.0), 4),
+             "score": round(shown_score(it), 4),
              "tier": it.tier, "epistemic_status": it.epistemic_status}
             for it in cand[:k]
         ]
