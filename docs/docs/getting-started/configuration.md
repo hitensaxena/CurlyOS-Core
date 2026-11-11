@@ -77,7 +77,7 @@ Wired knobs include:
 | `auto_promote` | Reflection may promote opportunities → goals |
 | `auto_plan` | System may plan goals → tasks |
 
-See the full table in **[Shared Infrastructure](../subsystems/shared-infrastructure.md)** and how autonomy toggles compose with the [safety layer](../subsystems/safety-and-governance.md).
+See the full table in **[Shared Infrastructure](../subsystems/shared-infrastructure.md)**.
 
 ## Backups
 

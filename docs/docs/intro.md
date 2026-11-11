@@ -36,7 +36,6 @@ CurlyOS Core is a set of real, queryable subsystems, each with its own tables an
 - **[Identity](subsystems/identity.md)** — a bi-temporal self-model distilled from reflection.
 - **[Cognition](subsystems/cognition.md)** — reflection, narrative, attention and meta faculties that think about the thinking.
 - **[Orchestration](subsystems/orchestration.md)** — the autonomous agent loop: opportunity → goal → agent → verify → repeat.
-- **[Safety & Governance](subsystems/safety-and-governance.md)** — policy gate, budget, kill switch, approvals, hash-chained audit.
 - **[Goals & Workspace](subsystems/goals-and-workspace.md)**, **[Studio / Simulation / Evaluation](subsystems/studio-simulation-evaluation.md)**, and **[Shared Infrastructure](subsystems/shared-infrastructure.md)**.
 
 ## Where to go next

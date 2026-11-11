@@ -14,7 +14,7 @@ from shared.events.catalog import (
     validate_short_type,
 )
 
-_GROUPS = {"MEMORY", "AGENTS", "SAFETY", "EVENTS"}
+_GROUPS = {"MEMORY", "AGENTS", "EVENTS"}
 
 
 def test_catalog_entries_are_well_formed():
@@ -58,11 +58,11 @@ def test_build_event_rejects_unregistered_type():
 
 
 def test_helpers_round_trip():
-    short = "safety.kill.triggered"
+    short = "memory.fact.stored"
     assert short_of(full_type(short)) == short
     assert subject_for(short) == "curlyos." + short
-    assert group_for(short) == "SAFETY"
-    assert group_for(full_type(short)) == "SAFETY"
+    assert group_for(short) == "MEMORY"
+    assert group_for(full_type(short)) == "MEMORY"
     assert validate_short_type(short) == short
     with pytest.raises(UnknownEventType):
         group_for("nope.nope")

@@ -3,13 +3,13 @@
 Adapted from the build repo's validated catalog (00b-shared-canon §8 grammar:
 `art.curlybrackets.curlyos.<short>`), with two recorded changes for curlyos-core:
 
-1. The catalog value is a DOMAIN GROUP (MEMORY / AGENTS / SAFETY / EVENTS),
+1. The catalog value is a DOMAIN GROUP (MEMORY / AGENTS / EVENTS),
    not a NATS stream — there is no NATS here (deviation DR-C1).
 2. The set is exactly the types this repo emits today. The 2026-11-10 lean
    refactor deleted the studio / simulation / evolution / plan-and-task event
-   families along with the packages that emitted them; historical rows with
-   those types remain in `events` and are still readable, they simply can no
-   longer be written.
+   families along with the packages that emitted them; the removal of `safety/`
+   took `safety.kill.triggered` with it. Historical rows with those types remain
+   in `events` and are still readable, they simply can no longer be written.
 
 CLOSED means closed: `build_event()` rejects a short type not listed here.
 Adding an event type is a deliberate one-line registration in this file,
@@ -21,8 +21,8 @@ FULL_TYPE_PREFIX = "art.curlybrackets.curlyos."
 SUBJECT_PREFIX = "curlyos."
 
 # short type → domain group.
-# short type → domain group. Every entry below has a live emitter in this
-# repository; anything without one was removed in the 2026-11-10 lean refactor.
+# Every entry below has a live emitter in this repository; anything without one
+# was removed in the 2026-11-10 lean refactor.
 EVENT_CATALOG: dict[str, str] = {
     # ── memory ──────────────────────────────────────────────────────────────
     "memory.episode.recorded": "MEMORY",
@@ -56,8 +56,6 @@ EVENT_CATALOG: dict[str, str] = {
     "agent.run.started": "AGENTS",
     "agent.run.completed": "AGENTS",
     "agent.run.failed": "AGENTS",
-    # ── safety (emitted only by safety/killswitch.py) ───────────────────────
-    "safety.kill.triggered": "SAFETY",
 }
 
 

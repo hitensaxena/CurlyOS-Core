@@ -71,4 +71,4 @@ Autonomous behaviour is gated by typed settings (`shared/settings.py`) so it can
 - `auto_plan` — let the system plan goals into tasks.
 - `auto_execute` — let planned tasks dispatch to agent runs.
 
-These compose with the [safety](../subsystems/safety-and-governance.md) PDP, budget and kill switch. See the [settings registry](../subsystems/shared-infrastructure.md) for every knob.
+These compose with the settings registry — see [shared infrastructure](../subsystems/shared-infrastructure.md) for every knob.

@@ -67,7 +67,6 @@ flowchart TD
 | Self | [Identity](../subsystems/identity.md) | Maintain a bi-temporal self-model resilient to context resets |
 | Metacognition | [Cognition](../subsystems/cognition.md) | Reflection, narrative, attention, meta, decision loop |
 | Action | [Orchestration](../subsystems/orchestration.md) | Decompose goals, run agents, verify, schedule, repeat |
-| Guardrails | [Safety & Governance](../subsystems/safety-and-governance.md) | PDP, budget, kill switch, approvals, audit hash chain |
 | Containers | [Goals & Workspace](../subsystems/goals-and-workspace.md) | Goals/tasks, on-disk workspace tree, artifacts |
 | Creative / QA | [Studio · Simulation · Evaluation](../subsystems/studio-simulation-evaluation.md) | Idea canvas, world-modeling, gate-checks/scorers |
 | Plumbing | [Shared Infrastructure](../subsystems/shared-infrastructure.md) | LLM tier routing, embedders, events, epistemic classifier, metrics, settings |

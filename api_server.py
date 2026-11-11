@@ -195,29 +195,6 @@ class ReflectionRequest(BaseModel):
     window_days: int = Field(default=7, ge=1, le=90)
 
 
-class ReflectionRunRequest(BaseModel):
-    scope: str = SCOPE
-    report_type: str = Field(default="weekly", pattern="^(daily|weekly|monthly)$")
-
-
-class MoodLogRequest(BaseModel):
-    scope: str = SCOPE
-    mood: str = Field(min_length=1, max_length=50)
-    valence: float = Field(default=0.0, ge=-1.0, le=1.0)
-    energy: float = Field(default=0.5, ge=0.0, le=1.0)
-    context: str | None = Field(default=None, max_length=500)
-
-
-class MoodHistoryRequest(BaseModel):
-    scope: str = SCOPE
-    days: int = Field(default=30, ge=1, le=365)
-
-
-class MentalModelSearchRequest(BaseModel):
-    scope: str = SCOPE
-    query: str = Field(min_length=1, max_length=500)
-
-
 class MetaAuditRequest(BaseModel):
     scope: str = SCOPE
     window_days: int = Field(default=30, ge=1, le=365)
@@ -604,41 +581,6 @@ def get_graph(scope: str = SCOPE, limit: int = Query(default=20000, le=50000)):
         for e in edges
     ]
     return {"nodes": nodes, "links": links}
-
-
-@app.get("/api/graph/sources")
-def get_graph_sources(scope: str = SCOPE):
-    """KG composition by originating data source (split from episodes.source_ref).
-    Lets clients show where the knowledge graph's content comes from (facebook,
-    instagram, whatsapp, linkedin, netflix, spotify, gdata, social-graph, …)."""
-    SYS = {
-        "mind", "claude-code", "agent", "hermes", "brain", "self-analysis",
-        "deep-research", "open-webui", "curlychat", "curlypod", "jobpilot",
-        "reflection", "meta", "web", "probe", "routing-test", "smoketest", "curlyos-tui",
-    }
-    with get_conn() as conn:
-        ent = conn.execute(
-            "SELECT split_part(ep.source_ref, ':', 1) AS src, count(DISTINCT k.id) AS n "
-            "FROM knowledge_entities k JOIN episodes ep ON k.source_episode_id = ep.id "
-            "WHERE k.scope = %s AND k.valid_to IS NULL GROUP BY src", [scope]
-        ).fetchall()
-        mem = conn.execute(
-            "SELECT split_part(ep.source_ref, ':', 1) AS src, count(*) AS n "
-            "FROM memories m JOIN episodes ep ON m.source_episode_id = ep.id "
-            "WHERE m.scope = %s GROUP BY src", [scope]
-        ).fetchall()
-        epi = conn.execute(
-            "SELECT split_part(source_ref, ':', 1) AS src, count(*) AS n FROM episodes GROUP BY src"
-        ).fetchall()
-    agg: dict[str, dict] = {}
-    for rows, key in ((ent, "entities"), (mem, "memories"), (epi, "episodes")):
-        for r in rows:
-            s = r["src"] or "unknown"
-            agg.setdefault(s, {"source": s, "entities": 0, "memories": 0, "episodes": 0})[key] = r["n"]
-    out = sorted(agg.values(), key=lambda d: -d["entities"])
-    for d in out:
-        d["kind"] = "system" if d["source"] in SYS else "personal"
-    return {"sources": out}
 
 
 @app.get("/api/graph/{entity_id}/expand")
@@ -2109,41 +2051,8 @@ async def reflection_monthly(body: ReflectionRequest | None = None):
         return {"error": str(e), "scope": scope, "type": "monthly"}
 
 
-@app.post("/api/reflection/run")
-async def reflection_run(body: ReflectionRunRequest | None = None):
-    """Run a reflection pass at the given cadence (daily/weekly/monthly).
-
-    Body: {"scope": "user:usr_hiten", "report_type": "weekly"}
-    """
-    body = body or ReflectionRunRequest()
-    scope, report_type = body.scope, body.report_type
-
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from cognition.reflection import run_reflection
-
-    llm_client, llm_model = _make_llm_client("deep")
-    pool = await _get_async_pool()
-    try:
-        result = await run_reflection(
-            pool=pool,
-            publisher=_make_publisher_sync(),
-            scope=scope,
-            report_type=report_type,
-            llm_client=llm_client,
-            llm_model=llm_model,
-        )
-        result["llm"] = bool(llm_client)
-        if report_type in ("weekly", "monthly"):
-            result.update(
-                await _sync_identity_from_reflection(pool, _make_publisher_sync(), scope))
-            result.update(await _sync_goals_from_reflection(pool, scope))
-        return result
-    except Exception as e:
-        logger.exception("reflection/%s failed scope=%s", report_type, scope)
-        return {"error": str(e), "scope": scope, "report_type": report_type}
-
-
-@app.post("/api/reflection/daily")
+# Internal — called by the `reflection_daily` scheduler job. No HTTP surface:
+# the cadence-specific routes (`/api/reflection/weekly|monthly`) are the public ones.
 async def reflection_daily(body: ReflectionRequest | None = None):
     """Run a daily reflection over the past 24h.
 
@@ -2318,119 +2227,9 @@ async def attention_scan(body: AttentionScanRequest | None = None):
         return {"error": str(e), "scope": scope}
 
 
-# ── Mental model endpoints ───────────────────────────────────────────────────
-
-@app.get("/api/cognition/mental-models/context")
-async def mental_models_context(scope: str = SCOPE, domain: str | None = None):
-    """Return a compact text summary of active mental models for prompt injection."""
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from cognition.meta import mental_model_context
-
-    pool = await _get_async_pool()
-    try:
-        text = await mental_model_context(pool=pool, scope=scope, domain=domain)
-        return {"context": text, "scope": scope}
-    except Exception as e:
-        logger.exception("mental model context failed scope=%s", scope)
-        return {"error": str(e), "scope": scope}
-
-
-@app.post("/api/cognition/mental-models/search")
-async def mental_models_search(body: MentalModelSearchRequest):
-    """Search mental models by semantic relevance to a query string."""
-    scope, query = body.scope, body.query
-
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from cognition.meta import relevant_models
-
-    pool = await _get_async_pool()
-    embedder = await get_shared_embedder()
-    try:
-        query_embedding = await embedder.embed_single(query)
-        results = await relevant_models(
-            pool=pool, scope=scope, query_embedding=query_embedding)
-        return {"results": results, "query": query, "scope": scope}
-    except Exception as e:
-        logger.exception("mental model search failed scope=%s", scope)
-        return {"error": str(e), "scope": scope}
-
-
-@app.get("/api/cognition/assumptions/context")
-async def assumptions_context(scope: str = SCOPE, domain: str | None = None):
-    """Return a compact text summary of active assumptions for prompt injection."""
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from cognition.meta import assumption_context
-
-    pool = await _get_async_pool()
-    try:
-        text = await assumption_context(pool=pool, scope=scope, domain=domain)
-        return {"context": text, "scope": scope}
-    except Exception as e:
-        logger.exception("assumption context failed scope=%s", scope)
-        return {"error": str(e), "scope": scope}
-
-
 # ── Mood / Health endpoints ──────────────────────────────────────────────────
 
-@app.post("/api/attention/mood")
-async def attention_log_mood(body: MoodLogRequest):
-    """Record an explicit mood entry.
-
-    Body: {"mood": "focused", "valence": 0.8, "energy": 0.7}
-    """
-    scope = body.scope
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from cognition.attention import log_mood
-
-    pool = await _get_async_pool()
-    try:
-        result = await log_mood(
-            pool=pool, scope=scope, mood=body.mood,
-            valence=body.valence, energy=body.energy, context=body.context,
-        )
-        return result
-    except Exception as e:
-        logger.exception("log mood failed scope=%s", scope)
-        return {"error": str(e), "scope": scope}
-
-
-@app.get("/api/attention/mood")
-async def attention_mood_history(scope: str = SCOPE, days: int = 30):
-    """Return mood history with rolling averages.
-
-    Params: scope, days
-    """
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from cognition.attention import get_mood_history
-
-    pool = await _get_async_pool()
-    try:
-        result = await get_mood_history(pool=pool, scope=scope, days=days)
-        return result
-    except Exception as e:
-        logger.exception("mood history failed scope=%s", scope)
-        return {"error": str(e), "scope": scope}
-
-
-@app.get("/api/attention/health")
-async def attention_health(scope: str = SCOPE, days: int = 14):
-    """Return health indicators derived from recent episodes.
-
-    Params: scope, days
-    """
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from cognition.attention import health_signals
-
-    pool = await _get_async_pool()
-    try:
-        result = await health_signals(pool=pool, scope=scope, days=days)
-        return result
-    except Exception as e:
-        logger.exception("health signals failed scope=%s", scope)
-        return {"error": str(e), "scope": scope}
-
-
-@app.post("/api/attention/mood/infer")
+# Internal — called by the `mood_inference` scheduler job. No HTTP surface.
 async def attention_infer_mood(scope: str = SCOPE):
     """Infer current mood from the most recent episode."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

@@ -37,7 +37,6 @@ const sidebars: SidebarsConfig = {
         'subsystems/identity',
         'subsystems/cognition',
         'subsystems/orchestration',
-        'subsystems/safety-and-governance',
         'subsystems/goals-and-workspace',
         'subsystems/studio-simulation-evaluation',
         'subsystems/shared-infrastructure',
