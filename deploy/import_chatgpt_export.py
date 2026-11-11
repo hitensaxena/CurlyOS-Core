@@ -379,6 +379,277 @@ def done_chunk_indexes(conn, conv_id: str) -> set[int]:
     return {r[0] for r in rows}
 
 
+# ── legacy repair (phase 4) ─────────────────────────────────────────────────
+def legacy_index(conn) -> dict[str, dict]:
+    """conversation_id → {epi, path, chunks} from the 2026-06 import.
+
+    That import wrote one episode per conversation whose body was
+    "Knowledge import from <file>: N facts" — unusable for extraction — and
+    stored the conversation text as ~2 KB chunk memories instead.
+    """
+    rows = conn.execute(
+        "SELECT source_episode_id, statement FROM memories "
+        "WHERE statement LIKE '# archives/chatgpt/%' AND valid_to IS NULL"
+    ).fetchall()
+    path_rx = re.compile(r"^# (archives/chatgpt/[^\n]+)")
+    cid_rx = re.compile(r'conversation_id: "?([0-9a-f-]+)"?')
+
+    # Only the FIRST chunk of a conversation carries the frontmatter; the rest
+    # are continuations. Group by source_episode_id (one episode per file) and
+    # read the identity from whichever chunk has it, so `memories` is the real
+    # chunk count per conversation, not a count of frontmatter rows.
+    by_epi: dict[str, list[str]] = {}
+    for epi_id, statement in rows:
+        by_epi.setdefault(epi_id or "", []).append(statement or "")
+
+    index: dict[str, dict] = {}
+    for epi_id, statements in by_epi.items():
+        for statement in statements:
+            m_path, m_cid = path_rx.match(statement), cid_rx.search(statement)
+            if m_path and m_cid:
+                index[m_cid.group(1)] = {
+                    "epi": epi_id,
+                    "path": m_path.group(1),
+                    "memories": len(statements),
+                }
+                break
+    return index
+
+
+async def repair_legacy(args: argparse.Namespace, export_dir: Path, mirror_dir: Path,
+                        scope: str, max_chars: int) -> dict:
+    """Re-point 2026-06 stub episodes at real text, re-extract, then retire the
+    raw chunk memories they were paired with.
+
+    Guardrail: a conversation is only retired once its replacement exists —
+    either a summary memory was written, or the whole conversation fits inside
+    the single episode we just rewrote (≤ max_chars). Conversations longer than
+    that which fail to summarise keep their raw chunks.
+    """
+    import psycopg
+    from psycopg_pool import AsyncConnectionPool
+
+    sync = psycopg.connect(dsn())
+    index = legacy_index(sync)
+    log.info("legacy index: %d conversation(s), %d raw chunk memories",
+             len(index), sum(v["memories"] for v in index.values()))
+    ledger = {
+        r[0]: r[1]
+        for r in sync.execute(
+            "SELECT conversation_id, status FROM chatgpt_conversations"
+        ).fetchall()
+    }
+
+    asset_names = load_asset_names(export_dir)
+    work: list[dict] = []
+    for conv in iter_conversations(export_dir):
+        cid = conv["conversation_id"]
+        if cid not in index:
+            continue
+        if ledger.get(cid) == "ingested" and not args.repair_all:
+            continue
+        turns = conversation_turns(conv, asset_names)
+        if not turns:
+            continue
+        chunks = chunk_turns(conv, turns, max_chars)
+        work.append({
+            "conv": conv,
+            "conv_id": cid,
+            "epi": index[cid]["epi"],
+            "chars": sum(len(t) for _, t in turns),
+            "text": chunks[0],
+            "chunks": chunks,
+            "turns": turns,
+            "turn_count": len(turns),
+            "raw_memories": index[cid]["memories"],
+        })
+
+    missing = [cid for cid in index if cid not in {w["conv_id"] for w in work}]
+    total_chars = sum(w["chars"] for w in work)
+    print()
+    print(f"legacy conversations in graph : {len(index)}")
+    print(f"  rebuildable from export     : {len(work)}")
+    print(f"  not in this export (kept)   : {len(missing)}")
+    print(f"  chars                     : {total_chars:,}")
+    print(f"  raw memories at stake       : {sum(w['raw_memories'] for w in work):,}")
+    print(f"  LLM calls                   : {len(work)} extraction + {len(work)} summaries")
+    print()
+    if args.dry_run:
+        for w in sorted(work, key=lambda x: -x["chars"])[:10]:
+            print(f"  {w['chars']:>7,} chars  {w['raw_memories']:>3} raw mems  "
+                  f"{(w['conv'].get('title') or '')[:55]}")
+        print("\n[dry-run] nothing written")
+        sync.close()
+        return {"dry_run": True}
+
+    if args.limit:
+        work = work[: args.limit]
+
+    pool = AsyncConnectionPool(dsn(), min_size=1, max_size=4, open=False)
+    await pool.open()
+    from shared.events.implementations import PgOnlyPublisher
+    from memory.governance import add
+    from knowledge.graph import extract_and_project
+    from shared.embeddings.implementations import LocalBgeM3, CachingEmbedder
+
+    publisher = PgOnlyPublisher()
+    embedder = CachingEmbedder(LocalBgeM3())
+    await embedder.embed(["warmup"])
+    llm = make_llm()
+    model = os.environ.get("CURLYOS_LLM_MODEL", "claude-haiku-5-5")
+    chain = [m.strip() for m in os.environ.get("CURLYOS_MODEL_CHAIN", "").split(",") if m.strip()]
+
+    stats = {"repaired": 0, "summaries": 0, "entities": 0, "edges": 0,
+             "triples": 0, "retired_memories": 0, "kept_chunks": 0,
+             "retirable": 0, "errors": 0}
+    t0 = time.time()
+
+    for n, w in enumerate(work, 1):
+        cid, epi_id, text = w["conv_id"], w["epi"], w["text"]
+        try:
+            md_file = mirror_path(mirror_dir, w["conv"])
+            md_file.parent.mkdir(parents=True, exist_ok=True)
+            md_file.write_text(render_markdown(w["conv"], w["turns"]), encoding="utf-8")
+            async with pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE episodes SET content = %s WHERE id = %s",
+                        (text, epi_id),
+                    )
+
+            try:
+                vec = (await embedder.embed([text]))[0]
+                literal = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+                async with pool.connection() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "UPDATE episodes SET embedding = %s::vector WHERE id = %s",
+                            (literal, epi_id),
+                        )
+            except Exception:  # noqa: BLE001
+                log.warning("episode re-embed failed epi=%s", epi_id)
+
+            triples = entities = edges = 0
+            for candidate in [model] + chain:
+                try:
+                    os.environ["CURLYOS_LLM_MODEL"] = candidate
+                    res = await extract_and_project(
+                        pool, publisher, scope, epi_id, text,
+                        embedder=embedder, llm_client=llm,
+                    )
+                    triples = int(res.get("triples_extracted", 0))
+                    entities = int(res.get("entities_created", 0))
+                    edges = int(res.get("edges_created", 0))
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("legacy extract failed %s (%s): %s", cid, candidate, exc)
+            os.environ["CURLYOS_LLM_MODEL"] = model
+            stats["triples"] += triples
+            stats["entities"] += entities
+            stats["edges"] += edges
+
+            summary = ""
+            if llm is not None:
+                view = "\n\n".join(w["chunks"])[: args.summary_chars]
+                for candidate in [model] + chain:
+                    try:
+                        summary = await summarize(llm, candidate, view)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("legacy summary failed %s (%s): %s", cid, candidate, exc)
+                        summary = ""
+                    if summary:
+                        break
+            mem_id = None
+            if summary and "NO_DURABLE_CONTENT" not in summary:
+                mem = await add(
+                    pool, publisher, scope,
+                    statement=f"ChatGPT conversation \"{w['conv'].get('title') or 'Untitled'}\" "
+                              f"({(_ts(w['conv'].get('create_time')) or datetime.now(tz=timezone.utc)).date()}):\n{summary}",
+                    source_episode_id=epi_id, kind="fact", epistemic_status="canonical",
+                )
+                mem_id = mem.get("mem_id")
+                stats["summaries"] += 1
+                try:
+                    vec = (await embedder.embed([summary]))[0]
+                    literal = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+                    async with pool.connection() as conn:
+                        async with conn.cursor() as cur:
+                            await cur.execute(
+                                "UPDATE memories SET embedding = %s::vector WHERE id = %s",
+                                (literal, mem_id),
+                            )
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # Retirement is opt-in (--retire-chunks). Recall reads `memories`
+            # only, so a retired chunk is gone from recall forever — that is a
+            # decision to make with the summary quality in hand, not by default.
+            replace_ok = bool(mem_id) or w["chars"] <= len(text)
+            retired = 0
+            if args.retire_chunks and replace_ok:
+                async with pool.connection() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            # left() prefix match, not LIKE: archive filenames
+                            # contain underscores, which LIKE treats as wildcards.
+                            "UPDATE memories SET valid_to = now() "
+                            "WHERE source_episode_id = %s AND valid_to IS NULL "
+                            "AND left(statement, length(%s)) = %s",
+                            (epi_id, f"# {index[cid]['path']}", f"# {index[cid]['path']}"),
+                        )
+                        retired = cur.rowcount
+                stats["retired_memories"] += retired
+            else:
+                stats["kept_chunks"] += w["raw_memories"]
+                if replace_ok:
+                    stats["retirable"] += w["raw_memories"]
+
+            async with pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        INSERT INTO chatgpt_conversations
+                          (conversation_id, title, created_at, message_count, model,
+                           char_count, chunk_count, md_path, export_dir, status,
+                           summary_mem_id, note, imported_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'ingested',%s,%s,now())
+                        ON CONFLICT (conversation_id) DO UPDATE SET
+                          status = 'ingested', summary_mem_id = EXCLUDED.summary_mem_id,
+                          note = EXCLUDED.note, imported_at = now(),
+                          md_path = EXCLUDED.md_path, char_count = EXCLUDED.char_count
+                        """,
+                        (cid, w["conv"].get("title"), _ts(w["conv"].get("create_time")),
+                         w["turn_count"], w["conv"].get("default_model_slug"),
+                         w["chars"], len(w["chunks"]), str(md_file),
+                         str(export_dir), mem_id,
+                         f"legacy repair 2026-11-11: {retired} raw chunks retired"),
+                    )
+            stats["repaired"] += 1
+            log.info("[%d/%d] %s +%dE +%dR, retired %d chunks (%.0fs)",
+                     n, len(work), cid[:8], entities, edges, retired, time.time() - t0)
+        except Exception:  # noqa: BLE001
+            stats["errors"] += 1
+            log.exception("legacy repair failed cid=%s", cid)
+
+    await pool.close()
+    try:
+        import redis.asyncio as aioredis
+        r = aioredis.from_url(os.environ.get("CURLYOS_REDIS_URL", "redis://127.0.0.1:6379"))
+        await r.incr(f"recall:gen:{scope}")
+        await r.aclose()
+    except Exception:  # noqa: BLE001
+        log.warning("could not bump recall cache generation")
+
+    print("\n" + "=" * 60)
+    for k, v in stats.items():
+        print(f"  {k:<18} {v}")
+    print(f"  kept raw chunks    {stats['kept_chunks']} (no replacement)")
+    print(f"  elapsed            {time.time() - t0:.0f}s")
+    print("=" * 60)
+    sync.close()
+    return stats
+
+
 # ── main ────────────────────────────────────────────────────────────────────
 async def run(args: argparse.Namespace) -> dict:
     import psycopg
@@ -389,6 +660,9 @@ async def run(args: argparse.Namespace) -> dict:
     mirror_dir = Path(args.mirror_dir).expanduser().resolve()
     scope = args.scope or os.environ.get("CURLYOS_SCOPE") or SCOPE_DEFAULT
     max_chars = args.max_chars
+
+    if args.repair_legacy:
+        return await repair_legacy(args, export_dir, mirror_dir, scope, max_chars)
 
     asset_names = load_asset_names(export_dir)
     log.info("export: %s (%d known asset names)", export_dir, len(asset_names))
@@ -748,6 +1022,15 @@ def main() -> None:
     ap.add_argument("--no-summary", action="store_true")
     ap.add_argument("--resummarize", action="store_true",
                     help="re-visit ingested conversations that never got a summary memory")
+    ap.add_argument("--repair-legacy", action="store_true",
+                    help="phase 4: re-point 2026-06 stub episodes at real text, re-extract, "
+                         "retire the raw chunk memories (only where a replacement exists)")
+    ap.add_argument("--repair-all", action="store_true",
+                    help="with --repair-legacy: include conversations already marked ingested")
+    ap.add_argument("--retire-chunks", action="store_true",
+                    help="with --repair-legacy: also soft-delete (valid_to) the raw chunk "
+                         "memories. Off by default; without it the run only reports how many "
+                         "are retirable.")
     args = ap.parse_args()
     asyncio.run(run(args))
 
