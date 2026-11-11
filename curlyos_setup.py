@@ -11,7 +11,6 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
 
 import psycopg
 
@@ -47,7 +46,7 @@ def check_postgres(dsn: str) -> tuple[bool, str]:
         conn.close()
         if has_vector:
             return True, f"Postgres OK ({ver[:40]}), pgvector installed"
-        return False, f"Postgres OK but pgvector extension missing. Run: CREATE EXTENSION vector;"
+        return False, "Postgres OK but pgvector extension missing. Run: CREATE EXTENSION vector;"
     except Exception as e:
         return False, f"Postgres connection failed: {e}"
 

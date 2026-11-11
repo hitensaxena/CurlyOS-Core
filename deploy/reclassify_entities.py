@@ -37,7 +37,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from knowledge.extraction import ENTITY_LABELS, normalize_label
-from shared.epistemic import normalize_status, MEMORY_STATUSES
+from shared.epistemic import normalize_status
 from shared.llm import json_records
 
 

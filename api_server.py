@@ -1331,7 +1331,7 @@ async def _bump_recall_gen(redis: Any, scope: str) -> None:
 
 
 def _make_publisher_sync():
-    """Create a PgNatsPublisher without NATS (PG-only staging)."""
+    """Create the Postgres event publisher (stage inside the caller's tx)."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from shared.events.implementations import PgOnlyPublisher
     return PgOnlyPublisher()

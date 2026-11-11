@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from shared.types.ulid import mint, is_valid
@@ -127,7 +127,7 @@ async def record_episode(
             subject=epi_id,
             scope=_scope_obj(scope_text),
             data=data,
-            actor=f"system",
+            actor="system",
             source="curlyos-core/memory",
         )
         _stored, subject, stamped = await publisher.stage(ev, conn)

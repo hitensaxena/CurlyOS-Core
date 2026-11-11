@@ -24,7 +24,6 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Any
 
 log = logging.getLogger("curlyos-core.notify")
 

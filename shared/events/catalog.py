@@ -70,6 +70,14 @@ def short_of(full_type: str) -> str:
     return full_type[len(FULL_TYPE_PREFIX):]
 
 
+def full_type(short: str) -> str:
+    """'memory.fact.stored' -> 'art.curlybrackets.curlyos.memory.fact.stored'.
+
+    Does not validate; `build_event()` does that at the call site.
+    """
+    return FULL_TYPE_PREFIX + short
+
+
 def subject_for(short: str) -> str:
     """'memory.fact.stored' -> 'curlyos.memory.fact.stored'."""
     return SUBJECT_PREFIX + short

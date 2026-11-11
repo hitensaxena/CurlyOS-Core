@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import re
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from shared.types.ulid import mint
@@ -241,9 +241,6 @@ async def surface_themes(
     Uses noun phrase frequency analysis. Clusters similar phrases.
     All themes inserted at epistemic_status='hypothesis'.
     """
-    import re
-    from collections import Counter
-
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -326,7 +323,6 @@ async def compose_chapters(
     line. All chapters at epistemic_status='hypothesis'.
     """
     import re
-    import json as _json
     from collections import Counter
     from knowledge.graph import graph_context as _graph_ctx
 

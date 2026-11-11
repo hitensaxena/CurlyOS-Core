@@ -100,7 +100,6 @@ async def get_allocation(pool: Any, scope: str, window_days: int = 7) -> dict:
 
     # All categories that appeared in either half
     all_cats = set(first_counts.keys()) | set(second_counts.keys())
-    total_all = sum(second_counts.values()) or 1
 
     categories: dict[str, dict] = {}
     for cat in all_cats:
@@ -496,8 +495,6 @@ async def get_mood_history(
 
     # Simple trend: compare first half vs second half of the window
     mid = n // 2
-    recent_avg = valence_sum / n
-    older_avg = valence_sum / n  # simplified - more sophisticated split across time
     if mid > 0:
         recent = sum(e["valence"] for e in entries[:mid]) / mid
         older = sum(e["valence"] for e in entries[mid:]) / max(n - mid, 1)

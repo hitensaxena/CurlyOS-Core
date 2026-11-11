@@ -9,7 +9,8 @@ import sys
 sys.path.insert(0, os.path.expanduser("~/curlyos-core"))
 sys.path.insert(0, os.path.expanduser("~/.hermes/plugins/curlyos"))
 # Stub out the Hermes agent + tools modules that the plugin imports
-import types, sys as _sys
+import types
+import sys as _sys
 _agent_mod = types.ModuleType("agent")
 _memprov_mod = types.ModuleType("agent.memory_provider")
 class _DummyMemProvider:

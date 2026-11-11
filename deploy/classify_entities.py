@@ -14,7 +14,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import psycopg
-from knowledge.extraction import ENTITY_LABELS, normalize_label
+from knowledge.extraction import normalize_label
 from shared.llm import json_records
 
 DSN = os.environ["CURLYOS_DATABASE_URL"]

@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from shared.types import (
-    RetrievalRequest, RetrievalResult, RetrievedItem, RankWeights,
+    RetrievalRequest, RetrievalResult, RetrievedItem,
 )
 
 log = logging.getLogger("curlyos.retrieval")
@@ -703,7 +703,8 @@ def diversify_by_episode(
     list and get the same order back when nothing is capped.
     """
     if key_of is None:
-        key_of = lambda it: getattr(it, "source_episode_id", "") or getattr(it, "id", "")
+        def key_of(it):
+            return getattr(it, "source_episode_id", "") or getattr(it, "id", "")
     decorated = [
         ((score_of(it) + (summary_boost if is_archive_summary(getattr(it, "text", "") or "")
                           else 0.0)), idx, it)

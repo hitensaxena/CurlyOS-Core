@@ -3,7 +3,7 @@
 import pytest
 
 from shared.events import build_event, full_type, short_type, EventPublisher
-from shared.events.implementations import PgOnlyPublisher, PgNatsPublisher, _stored_scope
+from shared.events.implementations import PgOnlyPublisher, _stored_scope
 
 
 FULL_PREFIX = "art.curlybrackets.curlyos."
@@ -78,26 +78,14 @@ class TestPgOnlyPublisher:
         """PgOnlyPublisher is importable and instantiable."""
         pub = PgOnlyPublisher()
         assert pub is not None
-        assert pub._nats is None
+
+    @pytest.mark.asyncio
+    async def test_emit_is_a_no_op_without_a_broker(self):
+        await PgOnlyPublisher().emit("curlyos.memory.fact.stored", {"id": "evt_x"})
 
     def test_pg_only_publisher_is_event_publisher(self):
         pub = PgOnlyPublisher()
         assert isinstance(pub, EventPublisher)
-
-
-class TestPgNatsPublisher:
-    def test_pg_nats_publisher_import(self):
-        """PgNatsPublisher is importable."""
-        pub = PgNatsPublisher(nats_client=None)
-        assert pub is not None
-
-    def test_pg_nats_publisher_with_mock_nats(self):
-        class FakeNats:
-            pass
-
-        pub = PgNatsPublisher(nats_client=FakeNats(), stream="CURLYOS_TEST")
-        assert pub._nats is not None
-        assert pub._stream == "CURLYOS_TEST"
 
 
 class TestStoredScope:

@@ -9,8 +9,6 @@ Reads the extracted triples JSON and:
 import asyncio
 import json
 import os
-import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 # Pool adapter (works in both venvs)
@@ -22,15 +20,20 @@ MIND_DIR = Path.home() / "mind"
 
 
 class SyncPool:
-    def __init__(self, d): self._dsn = d
+    def __init__(self, d):
+        self._dsn = d
     def connection(self): return _CtxMgr(self._dsn)
 class _CtxMgr:
-    def __init__(self, d): self._dsn = d; self._conn = None
+    def __init__(self, d):
+        self._dsn = d
+        self._conn = None
     async def __aenter__(self):
         self._conn = psycopg.connect(self._dsn, autocommit=False)
         return _CW(self._conn)
     async def __aexit__(self, *a):
-        if self._conn: self._conn.commit(); self._conn.close()
+        if self._conn:
+            self._conn.commit()
+            self._conn.close()
 class _CW:
     def __init__(self, c): self._c = c
     def cursor(self): return _CC(self._c)
@@ -97,7 +100,6 @@ def normalize_predicate(pred: str) -> str:
 def classify_triple(triple: dict) -> str:
     """Classify a triple into: identity, fact, relationship, project, health, skill, other."""
     pred = triple.get("predicate", "").lower()
-    obj = triple.get("object", "").lower()
 
     identity_preds = {"name", "age", "nationality", "location", "role", "occupation",
                       "diagnosis", "relationship_status", "friendship_pattern",
@@ -232,7 +234,7 @@ async def main():
     stats = await import_triples(triples, pool, pub, SCOPE)
 
     print(f"\n{'='*60}")
-    print(f"IMPORT RESULTS:")
+    print("IMPORT RESULTS:")
     print(f"  Episodes created:     {stats['episodes_created']}")
     print(f"  Facts added:          {stats['facts_added']}")
     print(f"  Identity facts:       {stats['identity_facts']}")

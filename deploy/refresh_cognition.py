@@ -98,7 +98,7 @@ async def main():
     gaps = await detect_alignment_gaps(pool=pool, publisher=pub, scope=SCOPE)
     alloc = await get_allocation(pool=pool, scope=SCOPE, window_days=7)
     load = await estimate_cognitive_load(pool=pool, scope=SCOPE, window_days=14)
-    log(f"attention: gaps={len(gaps)} load={load}")
+    log(f"attention: gaps={len(gaps)} load={load} categories={len(alloc.get('categories', {}))}")
 
     # 5. Meta-cognition: clear stale decision_audits + principles, re-derive from
     #    clean data, re-mirror principles into recallable memories.

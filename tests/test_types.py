@@ -1,6 +1,5 @@
 """Tests for CurlyOS Core type models, ULID minting/validation, and enums."""
 
-import re
 from datetime import datetime, timezone
 
 import pytest
@@ -16,7 +15,7 @@ from shared.types import (
     RetrievalResult,
     ScopeLevel,
 )
-from shared.types.ulid import mint, is_valid, PREFIXES, ALL_PREFIXES
+from shared.types.ulid import mint, is_valid, ALL_PREFIXES
 
 
 # ── Episode ──────────────────────────────────────────────────────────────────

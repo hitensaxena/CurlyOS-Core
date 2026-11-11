@@ -393,7 +393,7 @@ Maps a mode string to the set of `epistemic_status` values to include. Normal mo
 ## Consolidation
 
 **Module:** `memory/consolidation/__init__.py`  
-**Scheduler:** `memory/consolidation/scheduler.py`
+**Scheduled by:** the API job scheduler (`consolidation_fast`, `consolidation_deep`)
 
 ### Constants and thresholds
 
@@ -550,49 +550,14 @@ async def _recombine_pass(pool, scope: str, publisher, embedder) -> int
 
 Each returns a single integer count of operations performed.
 
-### Scheduler
+### Scheduling
 
-**Module:** `memory/consolidation/scheduler.py`
-
-```python
-class ConsolidationScheduler:
-    def __init__(self, pool, redis, embedder, publisher, interval_seconds: int = 1800)
-    def start(self) -> None
-    def stop(self) -> None
-    def run_once_sync(self, scope: str | None = None, replay: bool = False) -> dict
-    @property is_running: bool
-    @property last_run_at: str  # ISO-8601 or "never"
-```
-Spawns a daemon thread (`curlyos-consolidation`) that calls `run_once` every `interval_seconds` (default 30 minutes). Sleep is broken into 1-second increments so `stop()` is responsive. Each loop iteration creates and closes its own `asyncio` event loop to avoid interference with the main process loop.
-
-```python
-async def start_scheduler(pool, redis, embedder, publisher, interval_seconds: int = 1800) -> ConsolidationScheduler
-```
-Creates and starts a `ConsolidationScheduler`. Called at application startup (unless `CURLYOS_SCHEDULER=0`).
-
-```python
-async def run_fast_path(pool, redis, embedder, publisher, reranker=None, scope: str | None = None) -> dict
-```
-Runs `run_consolidation(deep=False)` — SUMMARIZE + DEDUP + CONFLICT-RESOLVE.
-
-```python
-async def run_deep_path(pool, redis, embedder, publisher, reranker=None, scope: str | None = None) -> dict
-```
-Runs `run_consolidation(deep=True)` — all six passes.
-
-```python
-async def get_consolidation_status(pool, scope: str) -> dict
-```
-Reads `projection_watermarks` and counts pending events. Returns `{last_seq, last_run_at, events_pending, status}` where `status` is `"idle"`, `"stale"`, or `"empty"`.
-
-```python
-def run_consolidation_standalone(
-    dsn: str | None = None, redis_url: str | None = None,
-    scope: str | None = None, replay: bool = False,
-    embedder_type: str = "fake",
-) -> dict
-```
-Synchronous, dependency-free runner for Hermes cron and CLI use (`python3 -m memory.consolidation.scheduler`). Falls back to `CURLYOS_DATABASE_URL` and `CURLYOS_REDIS_URL` env vars. Supports `embedder_type="bge-m3"` or `"fake"`.
+Consolidation has no scheduler of its own. The API's job scheduler owns the cadence: the
+`consolidation_fast` job calls `consolidation_run(mode="fast")` every 20 minutes, and
+`consolidation_deep` calls it nightly at 03:05. Both are internally locked per scope, so a
+slow run never overlaps the next firing. See
+[Shared Infrastructure](shared-infrastructure.md) for the scheduler itself and
+`POST /api/consolidation/run` for a manual pass.
 
 ## Stores
 
@@ -636,10 +601,6 @@ The functions other modules and the REST layer call directly:
 | `retrieve(request, pool, embedder, reranker, redis, fast_followup)` | `memory.retrieval` | Full five-stage recall pipeline |
 | `run_once(pool, redis, embedder, publisher, ...)` | `memory.consolidation` | Project events for all or one scope |
 | `run_consolidation(pool, redis, embedder, publisher, ...)` | `memory.consolidation` | Full consolidation with pass selection |
-| `start_scheduler(pool, redis, embedder, publisher, interval_seconds)` | `memory.consolidation.scheduler` | Start background consolidation thread |
-| `run_fast_path(pool, redis, embedder, publisher, ...)` | `memory.consolidation.scheduler` | Fast (SUMMARIZE+DEDUP+CONFLICT) path |
-| `run_deep_path(pool, redis, embedder, publisher, ...)` | `memory.consolidation.scheduler` | Nightly deep path (all 6 passes) |
-| `get_consolidation_status(pool, scope)` | `memory.consolidation.scheduler` | Watermark + pending event count |
 
 ## Related REST endpoints
 

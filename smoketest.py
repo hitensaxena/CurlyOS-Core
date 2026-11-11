@@ -12,13 +12,12 @@ Tests:
 import asyncio
 import sys
 import os
-import json
 from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from shared.types.ulid import mint, is_valid
-from shared.types import RetrievalRequest, RankWeights
+from shared.types.ulid import is_valid
+from shared.types import RetrievalRequest
 from shared.events.implementations import PgOnlyPublisher
 from shared.embeddings.implementations import FakeEmbedder, FakeReranker
 
@@ -129,8 +128,7 @@ class FakeRedis:
 
 async def main():
     from memory.governance import (
-        record_episode, add, invalidate, list_memories, list_episodes,
-        SourceEpisodeNotFound, AlreadyInvalidated,
+        record_episode, add, invalidate, list_memories, SourceEpisodeNotFound, AlreadyInvalidated,
     )
     from memory.retrieval import retrieve
     from memory.consolidation import run_once

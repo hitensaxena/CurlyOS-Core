@@ -1,7 +1,7 @@
 """Tests for memory governance verbs: record_episode, add, invalidate, forget, list_episodes, list_memories."""
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -10,8 +10,6 @@ from memory.governance import (
     MemoryNotFound,
     AlreadyInvalidated,
     ForgetRequiresApproval,
-    AlreadyForgotten,
-    ApprovalAlreadyUsed,
     add,
     forget,
     invalidate,
@@ -533,7 +531,6 @@ class TestScopeIsolation:
     async def test_scope_isolation(self):
         """Episodes in different scopes should only return those matching the scope."""
         scope_a = "user:usr_a"
-        scope_b = "user:usr_b"
         now = datetime.now(timezone.utc)
 
         conn = AsyncMock()

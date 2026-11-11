@@ -1,16 +1,11 @@
 """Event envelope + publisher contract.
 
-CloudEvents v1.0 envelope with typed-prefix ULID event ids.
-All events land in the `events` Postgres table AND NATS JetStream.
-
-Stream taxonomy:
-  HITENOS_MEMORY  — memory.fact.stored|consolidated|invalidated, memory.episode.recorded
-  HITENOS_AGENTS  — agent.run.* , agents.delegate.*
-  HITENOS_SAFETY  — safety.approval.*
-  HITENOS_EVOLUTION — evolution.eval.completed, evolution.selfmod.*, reflection.insight.produced
-  HITENOS_EVENTS  — identity.fact.updated, attention.*, narrative.*, sense.*, discovery.*
+CloudEvents v1.0 envelope with typed-prefix ULID event ids. Events land in the
+`events` Postgres table and nowhere else — there is no message broker in this
+system (deviation DR-C1), and every consumer reads the table by `seq`.
 
 Event type grammar: art.curlybrackets.curlyos.<domain>.<verb>
+The set of legal types is closed; see shared/events/catalog.py.
 """
 from __future__ import annotations
 
@@ -18,21 +13,19 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from shared.events.catalog import FULL_TYPE_PREFIX, full_type, validate_short_type
 from shared.types.ulid import mint
 
 log = logging.getLogger(__name__)
 
-_FULL_TYPE_PREFIX = "art.curlybrackets.curlyos."
-
-
-def full_type(short_type: str) -> str:
-    """Expand 'memory.fact.stored' → 'art.curlybrackets.curlyos.memory.fact.stored'."""
-    return f"{_FULL_TYPE_PREFIX}{short_type}"
-
 
 def short_type(full: str) -> str:
-    """Strip the prefix. Returns unchanged if not prefixed."""
-    return full[len(_FULL_TYPE_PREFIX):] if full.startswith(_FULL_TYPE_PREFIX) else full
+    """Strip the prefix. Returns unchanged if not prefixed.
+
+    Lenient counterpart of `catalog.short_of`, which raises on a foreign type.
+    Both live here rather than being redefined per caller.
+    """
+    return full[len(FULL_TYPE_PREFIX):] if full.startswith(FULL_TYPE_PREFIX) else full
 
 
 def build_event(
@@ -47,8 +40,6 @@ def build_event(
 
     The short type must be registered in the CLOSED catalog
     (shared/events/catalog.py) — unknown types raise UnknownEventType."""
-    from shared.events.catalog import validate_short_type
-
     validate_short_type(short_type)
     return {
         "specversion": "1.0",
@@ -64,22 +55,23 @@ def build_event(
 
 
 class EventPublisher:
-    """Abstract publisher — stamps events to Postgres (SoR) and NATS JetStream (live).
+    """The publisher contract: stage the event row, then (optionally) announce it.
 
-    Subclasses implement `_stage_pg()` and `_emit_nats()`.
-    The pattern from HitenOS: stage event row in the SAME DB transaction as the
-    SoR write, then publish to NATS post-commit (non-fatal on failure).
+    `stage()` writes the event into `events` inside the caller's transaction, so
+    the event and the state change it describes commit together or not at all.
+    `emit()` runs post-commit. With no broker in this system the only
+    implementation, `PgOnlyPublisher`, makes it a no-op.
     """
 
     async def stage(self, event: dict, conn: Any) -> tuple[str, str, dict]:
-        """Insert event row into `events` table inside the caller's transaction.
+        """Insert event row into `events` inside the caller's transaction.
 
-        Returns (event_id, nats_subject, stamped_event).
+        Returns (event_id, subject, stamped_event).
         """
         raise NotImplementedError
 
     async def emit(self, subject: str, event: dict) -> None:
-        """Publish to NATS JetStream (post-commit, best-effort)."""
+        """Post-commit notification hook (no-op without a broker)."""
         raise NotImplementedError
 
     def stamp(self, event: dict) -> dict:

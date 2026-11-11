@@ -5,8 +5,6 @@ Default: bge-m3 1024-dim (pinned in HitenOS architecture).
 """
 from __future__ import annotations
 
-from typing import Any
-
 
 class Embedder:
     """Abstract embedder — produces 1024-dim vectors from text.

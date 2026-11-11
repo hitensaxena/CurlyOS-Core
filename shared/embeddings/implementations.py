@@ -12,7 +12,6 @@ import hashlib
 import logging
 import math
 import threading
-from typing import Any
 
 from shared.embeddings import Embedder, Reranker
 

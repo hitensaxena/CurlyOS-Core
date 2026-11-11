@@ -12,10 +12,9 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
 from typing import Any
 
-from shared.types.ulid import mint, is_valid
+from shared.types.ulid import mint
 from shared.events import build_event
 from shared.scope import scope_parts
 
@@ -597,7 +596,7 @@ async def extract_and_project(
     This is the main entry point called by the consolidation worker
     when processing `memory.episode.recorded` events.
     """
-    from knowledge.extraction import extract_with_llm, ExtractedTriple
+    from knowledge.extraction import extract_with_llm
     from knowledge.resolution import resolve_entity, ResolutionDecision, normalize_mention
 
     # 1. Extract triples

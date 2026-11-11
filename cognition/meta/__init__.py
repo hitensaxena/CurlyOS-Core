@@ -14,9 +14,7 @@ See: ~/hitenos-architecture/34-meta-cognition.md
 """
 from __future__ import annotations
 
-import json
 import logging
-from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
 
 from shared.types.ulid import mint
@@ -138,7 +136,6 @@ async def create_assumption(
     )
     if publisher is not None:
         try:
-            from shared.events import EventPublisher  # type: ignore[import]
             if hasattr(publisher, "stage"):
                 async with pool.connection() as conn:
                     await publisher.stage(event, conn)
@@ -378,7 +375,6 @@ async def _llm_extract_decisions(llm_client: Any, model: str, episodes_text: str
     Returns a list of {decision, domain, rationale} dicts. Raises on failure
     so the caller can fall back to the regex path.
     """
-    import json
 
     prompt = (
         "From the conversation log below, extract concrete DECISIONS the user "
@@ -516,7 +512,6 @@ async def _llm_distill_principles(llm_client: Any, model: str, audit_rows: list)
     Returns [{statement, domain, confidence}]. Raises on failure so the caller
     can decide how to degrade.
     """
-    import json
 
     decisions_text = "\n".join(
         f"- [{(dom or 'general')}] {(dec or '')[:300]}" for dec, dom in audit_rows[:120]
@@ -638,7 +633,6 @@ async def generate_assumptions_and_models(
     """
     if llm_client is None:
         return {"assumptions": 0, "mental_models": 0}
-    import json
 
     async with pool.connection() as conn:
         async with conn.cursor() as cur:

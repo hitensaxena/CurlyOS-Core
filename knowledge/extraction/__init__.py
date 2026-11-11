@@ -12,10 +12,9 @@ from __future__ import annotations
 import os
 import re
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-from shared.types.ulid import mint
 from shared.llm import json_records
 
 log = logging.getLogger("curlyos.knowledge.extraction")

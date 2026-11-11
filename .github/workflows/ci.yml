@@ -12,10 +12,12 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
       # Tests mock their DB pools (AsyncMock) — no service containers needed.
-      # Heavy extras (embeddings/torch, neo4j, nats) deliberately excluded.
+      # Heavy extras (embeddings/torch, neo4j) deliberately excluded.
       # `mcp` is needed by tests/test_mcp_bridge.py (FastMCP client needs httpx).
       - run: uv sync --extra dev --extra postgres --extra redis --extra mcp
-      - run: uv run ruff check api_server.py
+      # Lint the whole tree, not one file — the previous target let 80+ errors
+      # accumulate in every module the linter never looked at.
+      - run: uv run ruff check .
       - run: uv run pytest -q
 
   # docs-deploy.yml only builds on main, so until this job existed a Dependabot

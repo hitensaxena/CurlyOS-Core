@@ -193,38 +193,38 @@ DDL `METACOG_DDL`: `assumptions` (`asu_`), `assumption_edges`, `mental_models` (
 
 ## Decision loop
 
-`cognition/decision_loop/__init__.py` — the faculty that lets CurlyOS *learn from its own decisions* rather than merely record them. Schema lives in `migrations/0007_decision_loop.sql`. These are deliberately thin psycopg helpers (sync + async variants of each) that own only DB mechanics and scoring; the lesson *text* is produced upstream by the reflection/meta LLM.
+`cognition/decision_loop/__init__.py` — the faculty that lets CurlyOS *learn from its own decisions* rather than merely record them. Schema lives in `migrations/0007_decision_loop.sql`. These are deliberately thin psycopg async helpers that own only DB mechanics and scoring; the lesson *text* is produced upstream by the reflection/meta LLM.
 
 The four moves plus a KG mirror:
 
 1. **DECIDE** — a `decisions` row carries a falsifiable prediction (`predicted_outcome` + `prediction_confidence`). (Written upstream, e.g. by the Executive/orchestrator.)
-2. **OUTCOME** — `record_outcome(...)` records what actually happened and scores it against the prediction via a **Brier surprise** term: `(confidence - hit)^2`. High surprise = confidently wrong (or unconfidently right) — exactly what's worth distilling. It backfills `decisions.outcome`/`outcome_id` and stamps `reviewed_at` so the scheduler's review index stops surfacing it.
-3. **LESSON** — `distill_or_reinforce_lesson(...)` creates a new `lessons` row, or — if the nearest existing lesson is within cosine `sim_threshold=0.85` — *reinforces* it instead (bumps `support_count` + `confidence`, appends provenance, promotes `provisional → validated` at `support_count >= 3`). This stops near-duplicate fragmentation and lets confidence accrue with evidence.
-4. **FEEDBACK** — `retrieve_lessons(...)` pulls the lessons most relevant to a pending decision by embedding similarity, optionally gated to a `domain` (or unconditioned lessons). Excludes retired/contradicted lessons. This is the move that actually closes the loop — it's the feedback read used by Executive hydration.
-5. **KG-mirror** — `mirror_lesson_to_kg(...)` promotes a lesson into the knowledge graph as a first-class `Lesson` entity with `applies_to` edges to the entities it concerns, so lessons are reachable by ordinary graph traversal. Idempotent (caches `kg_entity_id` on `lessons.properties`).
+2. **OUTCOME** — `record_outcome_async(...)` records what actually happened and scores it against the prediction via a **Brier surprise** term: `(confidence - hit)^2`. High surprise = confidently wrong (or unconfidently right) — exactly what's worth distilling. It backfills `decisions.outcome`/`outcome_id` and stamps `reviewed_at` so the scheduler's review index stops surfacing it.
+3. **LESSON** — `distill_or_reinforce_lesson_async(...)` creates a new `lessons` row, or — if the nearest existing lesson is within cosine `sim_threshold=0.85` — *reinforces* it instead (bumps `support_count` + `confidence`, appends provenance, promotes `provisional → validated` at `support_count >= 3`). This stops near-duplicate fragmentation and lets confidence accrue with evidence.
+4. **FEEDBACK** — `retrieve_lessons_async(...)` pulls the lessons most relevant to a pending decision by embedding similarity, optionally gated to a `domain` (or unconditioned lessons). Excludes retired/contradicted lessons. This is the move that actually closes the loop — it's the feedback read used by Executive hydration.
+5. **KG-mirror** — `mirror_lesson_to_kg_async(...)` promotes a lesson into the knowledge graph as a first-class `Lesson` entity with `applies_to` edges to the entities it concerns, so lessons are reachable by ordinary graph traversal. Idempotent (caches `kg_entity_id` on `lessons.properties`).
 
 ### How it ties the faculties together
 
 The decision loop is the reflection step *for the system's own choices*. `distill_lessons_from_outcomes(pool, scope, embedder, llm_client, llm_model, surprise_threshold=0.25, limit=20)` is invoked from the **weekly reflection endpoint**: it finds high-surprise, not-yet-distilled outcomes (Brier `>= 0.25`), uses `_distill_statement` (LLM with heuristic fallback) to phrase a one-sentence generalizable lesson, reinforces-or-creates it, and mirrors it into the KG — all idempotent so repeated reflections converge. The same endpoint then runs `decay_lesson_confidence(...)`, which exponentially decays idle lessons (half-life 30 days, floor 0.1, retire below 0.05) so a lesson that stops being reinforced fades and eventually retires instead of dominating retrieval forever. Thus: meta/reflection produce the *text*, the decision loop owns the *scoring, dedup, decay, and graph integration*, and the lessons flow back as feedback into future decisions.
 
-### Functions (sync + async variants)
+### Functions
 
 ```python
 def _brier_surprise(confidence, matched) -> float | None
-def record_outcome(conn, *, scope, decision_id, summary, valence, embedding,
-                   goal_id=None, matched_prediction=None, metrics=None,
-                   evidence_refs=None, source_episode_id=None) -> str
-def distill_or_reinforce_lesson(conn, *, scope, statement, embedding,
-                                derived_from_outcomes, applies_when=None, conditions=None,
-                                applies_to_entities=None, updates_model=None,
-                                source_episode_id=None, sim_threshold=0.85,
-                                confidence_step=0.1) -> tuple[str, str]
-def retrieve_lessons(conn, *, scope, query_embedding, domain=None, limit=5) -> list[dict]
-def mirror_lesson_to_kg(conn, *, scope, lesson_id, rel_type="applies_to",
-                        source_episode_id=None) -> str
 
-# async equivalents: record_outcome_async, distill_or_reinforce_lesson_async,
-#                     retrieve_lessons_async, mirror_lesson_to_kg_async
+async def record_outcome_async(conn, *, scope, decision_id, summary, valence,
+                               embedding=None, goal_id=None, matched_prediction=None,
+                               metrics=None, evidence_refs=None,
+                               source_episode_id=None) -> str
+async def distill_or_reinforce_lesson_async(conn, *, scope, statement, embedding,
+                                            derived_from_outcomes, applies_when=None,
+                                            conditions=None, applies_to_entities=None,
+                                            updates_model=None, source_episode_id=None,
+                                            sim_threshold=0.85, confidence_step=0.1) -> tuple[str, str]
+async def retrieve_lessons_async(conn, *, scope, query_embedding, domain=None,
+                                 limit=5) -> list[dict]
+async def mirror_lesson_to_kg_async(conn, *, scope, lesson_id, rel_type="applies_to",
+                                    source_episode_id=None) -> str
 
 async def distill_lessons_from_outcomes(pool, *, scope, embedder=None, llm_client=None,
                                         llm_model="gpt-4o-mini",

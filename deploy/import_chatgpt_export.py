@@ -759,7 +759,6 @@ async def run(args: argparse.Namespace) -> dict:
     from memory.governance import add, record_episode
     from knowledge.graph import extract_and_project
     from shared.embeddings.implementations import LocalBgeM3, CachingEmbedder
-    from knowledge.resolution import normalize_mention
 
     publisher = PgOnlyPublisher()
     embedder = CachingEmbedder(LocalBgeM3())
@@ -798,7 +797,7 @@ async def run(args: argparse.Namespace) -> dict:
                          conv.get("default_model_slug"), p["chars"], len(p["chunks"]),
                          str(md_file), str(export_dir)),
                     )
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             log.exception("mirror/ledger failed for %s", cid)
             stats["errors"] += 1
             return

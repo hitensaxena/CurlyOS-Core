@@ -13,7 +13,9 @@ try:
     from pydantic import BaseModel, Field
 except ImportError:  # pragma: no cover
     BaseModel = type("BaseModel", (), {"__annotations__": {}})  # type: ignore[assignment]
-    Field = lambda *a, **kw: None  # type: ignore[assignment]
+
+    def Field(*a, **kw):  # type: ignore[assignment]  # noqa: N802 — mirrors pydantic's name
+        return None
 
 # ── Epistemic status ────────────────────────────────────────────────────────
 
@@ -139,25 +141,6 @@ class InvalidateResponse(BaseModel):
     valid_to: datetime
     superseded_by: str | None = None
     deleted: Literal[False] = False
-
-
-class ForgetSelector(BaseModel):
-    scope: str
-    fact_id: str | None = None
-    predicate: str | None = None
-    valid_before: datetime | None = None
-
-
-class ForgetRequest(BaseModel):
-    mem_id: str
-    approval_id: str
-    reason: str
-
-
-class ForgetResponse(BaseModel):
-    mem_id: str
-    tombstoned: Literal[True] = True
-    approval_id: str
 
 
 # ── Identity engine requests ───────────────────────────────────────────────

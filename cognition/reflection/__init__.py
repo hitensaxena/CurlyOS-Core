@@ -459,8 +459,6 @@ async def _analyze_with_llm(llm_client, model, episodes, identity_ctx, graph_ctx
 
 async def _analyze_daily_llm(llm_client, model, episodes):
     """LLM-powered daily reflection — lighter, no identity extraction."""
-    import json
-
     episodes_text = "\n".join(f"- [{r[2].isoformat()[:10]}] {r[1][:200]}" for r in episodes[:20])
 
     prompt = DAILY_ANALYSIS_PROMPT.format(episodes=episodes_text)

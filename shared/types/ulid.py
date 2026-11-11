@@ -18,71 +18,42 @@ _DECODE_MAP = {c: i for i, c in enumerate(_ALPHABET)}
 # Also accept lowercase and ambiguous chars (I→1, L→1, O→0, U→V)
 _DECODE_MAP.update({"i": 1, "I": 1, "l": 1, "L": 1, "o": 0, "O": 0, "u": 21, "U": 21})
 
-# Entity → prefix. Closed set for Phase 1.
+# Entity → prefix. Every entry here is minted somewhere in this repository,
+# except `usr`, whose ids are written as literals in scope strings
+# (`user:usr_hiten`) rather than minted. Anything else was pruned in the
+# 2026-11-11 cleanup along with the packages that produced those ids; rows
+# carrying the old prefixes still exist in the database and remain readable.
 PREFIXES: dict[str, str] = {
+    # Memory spine
     "event": "evt",
     "episode": "epi",
     "memory": "mem",
     "identity_fact": "idf",
-    "workspace": "ws",
-    "project": "prj",
-    "task": "tsk",
-    "artifact": "art",
-    "artifact_version": "arv",
+    "entity": "ent",
+    # Runs and approvals
     "agent_run": "run",
-    "action": "act",
-    "observation": "obs",
-    "tool_call": "tcl",
     "approval": "apv",
-    "budget": "bgt",
-    "capability_grant": "cap",
-    "session": "ses",
+    # Scope owners (literal, never minted)
     "user": "usr",
-    # Creative cognition prefixes
-    "studio": "stu",
-    "sketch": "skt",
-    "concept": "cpt",
-    "world_model": "wld",
-    "simulation": "sim",
-    "discovery": "dsc",
+    # Goals and decisions
     "goal": "goal",
     "decision": "dec",
     "outcome": "out",
     "lesson": "les",
     "opportunity": "opp",
-    # Introspection prefixes
+    # Introspection
     "assumption": "asu",
     "mental_model": "mdl",
     "decision_audit": "dau",
     "principle": "prn",
     "chapter": "cha",
     "theme": "thm",
-    "trend": "trd",
     "alignment_signal": "aln",
-    # Telemetry prefixes
-    "activity_session": "ats",
-    "focus_log": "foc",
-    "energy_sample": "enr",
-    # Evaluation
-    "eval_run": "evr",
-    # Self-evolution
-    "self_modification": "smd",
-    "prompt_version": "pmt",
-    # Reflection
     "insight_report": "rpt",
-    # Mood / attention
     "mood_log": "moo",
     # Infrastructure
     "lock": "lck",
     "correlation": "cor",
-    "entity": "ent",
-    # Scheduled (user-defined) jobs + their delivery inbox
-    "scheduled_job": "sjob",
-    "inbox_item": "inb",
-    # Goal-execution orchestrator
-    "goal_plan": "gpl",
-    "goal_task": "gtk",
-    "orchestrator_message": "omsg",
 }
 
 ALL_PREFIXES: frozenset[str] = frozenset(PREFIXES.values())

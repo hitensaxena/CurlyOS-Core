@@ -8,8 +8,8 @@ import sys
 import psycopg
 
 TSV = sys.argv[1] if len(sys.argv) > 1 else "archive_vectors.tsv"
-dsn = [l.split("=", 1)[1].strip().strip('"') for l in open(".env")
-       if l.startswith("CURLYOS_DATABASE_URL=")][0]
+dsn = [line.split("=", 1)[1].strip().strip('"') for line in open(".env")
+       if line.startswith("CURLYOS_DATABASE_URL=")][0]
 
 conn = psycopg.connect(dsn)
 with conn.cursor() as cur:
