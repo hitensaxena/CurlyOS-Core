@@ -804,10 +804,12 @@ async def recall(body: RecallRequest):
             # no summary reaches the candidate pool at all. Pull the summaries
             # for the strongest chunks so the conversation is represented by
             # the form recall can actually use.
-            key_of = lambda it: (
-                conversation_key(getattr(it, "text", "") or "")
-                or (getattr(it, "source_episode_id", "") or it.id)
-            )
+            def key_of(it):
+                return (
+                    conversation_key(getattr(it, "text", "") or "")
+                    or (getattr(it, "source_episode_id", "") or it.id)
+                )
+
             try:
                 summary_index = await load_summary_index(pool, scope)
             except Exception:
@@ -1682,9 +1684,11 @@ async def _prewarm_embedder() -> None:
 
 
 async def _sweep_unembedded() -> None:
-    """Startup self-heal: embed recent rows left embedding-less by a crash or
-    restart that killed a background task mid-flight. Sequential and bounded
-    by design — this box swaps on big encode batches.
+    """Startup self-heal: embed rows left embedding-less by a crash, a failed
+    embed call, or an embedder fallback. No age cutoff — a row that was skipped
+    while the embedder was unavailable can be months old by the time it is
+    noticed, and the sweep is the only thing that ever fills it. Sequential and
+    bounded to 500/tick by design — this box swaps on big encode batches.
     """
     try:
         pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
@@ -1693,11 +1697,9 @@ async def _sweep_unembedded() -> None:
                 await cur.execute(
                     "SELECT 'episodes' AS t, id, content AS txt FROM episodes "
                     "WHERE embedding IS NULL AND content IS NOT NULL AND content <> '' "
-                    "AND created_at > now() - interval '7 days' "
                     "UNION ALL "
                     "SELECT 'memories' AS t, id, statement AS txt FROM memories "
                     "WHERE embedding IS NULL AND statement IS NOT NULL AND statement <> '' "
-                    "AND created_at > now() - interval '7 days' "
                     "LIMIT 500"
                 )
                 rows = await cur.fetchall()
@@ -1705,6 +1707,10 @@ async def _sweep_unembedded() -> None:
             return
         logger.info("sweep: re-embedding %d rows left unembedded", len(rows))
         embedder = await get_shared_embedder()
+        from shared.embeddings.implementations import FakeEmbedder
+        if isinstance(embedder, FakeEmbedder):
+            logger.error("sweep: embedder fallback is active — leaving %d rows NULL", len(rows))
+            return
         done = 0
         for table, row_id, txt in rows:
             text = txt[:4000] if table == "memories" else txt
