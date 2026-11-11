@@ -43,3 +43,6 @@ deploy/reclassify_audit_*.json
 # large personal-data exports (mind vault) — do not publish
 deploy/*.tsv
 deploy/*.jsonl
+
+# benchmark output from deploy/recall_eval.py and deploy/recall_api_eval.py
+deploy/eval/

@@ -31,6 +31,11 @@ log = logging.getLogger("curlyos.retrieval")
 
 _RRF_K = 60  # RRF constant
 
+# Weight of the graph channel against dense/sparse/entity in RRF. Graph hits are
+# a different kind of evidence — "this memory is one hop from a node you hit" —
+# so they contribute, but at half the weight of direct semantic match.
+GRAPH_RRF_WEIGHT = 0.5
+
 # ── Bi-temporal predicate ───────────────────────────────────────────────────
 
 
@@ -180,10 +185,16 @@ def _rrf_fuse(
     entity_ranked: list[dict],
     recency_weight: float = 0.3,
     divergent: bool = False,
+    graph_ranked: list[dict] | None = None,
+    graph_weight: float = GRAPH_RRF_WEIGHT,
 ) -> list[dict]:
-    """Reciprocal Rank Fusion combining dense + sparse + entity results.
+    """Reciprocal Rank Fusion combining dense + sparse + entity (+ graph).
 
     RRF score = Σ(1/(k + rank)) with k=60 for each signal channel.
+    The graph channel is scaled by `graph_weight`: without it graph items enter
+    with no rank at all and can only ever duplicate what the other channels
+    already found (measured 2026-11-11: 0.67% of graph items reached the top
+    ten).
     Recency boost: multiply by exp(-0.01 * age_in_days).
     For divergent mode, recency is inverted (older items boosted).
     """
@@ -196,6 +207,7 @@ def _rrf_fuse(
     dense_ranks = _build_rank_map(dense_ranked)
     sparse_ranks = _build_rank_map(sparse_ranked)
     entity_ranks = _build_rank_map(entity_ranked)
+    graph_ranks = _build_rank_map(graph_ranked or [])
 
     # Collect all unique candidate ids
     all_ids: set[str] = set()
@@ -221,6 +233,8 @@ def _rrf_fuse(
             rrf_score += 1.0 / (rrf_k + sparse_ranks[cid])
         if cid in entity_ranks:
             rrf_score += 1.0 / (rrf_k + entity_ranks[cid])
+        if cid in graph_ranks:
+            rrf_score += graph_weight * (1.0 / (rrf_k + graph_ranks[cid]))
 
         # Recency boost
         age_days = (now - item.get("valid_from", now)).total_seconds() / 86400.0
@@ -237,6 +251,46 @@ def _rrf_fuse(
 
 # ── Stage 3: Graph expansion ───────────────────────────────────────────────
 
+# How many entities one hop may contribute. MEASURED 2026-11-11: unbounded
+# 1-hop expansion returned 449 items per query on average (2,687 for
+# "neti neti meditation") and 0.67% of them survived into the top ten — the
+# graph was flooding the candidate pool, not informing it. Neighbours are
+# ranked by how specific the link is before this cut.
+GRAPH_ENTITIES_PER_HOP = 400
+
+# Memories one expansion may return. 400 entities × the ~6 episodes each is
+# still thousands of rows, so the list is cut as well as the walk.
+GRAPH_MEMORIES_MAX = 120
+
+
+async def _load_alias_pairs(pool: Any) -> tuple[list[str], list[str]]:
+    """(raw_id, canonical_id) for every entity whose spelling was absorbed.
+
+    Tier 1 recorded the duplicate spellings in knowledge_entity_aliases but left
+    the edges pointing where they were, so the graph's centre is still split
+    four ways (Hiten Saxena 4,649 edges, User 2,150, CRAZYMAGE 501, assistant
+    553). Folding endpoints through these pairs fixes traversal without
+    rewriting a single row.
+    """
+    sql = """
+      SELECT DISTINCT ON (en.id) en.id, a.entity_id
+      FROM knowledge_entities en
+      JOIN knowledge_entity_aliases a
+        ON a.alias_norm = en.name_norm AND a.entity_id <> en.id
+      WHERE en.valid_to IS NULL
+      ORDER BY en.id, a.entity_id
+    """
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(sql)
+                rows = await cur.fetchall()
+    except Exception as exc:
+        # A missing alias table must not take recall down: fall back to raw ids.
+        log.warning("Alias lookup failed, traversing raw entity ids: %s", exc)
+        return [], []
+    return [r[0] for r in rows], [r[1] for r in rows]
+
 
 async def _graph_expand(
     pool: Any,
@@ -252,6 +306,10 @@ async def _graph_expand(
     traverses knowledge_edges (src_entity_id/dst_entity_id) up to k_hops,
     and returns memories linked to reached entities.
 
+    Entity ids are folded through knowledge_entity_aliases first (see
+    _load_alias_pairs), so one person or project is one node no matter how the
+    extractor spelled it in each episode.
+
     Filters edges and entities by bi-temporal validity.
     """
     if not seed_ids:
@@ -264,42 +322,99 @@ async def _graph_expand(
     entity_bt = bt_where.replace("valid_from", "ke.valid_from").replace("valid_to", "ke.valid_to")
     mem_bt = bt_where  # memories table uses default column names
 
+    raw_ids, canon_ids = await _load_alias_pairs(pool)
+
     query = f"""
-    WITH RECURSIVE
+    WITH
+    -- Step 0: alias resolution table (empty arrays = no aliases known)
+    alias_map AS (
+        SELECT * FROM unnest(%s::text[], %s::text[]) AS t(raw_id, canon_id)
+    ),
+    -- Canonical view of the edges. Self-loops created by folding are dropped:
+    -- "User works_on CurlyOS" and "Hiten Saxena works_on CurlyOS" are one fact.
+    edge_c AS (
+        SELECT coalesce(a1.canon_id, e.src_entity_id) AS src,
+               coalesce(a2.canon_id, e.dst_entity_id) AS dst,
+               e.rel_norm
+        FROM knowledge_edges e
+        LEFT JOIN alias_map a1 ON a1.raw_id = e.src_entity_id
+        LEFT JOIN alias_map a2 ON a2.raw_id = e.dst_entity_id
+        WHERE ({edge_bt})
+    ),
+    -- How informative a predicate is. `related_to` accounts for roughly a
+    -- fifth of the mapped edges and says nothing, so a link through it is the
+    -- last thing expansion should spend its budget on; the specific predicates
+    -- cost nothing. Unmapped phrases sit in between — the extractor chose them
+    -- because the generic ones did not fit.
+    edge_scored AS (
+        SELECT src, dst, rel_norm,
+               CASE
+                   WHEN rel_norm = 'related_to' THEN 3.0
+                   WHEN rel_norm IS NULL THEN 1.0
+                   ELSE 0.0
+               END AS rel_cost
+        FROM edge_c
+    ),
     -- Step 1: Resolve seed memory IDs to their source episodes
     seed_episodes AS (
         SELECT DISTINCT m.source_episode_id AS episode_id
         FROM memories m
         WHERE m.id = ANY(%s)
     ),
-    -- Step 2: Find entity IDs linked to those episodes
+    -- Step 2: Find entity IDs linked to those episodes (canonical ids)
     seed_entities AS (
-        SELECT DISTINCT ke.id AS entity_id
+        SELECT DISTINCT coalesce(am.canon_id, ke.id) AS entity_id
         FROM knowledge_entities ke
         INNER JOIN seed_episodes se ON ke.source_episode_id = se.episode_id
+        LEFT JOIN alias_map am ON am.raw_id = ke.id
         WHERE ({entity_bt})
         AND ke.epistemic_status = ANY(%s)
     ),
-    -- Step 3: k-hop traversal on knowledge_edges
+    -- Step 3: traversal on the canonical edge view, damped by node degree.
+    -- A raw 1-hop from the Hiten Saxena hub reaches thousands of entities, so
+    -- expansion has to be bounded twice: rank neighbours by how specific the
+    -- connection is (log degree at both ends), and keep only the best
+    -- GRAPH_ENTITIES_PER_HOP of them per depth.
+    deg AS (
+        SELECT node, count(*) AS d FROM (
+            SELECT src AS node FROM edge_c
+            UNION ALL
+            SELECT dst AS node FROM edge_c
+        ) g GROUP BY 1
+    ),
+    hop1_ranked AS (
+        SELECT e.dst AS entity_id,
+               min(ln(1 + coalesce(ds.d, 1)) + ln(1 + coalesce(dd.d, 1))
+                   + e.rel_cost) AS cost
+        FROM edge_scored e
+        INNER JOIN seed_entities se ON e.src = se.entity_id
+        LEFT JOIN deg ds ON ds.node = e.src
+        LEFT JOIN deg dd ON dd.node = e.dst
+        WHERE e.src <> e.dst
+        GROUP BY 1
+    ),
+    hop1 AS (
+        SELECT entity_id FROM hop1_ranked ORDER BY cost LIMIT %s
+    ),
+    hop2_ranked AS (
+        SELECT e.dst AS entity_id,
+               min(ln(1 + coalesce(ds.d, 1)) + ln(1 + coalesce(dd.d, 1))
+                   + e.rel_cost) AS cost
+        FROM edge_scored e
+        INNER JOIN hop1 h ON e.src = h.entity_id
+        LEFT JOIN deg ds ON ds.node = e.src
+        LEFT JOIN deg dd ON dd.node = e.dst
+        WHERE e.src <> e.dst
+          AND e.dst NOT IN (SELECT entity_id FROM hop1)
+        GROUP BY 1
+    ),
+    hop2 AS (
+        SELECT entity_id FROM hop2_ranked ORDER BY cost LIMIT %s
+    ),
     graph_walk AS (
-        -- Base: outgoing edges from seed entities
-        SELECT
-            e.dst_entity_id AS entity_id,
-            1 AS depth
-        FROM knowledge_edges e
-        INNER JOIN seed_entities se ON e.src_entity_id = se.entity_id
-        WHERE ({edge_bt})
-
-        UNION
-
-        -- Recursive: follow outgoing edges up to k hops
-        SELECT
-            e.dst_entity_id,
-            gw.depth + 1
-        FROM knowledge_edges e
-        INNER JOIN graph_walk gw ON e.src_entity_id = gw.entity_id
-        WHERE gw.depth < %s
-        AND ({edge_bt})
+        SELECT entity_id, 1 AS depth FROM hop1
+        UNION ALL
+        SELECT entity_id, 2 AS depth FROM hop2
     ),
     -- Step 4: Collect all reached entities (seed + walked)
     all_reached_entities AS (
@@ -307,48 +422,70 @@ async def _graph_expand(
         UNION
         SELECT entity_id FROM graph_walk
     ),
-    -- Step 5: Find episodes linked to reached entities
-    reached_episodes AS (
-        SELECT DISTINCT ke.source_episode_id AS episode_id
+    -- Step 5: Fold entities to their canonical node once, then attribute
+    -- episodes to the shallowest reached node. Doing this as a join instead of
+    -- a correlated subquery in the final SELECT matters: the old shape ran an
+    -- index scan per output row (55k loops on a 5-seed query).
+    reached AS (
+        SELECT DISTINCT coalesce(am2.canon_id, ke.id) AS canon_id,
+               ke.source_episode_id AS episode_id
         FROM knowledge_entities ke
-        INNER JOIN all_reached_entities re ON ke.id = re.entity_id
+        LEFT JOIN alias_map am2 ON am2.raw_id = ke.id
         WHERE ({entity_bt})
+          AND ke.source_episode_id IS NOT NULL
+    ),
+    reached_episodes AS (
+        SELECT r.episode_id, min(COALESCE(gw.depth, 0)) AS depth
+        FROM reached r
+        INNER JOIN all_reached_entities re ON re.entity_id = r.canon_id
+        LEFT JOIN graph_walk gw ON gw.entity_id = r.canon_id
+        -- The seed memories' own episodes are already represented by the seed
+        -- hits; re-adding them spends the budget on memories the other channels
+        -- could have found. MEASURED 2026-11-11: 285 of 619 expansion items
+        -- came from a seed episode, and 100 percent of them for
+        -- "figma design system work".
+        WHERE NOT EXISTS (
+            SELECT 1 FROM seed_episodes se WHERE se.episode_id = r.episode_id
+        )
+        GROUP BY r.episode_id
     )
     -- Step 6: Fetch memories from those episodes
-    SELECT DISTINCT ON (m.id)
-        m.id,
-        m.statement,
-        m.kind,
-        m.valid_from,
-        m.valid_to,
-        m.source_episode_id,
-        m.epistemic_status,
-        1.0 / (1.0 + COALESCE(gw.depth, 0))::float AS score
-    FROM reached_episodes re
-    JOIN memories m ON m.source_episode_id = re.episode_id
-    LEFT JOIN graph_walk gw ON gw.entity_id IN (
-        SELECT ke2.id FROM knowledge_entities ke2
-        WHERE ke2.source_episode_id = re.episode_id
-    )
-    WHERE m.scope = %s
-    AND {mem_bt}
-    AND m.epistemic_status = ANY(%s)
-    ORDER BY m.id, score DESC
+    SELECT * FROM (
+        SELECT DISTINCT ON (m.id)
+            m.id,
+            m.statement,
+            m.kind,
+            m.valid_from,
+            m.valid_to,
+            m.source_episode_id,
+            m.epistemic_status,
+            1.0 / (1.0 + re.depth)::float AS score
+        FROM reached_episodes re
+        JOIN memories m ON m.source_episode_id = re.episode_id
+        WHERE m.scope = %s
+        AND {mem_bt}
+        AND m.epistemic_status = ANY(%s)
+        ORDER BY m.id, score DESC
+    ) picked
+    ORDER BY score DESC
+    LIMIT %s
     """
 
     eph_list = list(epistemic_filter)
     params: list = []
+    # Step 0: alias resolution arrays
+    params.append(raw_ids)
+    params.append(canon_ids)
+    # Canonical edge view: edge bi-temporal
+    params.extend(bt_params)
     # Step 1: seed memory IDs (ANY)
     params.append(seed_ids)
     # Step 2: entity bi-temporal + epistemic filter
     params.extend(bt_params)
     params.append(eph_list)
-    # Step 3 base: edge bi-temporal
-    params.extend(bt_params)
-    # Step 3 recursive: k_hops
-    params.append(k_hops)
-    # Step 3 recursive: edge bi-temporal
-    params.extend(bt_params)
+    # Step 3: entities kept per hop (0 disables the second hop on fast mode)
+    params.append(GRAPH_ENTITIES_PER_HOP)
+    params.append(GRAPH_ENTITIES_PER_HOP if k_hops >= 2 else 0)
     # Step 5: entity bi-temporal for reached_episodes
     params.extend(bt_params)
     # Step 6: scope
@@ -357,12 +494,21 @@ async def _graph_expand(
     params.extend(bt_params)
     # Step 6: epistemic filter
     params.append(eph_list)
+    # Step 6: keep only the strongest graph hits — episodes reached through a
+    # well-connected entity multiply, so the entity cap alone does not bound
+    # the memory list.
+    params.append(GRAPH_MEMORIES_MAX)
 
     try:
         async with pool.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(query, params)
-                rows = await cur.fetchall()
+            # This query is wide rather than deep, and the cost estimate crosses
+            # Postgres's JIT threshold: EXPLAIN ANALYZE showed 732 ms of a
+            # 1,042 ms run spent compiling expressions that then run once.
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute("SET LOCAL jit = off")
+                    await cur.execute(query, params)
+                    rows = await cur.fetchall()
     except Exception as exc:
         log.warning("Graph expansion failed: %s", exc)
         return []
@@ -855,7 +1001,8 @@ async def retrieve(
 
     # Merge graph items into candidates
     all_candidates = candidates + graph_items
-    # Re-fuse with graph signal
+    # Re-fuse, now with the graph as its own rank channel. Without a channel the
+    # graph could only re-confirm what dense/sparse/entity already returned.
     if graph_items:
         all_candidates = _rrf_fuse(
             all_candidates,
@@ -863,6 +1010,7 @@ async def retrieve(
             sparse_ranked=sparse,
             entity_ranked=entity,
             divergent=divergent,
+            graph_ranked=graph_items,
         )
 
     # Stage 3b: Cross-encoder rerank (top-50 → top-30)

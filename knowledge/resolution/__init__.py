@@ -32,8 +32,16 @@ class ResolutionDecision(StrEnum):
 
 
 def normalize_mention(mention: str) -> str:
-    """Canonical comparison form for an entity name."""
-    return re.sub(r"\s+", " ", (mention or "").strip().lower())
+    """Canonical comparison form for an entity name.
+
+    Must stay identical to the expression behind knowledge_entities.name_norm
+    (migration 0020): punctuation that only varies by typing — full stop, comma,
+    hyphen-used-as-a-space — is dropped, whitespace collapsed, case lowered.
+    Matching on lower(name) instead let "CurlyOS Core" and "curlyos-core" live
+    as two nodes, which is how 25 duplicate pairs survived Tier 1.
+    """
+    stripped = (mention or "").replace(".", "").replace(",", "").replace("-", " ")
+    return re.sub(r"\s+", " ", stripped).strip().lower()
 
 
 async def resolve_entity(
@@ -53,14 +61,36 @@ async def resolve_entity(
     if len(normalized) < 2 or pool is None:
         return ResolutionDecision.MINT, None
 
-    # 1. Exact normalized-name match (scope-bound). Pick the OLDEST row so
-    #    repeated resolution converges on a single canonical node.
+    # 1. Known spelling variant → the entity it was folded into (Tier 1 alias
+    #    table). Checked BEFORE the name match: an alias row is an explicit
+    #    statement that two names are one thing, while a name match can land on
+    #    a duplicate row that the alias already superseded ("User" and
+    #    "CRAZYMAGE" still exist as entities; they mean Hiten Saxena).
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT a.entity_id FROM knowledge_entity_aliases a "
+                    "JOIN knowledge_entities en ON en.id = a.entity_id "
+                    "WHERE a.alias_norm = %s AND en.scope = %s AND en.valid_to IS NULL "
+                    "ORDER BY a.created_at ASC LIMIT 1",
+                    (normalized, scope),
+                )
+                row = await cur.fetchone()
+                if row is not None:
+                    return ResolutionDecision.MERGE, row[0]
+    except Exception as e:  # noqa: BLE001
+        log.warning("alias resolution failed for %r: %s", mention, e)
+
+    # 2. Exact normalized-name match (scope-bound). Pick the OLDEST row so
+    #    repeated resolution converges on a single canonical node. name_norm is
+    #    a generated column, so the comparison cannot drift from the stored name.
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "SELECT id FROM knowledge_entities "
-                    "WHERE scope = %s AND lower(name) = %s AND valid_to IS NULL "
+                    "WHERE scope = %s AND name_norm = %s AND valid_to IS NULL "
                     "ORDER BY created_at ASC LIMIT 1",
                     (scope, normalized),
                 )
