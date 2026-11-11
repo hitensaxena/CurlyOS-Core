@@ -196,8 +196,60 @@ class Scheduler:
         except Exception as exc:  # noqa: BLE001 — never block the loop on bookkeeping
             log.warning("scheduler: could not reconcile orphaned runs (%s)", exc)
 
+    async def _last_run_times(self) -> dict[str, datetime]:
+        """Newest `agent_runs.created_at` per scheduled workflow, keyed by job
+        name. Local naive datetimes (the scheduler's clock), best-effort."""
+        try:
+            pool = await self._pool_factory()
+            async with pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT agent, max(created_at) FROM agent_runs "
+                        "WHERE starts_with(agent, 'workflow:') GROUP BY agent"
+                    )
+                    rows = await cur.fetchall()
+        except Exception as exc:  # noqa: BLE001 — bookkeeping must not block the loop
+            log.warning("scheduler: could not read run history (%s)", exc)
+            return {}
+        out: dict[str, datetime] = {}
+        for agent, ts in rows:
+            if ts is None:
+                continue
+            if ts.tzinfo is not None:
+                ts = ts.astimezone().replace(tzinfo=None)
+            out[str(agent).partition(":")[2]] = ts
+        return out
+
+    async def _seed_next_due(self) -> None:
+        """Restore each job's schedule from its last actual run.
+
+        `start()` can only compute the next slot from "now", so a restart after
+        a slot silently moves the job a whole period out — which is how the
+        weekly and monthly jobs went a month without firing while daily jobs
+        kept running. If the slot that should have followed the last real run
+        has already passed, the job is due now, staggered a few seconds apart so
+        a backlog does not fire every LLM-bearing job at once.
+        """
+        now = datetime.now()
+        last_runs = await self._last_run_times()
+        enabled = [j for j in self.jobs if j.enabled]
+        for i, job in enumerate(enabled):
+            last = last_runs.get(job.name)
+            if last is None:
+                job.next_due = job.cadence.next_due(now, None)
+                continue
+            job.last_fired = last
+            due = job.cadence.next_due(last, last)
+            if due > now:
+                job.next_due = due
+            else:
+                job.next_due = now + timedelta(seconds=5 + 5 * i)
+                log.info("scheduler: %s overdue since %s — catching up",
+                         job.name, due.isoformat(timespec="minutes"))
+
     async def _loop(self) -> None:
         await self._reconcile_orphaned_runs()
+        await self._seed_next_due()
         while not self._stopping.is_set():
             now = datetime.now()
             for job in self.jobs:

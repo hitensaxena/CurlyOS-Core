@@ -1808,6 +1808,17 @@ async def consolidation_run(body: ConsolidationRunRequest | None = None):
             await redis.close()
 
 
+def _same_identity_value(a: str, b: str) -> bool:
+    """Compare two identity objects the way a reader would: case, spacing and
+    trailing punctuation are not differences of belief."""
+    import re as _re
+
+    def norm(v: str) -> str:
+        return _re.sub(r"[\s.!;,]+$", "", _re.sub(r"\s+", " ", v.strip().lower()))
+
+    return norm(a) == norm(b)
+
+
 async def _sync_identity_from_reflection(pool: Any, pub: Any, scope: str) -> dict:
     """Promote reflection reports' identity_candidates into identity_facts.
 
@@ -1852,20 +1863,24 @@ async def _sync_identity_from_reflection(pool: Any, pub: Any, scope: str) -> dic
         if pred not in best or float(c.get("confidence", 0.6)) > float(best[pred].get("confidence", 0.6)):
             best[pred] = c
 
-    promoted = skipped = 0
+    promoted = skipped = unchanged = 0
     epi_id = None
     for pred, c in best.items():
         obj, conf = str(c["object"]), float(c.get("confidence", 0.6))
-        # Idempotent + churn-free: skip predicates that already have a current
-        # fact (don't re-propose/supersede on every reflection run).
+        # Idempotent + churn-free, but not frozen: skip only when the current
+        # fact says the same thing. Skipping on the predicate alone (the old
+        # behaviour) meant the first value a predicate ever received was final —
+        # which is why "work: Product Design" was still the current fact in
+        # November 2026, months after he stopped employed design work.
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT 1 FROM identity_facts WHERE scope = %s AND predicate = %s "
+                    "SELECT object FROM identity_facts WHERE scope = %s AND predicate = %s "
                     "AND valid_to IS NULL",
                     [scope, pred],
                 )
-                if await cur.fetchone():
+                row = await cur.fetchone()
+                if row is not None and _same_identity_value(str(row[0]), obj):
                     skipped += 1
                     continue
         if epi_id is None:
@@ -1876,14 +1891,18 @@ async def _sync_identity_from_reflection(pool: Any, pub: Any, scope: str) -> dic
             )
             epi_id = epi["epi_id"]
         try:
-            await propose_identity_fact(
+            out = await propose_identity_fact(
                 pool, pub, scope, predicate=pred, object=obj,
                 confidence=conf, source_episode_id=epi_id,
             )
-            promoted += 1
+            if out.get("action_taken") in ("inserted", "superseded"):
+                promoted += 1
+            else:  # a lower-confidence candidate for the same predicate
+                unchanged += 1
         except Exception:
             skipped += 1
-    return {"identity_promoted": promoted, "identity_skipped": skipped}
+    return {"identity_promoted": promoted, "identity_skipped": skipped,
+            "identity_unchanged": unchanged}
 
 
 async def _sync_goals_from_reflection(pool: Any, scope: str) -> dict:
@@ -1916,51 +1935,50 @@ async def _sync_goals_from_reflection(pool: Any, scope: str) -> dict:
     return {"goals_synced": synced}
 
 
-async def _sync_principles_to_memory(pool: Any, pub: Any, embedder: Any, scope: str) -> dict:
-    """Mirror distilled principles into recallable memories.
+async def _mirror_statements(pool: Any, pub: Any, embedder: Any, scope: str, *,
+                             source_ref: str, episode_content: str,
+                             statements: list[str]) -> dict:
+    """Keep exactly `statements` recallable as memories under `source_ref`.
 
-    Closes the meta→memory loop so principles surface in /api/search and
-    /api/recall. Stored canonical (recall filters to canonical) with a
-    provenance episode (source_ref='meta:principles-mirror') and embedded so
-    they're dense-recallable. Idempotent: skips principles already mirrored.
-    Best-effort. Returns counts.
+    Supersede-not-delete: a statement that is no longer current is expired
+    (`valid_to`), not removed, so history stays queryable. This is the part the
+    principles mirror was missing — it only ever inserted, so 83 mirrored
+    principle memories were still live after the valid principle set had shrunk
+    to 4.
     """
-    import re
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from memory.governance import record_episode, add
 
+    wanted = [s.strip() for s in statements if s and s.strip()]
+    wanted_set = set(wanted)
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                "SELECT statement FROM principles WHERE scope = %s AND valid_to IS NULL",
-                [scope],
+                "SELECT m.id, m.statement FROM memories m "
+                "JOIN episodes e ON e.id = m.source_episode_id "
+                "WHERE e.source_ref = %s AND m.scope = %s AND m.valid_to IS NULL",
+                (source_ref, scope),
             )
-            # Skip word-frequency "principles" (e.g. "... 'use' appears 4 times")
-            # from the pattern-counting distiller — noise in recallable memory.
-            _junk = re.compile(r"appears\s+\d+\s+times", re.I)
-            principles = [
-                r[0] for r in await cur.fetchall()
-                if r[0] and r[0].strip() and not _junk.search(r[0])
-            ]
-
-    added = skipped = 0
-    epi_id = None
-    for statement in principles:
+            existing = await cur.fetchall()
+    live = {str(st).strip() for _, st in existing}
+    stale = [mid for mid, st in existing if str(st).strip() not in wanted_set]
+    if stale:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT 1 FROM memories WHERE scope = %s AND statement = %s AND valid_to IS NULL",
-                    [scope, statement],
+                    "UPDATE memories SET valid_to = now() WHERE id = ANY(%s)",
+                    (stale,),
                 )
-                if await cur.fetchone():
-                    skipped += 1
-                    continue
+
+    epi_id = None
+    added = skipped = 0
+    for statement in wanted:
+        if statement in live:
+            skipped += 1
+            continue
         if epi_id is None:
-            epi = await record_episode(
-                pool, pub, scope,
-                content="Principles distilled by meta-cognition.",
-                source_ref="meta:principles-mirror",
-            )
+            epi = await record_episode(pool, pub, scope, content=episode_content,
+                                       source_ref=source_ref)
             epi_id = epi["epi_id"]
         try:
             mem = await add(
@@ -1973,7 +1991,63 @@ async def _sync_principles_to_memory(pool: Any, pub: Any, embedder: Any, scope: 
             added += 1
         except Exception:
             skipped += 1
-    return {"principles_mirrored": added, "principles_skipped": skipped}
+    return {"added": added, "skipped": skipped, "superseded": len(stale)}
+
+
+async def _sync_derived_to_memory(pool: Any, pub: Any, embedder: Any, scope: str) -> dict:
+    """Mirror the derived layer's durable statements into recallable memory.
+
+    Principles were the only mirrored artefact, so the five mental models and
+    every canonical identity fact never reached /api/search or /api/recall —
+    the best output of the cognition layer was only visible if you opened its
+    page.
+    """
+    import re
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+    # Skip word-frequency "principles" (e.g. "... 'use' appears 4 times") from
+    # the old pattern-counting distiller — noise in recallable memory.
+    _junk = re.compile(r"appears\s+\d+\s+times", re.I)
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT statement FROM principles WHERE scope = %s AND valid_to IS NULL",
+                [scope],
+            )
+            principles = [r[0].strip() for r in await cur.fetchall()
+                          if r[0] and r[0].strip() and not _junk.search(r[0])]
+            await cur.execute(
+                "SELECT name, description FROM mental_models "
+                "WHERE scope = %s AND valid_to IS NULL",
+                [scope],
+            )
+            models = []
+            for name, desc in await cur.fetchall():
+                if not name:
+                    continue
+                models.append(f"{name.strip()}: {desc.strip()}" if desc else name.strip())
+            await cur.execute(
+                "SELECT predicate, object FROM identity_facts "
+                "WHERE scope = %s AND valid_to IS NULL AND epistemic_status = 'canonical'",
+                [scope],
+            )
+            facts = [f"{str(p).replace('_', ' ')}: {o}" for p, o in await cur.fetchall()
+                     if p and o]
+
+    return {
+        "principles": await _mirror_statements(
+            pool, pub, embedder, scope, source_ref="meta:principles-mirror",
+            episode_content="Principles distilled by meta-cognition.",
+            statements=principles),
+        "mental_models": await _mirror_statements(
+            pool, pub, embedder, scope, source_ref="meta:models-mirror",
+            episode_content="Mental models distilled by meta-cognition.",
+            statements=models),
+        "identity_facts": await _mirror_statements(
+            pool, pub, embedder, scope, source_ref="identity:facts-mirror",
+            episode_content="Identity facts promoted by the identity engine.",
+            statements=facts),
+    }
 
 
 @app.post("/api/reflection/weekly")
@@ -2002,18 +2076,10 @@ async def reflection_weekly(body: ReflectionRequest | None = None):
         result["llm"] = bool(llm_client)
         result.update(await _sync_identity_from_reflection(pool, _make_publisher_sync(), scope))
         result.update(await _sync_goals_from_reflection(pool, scope))
-        try:
-            from cognition.decision_loop import (
-                distill_lessons_from_outcomes, decay_lesson_confidence,
-            )
-
-            result["lessons"] = await distill_lessons_from_outcomes(
-                pool, scope=scope, embedder=await get_shared_embedder(),
-                llm_client=llm_client, llm_model=llm_model,
-            )
-            result["lesson_decay"] = await decay_lesson_confidence(pool, scope=scope)
-        except Exception:
-            logger.exception("lesson distillation/decay failed scope=%s", scope)
+        # Lessons were retired 2026-11-11: nothing has ever recorded an outcome
+        # (0 of 214 decisions reviewed), so distillation ran over an empty
+        # `outcomes` table on every weekly reflection. cognition.decision_loop
+        # keeps the machinery if decision scoring is ever wired up.
         return result
     except Exception as e:
         logger.exception("weekly reflection failed scope=%s", scope)
@@ -2107,14 +2173,14 @@ async def meta_audit(body: MetaAuditRequest | None = None):
             llm_client=llm_client,
             llm_model=llm_model,
         )
-        sync = await _sync_principles_to_memory(
+        sync = await _sync_derived_to_memory(
             pool, _make_publisher_sync(), await get_shared_embedder(), scope,
         )
         return {
             "audit": audit_result,
             "principles_distilled": len(principles),
             "principles": principles,
-            **sync,
+            "mirror": sync,
         }
     except Exception as e:
         logger.exception("meta audit failed scope=%s", scope)
@@ -2144,10 +2210,11 @@ async def meta_distill(body: MetaDistillRequest | None = None):
             llm_client=llm_client,
             llm_model=llm_model,
         )
-        sync = await _sync_principles_to_memory(
+        sync = await _sync_derived_to_memory(
             pool, _make_publisher_sync(), await get_shared_embedder(), scope,
         )
-        return {"principles_distilled": len(principles), "principles": principles, **sync}
+        return {"principles_distilled": len(principles), "principles": principles,
+                "mirror": sync}
     except Exception as e:
         logger.exception("meta distill failed scope=%s", scope)
         return {"error": str(e), "scope": scope}
@@ -2155,14 +2222,16 @@ async def meta_distill(body: MetaDistillRequest | None = None):
 
 @app.post("/api/narrative/generate")
 async def narrative_generate(body: NarrativeGenerateRequest | None = None):
-    """Surface themes + compose life chapters from episodes.
+    """Surface themes + compose life chapters from the full episode timeline.
 
-    Body: {"scope": "user:usr_hiten", "min_frequency": 3}
+    Body: {"scope": "user:usr_hiten"}
     Each run supersedes prior hypothesis themes/chapters (invalidate-not-delete)
-    so the active set stays a fresh, bounded snapshot.
+    so the active set stays a fresh, bounded snapshot. Themes need the LLM: with
+    no usable model output the previous set is kept rather than replaced by
+    graph-degree rankings.
     """
     body = body or NarrativeGenerateRequest()
-    scope, min_frequency = body.scope, body.min_frequency
+    scope = body.scope
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from cognition.narrative import surface_themes, compose_chapters
@@ -2172,7 +2241,7 @@ async def narrative_generate(body: NarrativeGenerateRequest | None = None):
     try:
         themes = await surface_themes(
             pool=pool, publisher=_make_publisher_sync(),
-            scope=scope, min_frequency=min_frequency,
+            scope=scope, llm_client=llm_client, llm_model=llm_model,
         )
         chapters = await compose_chapters(
             pool=pool, publisher=_make_publisher_sync(), scope=scope,
@@ -2287,24 +2356,6 @@ def _reflection_period_guard(report_type: str, trunc: str):
 
 
 
-async def _decision_review_nudge_job() -> dict:
-    """Daily: surface decisions whose review_at has passed without an outcome.
-    One notification naming up to 5; the /decisions page shows the full list."""
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from goals import list_decisions
-    from shared.notify import get_notifier
-
-    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
-    due = await list_decisions(pool, SCOPE, due_for_review=True)
-    if due:
-        titles = "; ".join(d["title"][:60] for d in due[:5])
-        await get_notifier().notify(
-            f"{len(due)} decision(s) due for outcome review: {titles}"
-            + (" …" if len(due) > 5 else ""),
-        )
-    return {"due_for_review": len(due)}
-
-
 def _scheduler_jobs():
     from shared.scheduler import DailyAt, Every, Job, MonthlyAt, WeeklyAt
 
@@ -2326,7 +2377,6 @@ def _scheduler_jobs():
         )
 
     return [
-        Job("decision_review_nudge", DailyAt("09:00"), _decision_review_nudge_job),
         # consolidation is internally locked per scope — overlap-safe at any cadence
         Job("consolidation_fast", Every(20),
             lambda: consolidation_run(ConsolidationRunRequest(mode="fast"))),

@@ -54,15 +54,6 @@ class RecordDecisionRequest(BaseModel):
     prediction_confidence: float | None = Field(default=None, ge=0, le=1)
 
 
-class ReviewDecisionRequest(BaseModel):
-    outcome: str = Field(min_length=1, max_length=4000)
-    valence: str = Field(default="mixed",
-                         pattern="^(success|partial|failure|mixed|too_early)$")
-    matched_prediction: bool | None = None
-    lesson: str | None = Field(default=None, max_length=2000)
-    applies_to_entities: list[str] = Field(default_factory=list)
-
-
 class CreateOpportunityRequest(BaseModel):
     title: str = Field(min_length=1, max_length=300)
     description: str = Field(min_length=1, max_length=4000)
@@ -158,20 +149,10 @@ def make_router(
             prediction_confidence=body.prediction_confidence,
         )
 
-    @router.post("/decisions/{dec_id}/review")
-    async def decisions_review(dec_id: str, body: ReviewDecisionRequest):
-        pool = await pool_factory()
-        embedder = await embedder_factory() if embedder_factory is not None else None
-        try:
-            return await goals_mod.review_decision(
-                pool, publisher_factory(), scope, dec_id,
-                outcome=body.outcome, valence=body.valence,
-                matched_prediction=body.matched_prediction,
-                lesson=body.lesson, applies_to_entities=body.applies_to_entities,
-                embedder=embedder,
-            )
-        except ValueError as e:
-            raise HTTPException(404, str(e))
+    # POST /decisions/{id}/review was retired 2026-11-11 (see the weekly
+    # reflection endpoint): it was the only writer of `outcomes`, and nothing
+    # ever called it, so `lessons` could not fill. goals.review_decision and
+    # cognition.decision_loop remain if decision scoring is revived.
 
     # ── opportunities ────────────────────────────────────────────────────────
     @router.get("/opportunities")

@@ -45,8 +45,9 @@ def test_monthly_at_rolls_to_next_month_and_year():
 
 # ── fakes ─────────────────────────────────────────────────────────────────────
 class FakeCursor:
-    def __init__(self, log):
+    def __init__(self, log, rows=()):
         self.log = log
+        self.rows = list(rows)
 
     async def execute(self, sql, params=None):
         self.log.append((" ".join(sql.split()), params))
@@ -55,7 +56,7 @@ class FakeCursor:
         return None
 
     async def fetchall(self):
-        return []
+        return self.rows
 
     async def __aenter__(self):
         return self
@@ -65,23 +66,25 @@ class FakeCursor:
 
 
 class FakeConn:
-    def __init__(self, log):
+    def __init__(self, log, rows=()):
         self._log = log
+        self._rows = rows
 
     def cursor(self):
-        return FakeCursor(self._log)
+        return FakeCursor(self._log, self._rows)
 
 
 class FakePool:
-    def __init__(self):
+    def __init__(self, rows=()):
         self.sql_log = []
+        self.rows = list(rows)
 
     def connection(self):
         pool = self
 
         class _CM:
             async def __aenter__(self):
-                return FakeConn(pool.sql_log)
+                return FakeConn(pool.sql_log, pool.rows)
 
             async def __aexit__(self, *a):
                 return False
@@ -343,3 +346,69 @@ async def test_reconcile_never_blocks_the_loop_when_the_db_is_down():
     sched = Scheduler([job], scope=SCOPE, pool_factory=broken_pool,
                       publisher_factory=FakePublisher, redis_factory=lambda: None)
     await sched._reconcile_orphaned_runs()  # must not raise
+
+
+# ── boot-time catch-up ────────────────────────────────────────────────────────
+# `start()` can only compute the next slot from "now"; without the run history
+# a restart after a slot moved weekly/monthly jobs a whole period out, which is
+# how narrative_generate last fired on 2026-10-11 and stayed silent after.
+@pytest.mark.asyncio
+async def test_seed_catches_up_a_weekly_job_whose_slot_has_passed():
+    job = Job("narrative_generate", WeeklyAt((6,), "05:20"), _async_return({}))
+    last = datetime.now() - timedelta(days=31)
+    sched, _ = _scheduler(job, pool=FakePool(rows=[("workflow:narrative_generate", last)]))
+
+    await sched._seed_next_due()
+
+    assert job.next_due <= datetime.now() + timedelta(seconds=30)
+    assert job.last_fired == last
+
+
+@pytest.mark.asyncio
+async def test_seed_keeps_a_weekly_job_that_already_ran_this_period_on_schedule():
+    job = Job("narrative_generate", WeeklyAt((6,), "05:20"), _async_return({}))
+    last = datetime.now() - timedelta(days=1)
+    sched, _ = _scheduler(job, pool=FakePool(rows=[("workflow:narrative_generate", last)]))
+
+    await sched._seed_next_due()
+
+    assert job.next_due > datetime.now() + timedelta(days=1)
+
+
+@pytest.mark.asyncio
+async def test_seed_staggers_a_backlog_instead_of_firing_it_all_at_once():
+    jobs = [Job(f"job{i}", WeeklyAt((6,), "05:20"), _async_return({})) for i in range(3)]
+    last = datetime.now() - timedelta(days=40)
+    rows = [(f"workflow:job{i}", last) for i in range(3)]
+    sched = Scheduler(jobs, scope=SCOPE, pool_factory=_async_return(FakePool(rows=rows)),
+                      publisher_factory=FakePublisher, redis_factory=lambda: None)
+
+    await sched._seed_next_due()
+
+    dues = [j.next_due for j in jobs]
+    assert dues == sorted(dues) and len(set(dues)) == len(dues)
+    assert max(dues) <= datetime.now() + timedelta(seconds=60)
+
+
+@pytest.mark.asyncio
+async def test_seed_without_history_schedules_normally():
+    job = Job("fresh", Every(20), _async_return({}))
+    sched, _ = _scheduler(job, pool=FakePool())
+
+    before = datetime.now()
+    await sched._seed_next_due()
+
+    assert before + timedelta(minutes=19) < job.next_due < datetime.now() + timedelta(minutes=21)
+
+
+@pytest.mark.asyncio
+async def test_seed_never_blocks_the_loop_when_the_db_is_down():
+    job = Job("fresh", Every(20), _async_return({}))
+
+    async def broken_pool():
+        raise ConnectionError("postgres down")
+
+    sched = Scheduler([job], scope=SCOPE, pool_factory=broken_pool,
+                      publisher_factory=FakePublisher, redis_factory=lambda: None)
+    await sched._seed_next_due()
+    assert job.next_due is not None

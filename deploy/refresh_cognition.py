@@ -89,7 +89,8 @@ async def main():
     log(f"mood={mood.get('mood')} health_sleep={health.get('sleep', {}).get('mentions', 0)}")
 
     # 3. Narrative (supersedes old themes + chapters).
-    themes = await surface_themes(pool=pool, publisher=pub, scope=SCOPE, min_frequency=3)
+    themes = await surface_themes(pool=pool, publisher=pub, scope=SCOPE,
+                                  llm_client=llm, llm_model=model)
     chapters = await compose_chapters(pool=pool, publisher=pub, scope=SCOPE,
                                       llm_client=llm, llm_model=model)
     log(f"narrative: themes={len(themes)} chapters={len(chapters)} top={[t.get('name') for t in themes[:8]]}")
@@ -118,7 +119,7 @@ async def main():
     log(f"meta: audit={audit} principles_distilled={len(principles)} assumptions/models={am}")
     try:
         emb = await api_server.get_shared_embedder()
-        sync = await api_server._sync_principles_to_memory(pool, pub, emb, SCOPE)
+        sync = await api_server._sync_derived_to_memory(pool, pub, emb, SCOPE)
         log(f"principle mirror: {sync}")
     except Exception as e:  # noqa: BLE001
         log(f"principle mirror skipped: {e}")
