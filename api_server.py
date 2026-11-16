@@ -1724,6 +1724,10 @@ async def ingest(body: IngestRequest, background_tasks: BackgroundTasks):
         )
         mem_chunks = result.pop("mem_chunks", [])
         epi_id = result.get("epi_id")
+        if epi_id:
+            # New graph/memory rows make cached alias and graph results stale.
+            from memory.retrieval import invalidate_caches
+            invalidate_caches()
     except Exception as e:
         logger.exception("ingest failed source_ref=%s", source_ref)
         return {"error": str(e)}

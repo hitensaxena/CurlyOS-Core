@@ -14,6 +14,7 @@ See: ~/hitenos-architecture/02c-retrieval.md
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import math
 import hashlib
@@ -325,6 +326,20 @@ GRAPH_ENTITIES_PER_HOP = 400
 GRAPH_MEMORIES_MAX = 120
 
 
+_ALIAS_CACHE: tuple[float, tuple[list[str], list[str]]] | None = None
+_ALIAS_CACHE_TTL = 60.0
+_GRAPH_CACHE: dict[tuple, tuple[float, list[dict]]] = {}
+_GRAPH_CACHE_TTL = 30.0
+_GRAPH_CACHE_MAX = 128
+
+
+def invalidate_caches() -> None:
+    """Drop process-local alias/graph caches after a graph-changing write."""
+    global _ALIAS_CACHE
+    _ALIAS_CACHE = None
+    _GRAPH_CACHE.clear()
+
+
 async def _load_alias_pairs(pool: Any) -> tuple[list[str], list[str]]:
     """(raw_id, canonical_id) for every entity whose spelling was absorbed.
 
@@ -334,6 +349,11 @@ async def _load_alias_pairs(pool: Any) -> tuple[list[str], list[str]]:
     553). Folding endpoints through these pairs fixes traversal without
     rewriting a single row.
     """
+    global _ALIAS_CACHE
+    now = time.monotonic()
+    if _ALIAS_CACHE is not None and _ALIAS_CACHE[0] > now:
+        return _ALIAS_CACHE[1]
+
     sql = """
       SELECT DISTINCT ON (en.id) en.id, a.entity_id
       FROM knowledge_entities en
@@ -351,7 +371,9 @@ async def _load_alias_pairs(pool: Any) -> tuple[list[str], list[str]]:
         # A missing alias table must not take recall down: fall back to raw ids.
         log.warning("Alias lookup failed, traversing raw entity ids: %s", exc)
         return [], []
-    return [r[0] for r in rows], [r[1] for r in rows]
+    result = ([r[0] for r in rows], [r[1] for r in rows])
+    _ALIAS_CACHE = (now + _ALIAS_CACHE_TTL, result)
+    return result
 
 
 async def _graph_expand(
@@ -376,6 +398,22 @@ async def _graph_expand(
     """
     if not seed_ids:
         return []
+
+    cache_key = (
+        scope,
+        tuple(seed_ids),
+        k_hops,
+        as_of.isoformat() if as_of else None,
+        tuple(sorted(epistemic_filter)),
+    )
+    now = time.monotonic()
+    cached = _GRAPH_CACHE.get(cache_key)
+    if cached is not None:
+        if cached[0] > now:
+            _GRAPH_CACHE.pop(cache_key, None)
+            _GRAPH_CACHE[cache_key] = cached  # refresh recency
+            return copy.deepcopy(cached[1])
+        _GRAPH_CACHE.pop(cache_key, None)
 
     bt_where, bt_params = _bitemporal_where(as_of)
 
@@ -575,7 +613,7 @@ async def _graph_expand(
         log.warning("Graph expansion failed: %s", exc)
         return []
 
-    return [
+    result = [
         {"id": r[0], "text": r[1], "tier": r[2],
          "valid_from": r[3], "valid_to": r[4],
          "source_episode_id": r[5], "epistemic_status": r[6],
@@ -583,6 +621,10 @@ async def _graph_expand(
          "signals": {"graph": float(r[7]) if r[7] else 0.0}}
         for r in rows
     ]
+    if len(_GRAPH_CACHE) >= _GRAPH_CACHE_MAX:
+        _GRAPH_CACHE.pop(next(iter(_GRAPH_CACHE)), None)
+    _GRAPH_CACHE[cache_key] = (time.monotonic() + _GRAPH_CACHE_TTL, copy.deepcopy(result))
+    return result
 
 
 # ── Stage 3b: Cross-encoder rerank ─────────────────────────────────────────
