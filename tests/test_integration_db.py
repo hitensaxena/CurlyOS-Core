@@ -14,6 +14,9 @@ import pytest
 from psycopg_pool import AsyncConnectionPool
 
 import migrate
+from cognition.working_set import (
+    get_working_set, pin_memory, refresh_working_set, working_set_boost,
+)
 from memory.chunking import split_text
 from memory.governance import add, invalidate, record_episode
 from memory.ingest_service import ingest_text
@@ -79,6 +82,43 @@ async def test_add_deduplicates_active_fact(pool):
     assert third["deduplicated"] is False
     assert third["mem_id"] != first["mem_id"]
     await invalidate(pool, pub, scope, third["mem_id"], reason="integration cleanup")
+
+
+@pytest.mark.asyncio
+async def test_working_set_refresh_preserves_pins(pool):
+    pub = _Publisher()
+    scope = "test:integration"
+    epi = await record_episode(pool, pub, scope, content="working set integration")
+    mem_ids = []
+    for i in range(3):
+        mem = await add(
+            pool, pub, scope,
+            f"Working set fact {uuid.uuid4()} number {i}",
+            epi["epi_id"],
+        )
+        mem_ids.append(mem["mem_id"])
+
+    await pin_memory(pool, scope, mem_ids[0], "integration pin")
+    result = await refresh_working_set(pool, pub, scope, size=10, ttl_hours=1)
+    assert result["selected"] >= 1
+    assert result["pinned"] == 1
+
+    items = await get_working_set(pool, scope, 10)
+    pinned = [item for item in items if item["memory_id"] == mem_ids[0]]
+    assert pinned and pinned[0]["pinned"] is True
+    assert pinned[0]["salience"] == 1.0
+
+    boost = await working_set_boost(pool, scope)
+    assert boost.get(mem_ids[0]) == 1.0
+
+    for mem_id in mem_ids:
+        await invalidate(pool, pub, scope, mem_id, reason="integration cleanup")
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM working_set WHERE scope = %s AND memory_id = ANY(%s)",
+                (scope, mem_ids),
+            )
 
 
 @pytest.mark.asyncio

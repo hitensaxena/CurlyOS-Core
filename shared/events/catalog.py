@@ -44,6 +44,7 @@ EVENT_CATALOG: dict[str, str] = {
     "cognition.reflection.completed": "MEMORY",
     "cognition.audit.completed": "MEMORY",
     "cognition.meta.models_generated": "MEMORY",
+    "cognition.working_set.refreshed": "MEMORY",
     # ── goals / decisions / opportunities ───────────────────────────────────
     "goal.created": "EVENTS",
     "goal.updated": "EVENTS",

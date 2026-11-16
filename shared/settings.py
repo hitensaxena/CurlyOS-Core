@@ -32,6 +32,15 @@ SETTINGS_REGISTRY: dict[str, dict[str, Any]] = {
                              "description": "Weight of recency in the final blend (0–1)."},
     "recall_blend_half_life_days": {"type": "float", "default": 30.0, "category": "recall",
                                     "description": "Recency half-life in days for the final blend."},
+    "recall_working_set_boost": {"type": "float", "default": 0.08, "category": "recall",
+                                 "description": "Bounded score boost for working-set members (0–1)."},
+    # working memory
+    "working_set_enabled": {"type": "bool", "default": True, "category": "cognition",
+                            "description": "Run the working-set refresh engine."},
+    "working_set_size": {"type": "int", "default": 50, "category": "cognition",
+                         "description": "Maximum non-pinned working-set entries."},
+    "working_set_ttl_hours": {"type": "int", "default": 24, "category": "cognition",
+                              "description": "Lifetime of a non-pinned working-set entry, in hours."},
     # ingest
     "epistemic_classify_enabled": {"type": "bool", "default": True, "category": "ingest",
                                    "description": "Run the per-ingest LLM epistemic classification (canonical/belief/hypothesis)."},
@@ -71,13 +80,20 @@ def coerce_value(key: str, raw: Any) -> Any:
             raise ValueError(f"{key} expects an integer")
         if key == "recall_cache_ttl_seconds" and not (1 <= v <= 3600):
             raise ValueError("recall_cache_ttl_seconds must be 1–3600")
+        if key == "working_set_size" and not (1 <= v <= 500):
+            raise ValueError("working_set_size must be 1–500")
+        if key == "working_set_ttl_hours" and not (1 <= v <= 720):
+            raise ValueError("working_set_ttl_hours must be 1–720")
         return v
     if t == "float":
         try:
             v = float(raw)
         except (TypeError, ValueError):
             raise ValueError(f"{key} expects a number")
-        if key in ("recall_blend_cosine", "recall_blend_fused", "recall_blend_recency"):
+        if key in (
+            "recall_blend_cosine", "recall_blend_fused", "recall_blend_recency",
+            "recall_working_set_boost",
+        ):
             if not (0.0 <= v <= 1.0):
                 raise ValueError(f"{key} must be between 0 and 1")
         if key == "recall_blend_half_life_days" and v <= 0:

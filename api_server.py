@@ -223,6 +223,11 @@ class EngineRunRequest(BaseModel):
     scope: str = SCOPE
 
 
+class WorkingSetPinRequest(BaseModel):
+    scope: str = SCOPE
+    reason: str = ""
+
+
 class ReflectionRequest(BaseModel):
     scope: str = SCOPE
     window_days: int = Field(default=7, ge=1, le=90)
@@ -797,6 +802,7 @@ async def recall(body: RecallRequest):
         blend_fused=float(await get_setting_cached(pool, "recall_blend_fused", 0.25)),
         blend_recency=float(await get_setting_cached(pool, "recall_blend_recency", 0.10)),
         blend_half_life_days=float(await get_setting_cached(pool, "recall_blend_half_life_days", 30.0)),
+        working_set_boost=float(await get_setting_cached(pool, "recall_working_set_boost", 0.08)),
     )
 
     redis = _make_redis() if settings.cache_enabled else None
@@ -854,6 +860,50 @@ def cognition_meta(scope: str = SCOPE):
         "decision_audits": decision_audits,
         "mental_models": mental_models,
     }
+
+
+@app.get("/api/cognition/working-set")
+async def working_set_list(scope: str = SCOPE, limit: int = Query(default=20, le=100)):
+    """The current salience-ranked working memory for a scope."""
+    from cognition.working_set import get_working_set
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    items = await get_working_set(pool, scope, limit)
+    return {"items": items, "count": len(items), "scope": scope}
+
+
+@app.post("/api/cognition/working-set/{memory_id}/pin")
+async def working_set_pin(memory_id: str, body: WorkingSetPinRequest | None = None):
+    """Pin a memory into working memory. Pins survive refreshes."""
+    from cognition.working_set import WorkingSetError, pin_memory
+    from shared.scope import ScopeNotAllowed, require_scope
+
+    scope = body.scope if body else SCOPE
+    try:
+        require_scope(scope)
+    except ScopeNotAllowed:
+        raise HTTPException(status_code=403, detail=f"scope not allowed: {scope}")
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    try:
+        await pin_memory(pool, scope, memory_id, body.reason if body else "")
+    except WorkingSetError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"pinned": memory_id, "scope": scope}
+
+
+@app.delete("/api/cognition/working-set/{memory_id}")
+async def working_set_unpin(memory_id: str, scope: str = SCOPE):
+    """Release a pin; the entry expires on the normal TTL."""
+    from cognition.working_set import unpin_memory
+    from shared.scope import ScopeNotAllowed, require_scope
+
+    try:
+        require_scope(scope)
+    except ScopeNotAllowed:
+        raise HTTPException(status_code=403, detail=f"scope not allowed: {scope}")
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    unpinned = await unpin_memory(pool, scope, memory_id)
+    return {"unpinned": unpinned, "memory_id": memory_id, "scope": scope}
 
 
 @app.get("/api/cognition/reflection")
@@ -2381,6 +2431,19 @@ def _register_engines() -> None:
         await _sweep_unembedded()
         return {"ok": True}
 
+    async def _working_set_refresh(scope: str) -> dict:
+        from cognition.working_set import refresh_working_set
+        from shared.settings import get_setting_cached
+
+        pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+        if not bool(await get_setting_cached(pool, "working_set_enabled", True)):
+            return {"skipped": "disabled"}
+        size = int(await get_setting_cached(pool, "working_set_size", 50))
+        ttl = int(await get_setting_cached(pool, "working_set_ttl_hours", 24))
+        return await refresh_working_set(
+            pool, _make_publisher_sync(), scope, size=size, ttl_hours=ttl,
+        )
+
     for engine in (
         Engine(
             name="consolidation_fast",
@@ -2411,6 +2474,16 @@ def _register_engines() -> None:
             inputs=("memories", "episodes"),
             outputs=("memories", "episodes"),
             run=_embedding_sweep,
+        ),
+        Engine(
+            name="working_set_refresh",
+            category="cognition",
+            description="Recompute the salience-ranked working set from recency, goals and identity.",
+            schedule="every 15m",
+            cadence=Every(15),
+            inputs=("memories", "goals", "identity_facts", "working_set"),
+            outputs=("working_set",),
+            run=_working_set_refresh,
         ),
         Engine(
             name="attention_scan",

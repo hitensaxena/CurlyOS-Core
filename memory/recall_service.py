@@ -33,6 +33,7 @@ class RecallSettings:
     blend_fused: float = 0.25
     blend_recency: float = 0.10
     blend_half_life_days: float = 30.0
+    working_set_boost: float = 0.08
 
 
 def recall_cache_key(
@@ -43,7 +44,8 @@ def recall_cache_key(
         f"cache:recall:{scope}:{generation}:{mode}:{k}:{settings.max_per_episode}:"
         f"{settings.summary_boost}:{settings.chunk_penalty}:"
         f"{settings.blend_cosine}:{settings.blend_fused}:"
-        f"{settings.blend_recency}:{settings.blend_half_life_days}:{digest}"
+        f"{settings.blend_recency}:{settings.blend_half_life_days}:"
+        f"{settings.working_set_boost}:{digest}"
     )
 
 
@@ -154,6 +156,26 @@ async def recall_query(
                 half_life_days=settings.blend_half_life_days,
             )
             stage_timings["blend"] = round((time.monotonic() - _t_blend) * 1000, 2)
+
+            # Working memory is a bounded boost for candidates the query
+            # already retrieved; it never injects unrelated pinned rows.
+            _t_ws = time.monotonic()
+            try:
+                from cognition.working_set import working_set_boost
+
+                ws = await working_set_boost(pool, scope)
+            except Exception:
+                log.debug("working-set boost unavailable", exc_info=True)
+                ws = {}
+            if ws:
+                for it in cand:
+                    salience = ws.get(it.id)
+                    if salience:
+                        blend[it.id] = min(
+                            1.0,
+                            blend.get(it.id, 0.0) + settings.working_set_boost * salience,
+                        )
+            stage_timings["working_set"] = round((time.monotonic() - _t_ws) * 1000, 2)
             cand = sorted(cand, key=lambda it: -rank_of(it))
 
             def key_of(it: Any) -> str:
