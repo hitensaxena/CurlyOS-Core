@@ -47,6 +47,9 @@ EVENT_CATALOG: dict[str, str] = {
     "cognition.working_set.refreshed": "MEMORY",
     "cognition.contradiction.detected": "MEMORY",
     "cognition.contradiction.resolved": "MEMORY",
+    "cognition.intention.created": "MEMORY",
+    "cognition.intention.surfaced": "MEMORY",
+    "cognition.intention.updated": "MEMORY",
     # ── goals / decisions / opportunities ───────────────────────────────────
     "goal.created": "EVENTS",
     "goal.updated": "EVENTS",
