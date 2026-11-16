@@ -15,6 +15,7 @@ of ``{"error": ...}`` is treated as an error, never as success.
 from __future__ import annotations
 
 import json
+import os
 import re
 import urllib.error
 import urllib.parse
@@ -78,10 +79,19 @@ def _check(payload: Any, method: str, path: str) -> Any:
 
 class _ClientBase:
     def __init__(self, base_url: str | None = None, scope: str | None = None,
-                 timeout: float = 30.0) -> None:
+                 timeout: float = 30.0, token: str | None = None) -> None:
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self.scope = validate_scope(scope or DEFAULT_SCOPE)
         self.timeout = timeout
+        # The server's gate is dormant unless CURLYOS_API_TOKEN is set there.
+        # Reading the same variable here means every client — hooks, MCP,
+        # Hermes — arms itself when the operator arms the server, with no
+        # per-call wiring. An explicit token wins over the environment.
+        self.token = (token if token is not None
+                      else os.environ.get("CURLYOS_API_TOKEN", "")).strip()
+
+    def _auth_headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.token}"} if self.token else {}
 
     def _recall_body(self, query: str, k: int, mode: str) -> dict:
         if mode not in VALID_MODES:
@@ -104,9 +114,9 @@ class SyncCurlyOSClient(_ClientBase):
                 params: dict | None = None, timeout: float | None = None) -> Any:
         url = _url(self.base_url, path, params)
         data = json.dumps(body).encode() if body is not None else None
+        headers = {"Content-Type": "application/json", **self._auth_headers()}
         request = urllib.request.Request(
-            url, data=data, headers={"Content-Type": "application/json"},
-            method=method,
+            url, data=data, headers=headers, method=method,
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout or self.timeout) as response:
@@ -178,7 +188,9 @@ class CurlyOSClient(_ClientBase):
         url = _url(self.base_url, path, params)
         try:
             async with httpx.AsyncClient(timeout=timeout or self.timeout, trust_env=False) as client:
-                response = await client.request(method, url, json=body)
+                response = await client.request(
+                    method, url, json=body, headers=self._auth_headers(),
+                )
                 response.raise_for_status()
                 payload = response.json()
         except httpx.HTTPStatusError as exc:

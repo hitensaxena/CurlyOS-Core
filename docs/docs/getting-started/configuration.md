@@ -21,6 +21,7 @@ env vars  →  ~/.hermes/curlyos.yaml  →  ~/.hermes/.env
 | `CURLYOS_REDIS_URL` | Redis URL | *(required)* |
 | `CURLYOS_API_PORT` | API server port | `8643` |
 | `CURLYOS_SCOPE` | Default scope for facts | `user:usr_hiten` |
+| `CURLYOS_API_TOKEN` | Bearer token for `/api/*`. Dormant when unset — set it on the server **and** on every client before exposing the API beyond 127.0.0.1. `/api/health` stays open. | *(unset)* |
 | `CURLYOS_EMBED_DEVICE` | Force embedder device: `cpu` · `mps` · `cuda` | `cpu` |
 | `OPENROUTER_API_KEY` | LLM key for extraction/cognition | *(optional)* |
 | `REFRESH_BACKEND` | `chain` (OpenRouter) or `hermes` (Claude via hermes-bridge) | `chain` |

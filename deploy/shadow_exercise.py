@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import urllib.request
 from pathlib import Path
@@ -42,13 +43,20 @@ API = "http://127.0.0.1:8643"
 HANDLER = "graph_projection"
 
 
+def _auth() -> dict[str, str]:
+    """Bearer token when the API gate is armed (dormant by default)."""
+    token = os.environ.get("CURLYOS_API_TOKEN", "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def _get(path: str) -> dict:
-    with urllib.request.urlopen(f"{API}{path}", timeout=60) as resp:
+    req = urllib.request.Request(f"{API}{path}", headers=_auth())
+    with urllib.request.urlopen(req, timeout=60) as resp:
         return json.load(resp)
 
 
 def _post(path: str) -> dict:
-    req = urllib.request.Request(f"{API}{path}", method="POST")
+    req = urllib.request.Request(f"{API}{path}", method="POST", headers=_auth())
     with urllib.request.urlopen(req, timeout=300) as resp:
         return json.load(resp)
 

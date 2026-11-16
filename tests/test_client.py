@@ -96,3 +96,40 @@ def test_identity_encodes_predicates():
         client.identity(["name", "work"])
     assert req.call_args.kwargs["params"]["predicates"] == "name,work"
     assert req.call_args.kwargs["params"]["scope"] == "user:test"
+
+
+def test_token_is_sent_when_configured(monkeypatch):
+    """Half-arming is the failure this guards: a token on the server and a
+    client that silently sends none looks like an outage."""
+    monkeypatch.setenv("CURLYOS_API_TOKEN", "tok-123")
+    client = SyncCurlyOSClient(base_url="http://example", scope="user:test")
+    captured = {}
+
+    def fake_urlopen(request, timeout=None):
+        captured["headers"] = dict(request.header_items())
+        return _Response({"ok": True})
+
+    with patch("shared.client.urllib.request.urlopen", side_effect=fake_urlopen):
+        client.request("GET", "/api/engines")
+    assert captured["headers"].get("Authorization") == "Bearer tok-123"
+
+
+def test_no_token_header_when_the_gate_is_dormant(monkeypatch):
+    monkeypatch.delenv("CURLYOS_API_TOKEN", raising=False)
+    client = SyncCurlyOSClient(base_url="http://example", scope="user:test")
+    captured = {}
+
+    def fake_urlopen(request, timeout=None):
+        captured["headers"] = dict(request.header_items())
+        return _Response({"ok": True})
+
+    with patch("shared.client.urllib.request.urlopen", side_effect=fake_urlopen):
+        client.request("GET", "/api/engines")
+    assert "Authorization" not in captured["headers"]
+
+
+def test_explicit_token_overrides_the_environment(monkeypatch):
+    monkeypatch.setenv("CURLYOS_API_TOKEN", "env-token")
+    client = SyncCurlyOSClient(base_url="http://example", scope="user:test",
+                               token="explicit-token")
+    assert client._auth_headers() == {"Authorization": "Bearer explicit-token"}

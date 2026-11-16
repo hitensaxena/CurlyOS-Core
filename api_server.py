@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import json
 import logging
 import os
@@ -135,6 +136,41 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _api_token() -> str:
+    """The bearer token this process requires, or "" when the gate is dormant.
+
+    Read per request, not cached at import: a token added to the environment of
+    a long-running service should not require a second restart to take effect
+    beyond the one that loads it.
+    """
+    return os.environ.get("CURLYOS_API_TOKEN", "").strip()
+
+
+# Unauthenticated by design: the health probe must work before anything else
+# does, and it exposes no user data.
+_AUTH_EXEMPT = frozenset({"/api/health"})
+
+
+@app.middleware("http")
+async def api_token_gate(request, call_next):
+    """Require a bearer token on /api/* when CURLYOS_API_TOKEN is set.
+
+    Dormant by default: with the variable unset this is a pass-through, which
+    is correct while the server binds 127.0.0.1 — the token exists for the day
+    something is put in front of it (a proxy, a tunnel, another host).
+    """
+    token = _api_token()
+    path = request.scope.get("path", "")
+    if token and path.startswith("/api/") and path not in _AUTH_EXEMPT:
+        header = request.headers.get("authorization", "")
+        scheme, _, presented = header.partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(presented, token):
+            return JSONResponse(
+                {"detail": "missing or invalid API token"}, status_code=401,
+            )
+    return await call_next(request)
 
 
 @app.middleware("http")
