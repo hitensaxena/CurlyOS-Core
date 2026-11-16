@@ -40,8 +40,9 @@ episodes closed instead of re-summarising them.
 
 **Retrieval** blends dense, sparse, entity and graph candidates with RRF, then
 re-ranks by cosine, recency, lexical overlap and working-set salience, with a
-multiplier demoting rows graph hygiene flagged as chatter. Stage timings are
-returned with every response. Golden eval: hit@8 0.95, MRR 0.658 over 22
+multiplier demoting rows flagged as chatter — 370 of 27,907, set by regex plus
+a semantic pass (`deploy/classify_chatter.py`, report-only). Stage timings are
+returned with every response. Golden eval: hit@8 0.95, MRR 0.676 over 22
 queries.
 
 **Cognition** keeps a salience-ranked working set that boosts recall,
