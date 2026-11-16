@@ -202,8 +202,7 @@ async def scan(
                         "(id, scope, kind, left_id, right_id, similarity, reason, "
                         " proposed_action, evidence) "
                         "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb) "
-                        "ON CONFLICT (scope, kind, left_id, right_id) "
-                        "WHERE status = 'open' DO NOTHING "
+                        "ON CONFLICT (scope, kind, left_id, right_id) DO NOTHING "
                         "RETURNING id",
                         (
                             mint("ctr"), candidate["scope"], candidate["kind"],
