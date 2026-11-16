@@ -47,14 +47,24 @@ def _dt(value: Any, fallback: datetime) -> datetime:
     return fallback
 
 
-async def _events(pool: Any, scope: str, types: tuple[str, ...]) -> list[tuple]:
+async def _events(
+    pool: Any, scope: str, types: tuple[str, ...], since: datetime | None = None,
+) -> list[tuple]:
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT seq, type, subject, data, created_at FROM events "
-                "WHERE scope = %s AND type = ANY(%s) ORDER BY seq",
-                (scope, list(types)),
-            )
+            if since is None:
+                await cur.execute(
+                    "SELECT seq, type, subject, data, created_at FROM events "
+                    "WHERE scope = %s AND type = ANY(%s) ORDER BY seq",
+                    (scope, list(types)),
+                )
+            else:
+                await cur.execute(
+                    "SELECT seq, type, subject, data, created_at FROM events "
+                    "WHERE scope = %s AND type = ANY(%s) AND created_at >= %s "
+                    "ORDER BY seq",
+                    (scope, list(types), since),
+                )
             return list(await cur.fetchall())
 
 
@@ -77,8 +87,10 @@ async def _invalidated_ids(pool: Any, scope: str, types: tuple[str, ...]) -> set
     }
 
 
-async def graph_diff(pool: Any, scope: str) -> dict:
-    events = await _events(pool, scope, _GRAPH_TYPES)
+async def graph_diff(
+    pool: Any, scope: str, since: datetime | None = None,
+) -> dict:
+    events = await _events(pool, scope, _GRAPH_TYPES, since)
     entity_ids = {
         e[3].get("entity_id") or e[2] for e in events if e[1] == _GRAPH_TYPES[0]
     }
@@ -118,9 +130,12 @@ async def graph_diff(pool: Any, scope: str) -> dict:
     }
 
 
-async def rebuild_graph(pool: Any, scope: str, *, dry_run: bool = False) -> dict:
-    events = await _events(pool, scope, _GRAPH_TYPES)
-    diff = await graph_diff(pool, scope)
+async def rebuild_graph(
+    pool: Any, scope: str, *, dry_run: bool = False,
+    since: datetime | None = None,
+) -> dict:
+    events = await _events(pool, scope, _GRAPH_TYPES, since)
+    diff = await graph_diff(pool, scope, since)
     invalidated_entities = await _invalidated_ids(pool, scope, (_GRAPH_INVALIDATED[0],))
     invalidated_edges = await _invalidated_ids(pool, scope, (_GRAPH_INVALIDATED[1],))
     restored_entities = 0

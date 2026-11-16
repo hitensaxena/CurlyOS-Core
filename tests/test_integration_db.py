@@ -1020,3 +1020,60 @@ async def test_lesson_mirror_writes_events(pool):
                               (entity_id,))
             await cur.execute("DELETE FROM knowledge_entities WHERE scope = %s", (scope,))
             await cur.execute("DELETE FROM lessons WHERE scope = %s", (scope,))
+
+
+@pytest.mark.asyncio
+async def test_backfilled_invalidation_is_not_a_discrepancy(pool):
+    """A backfilled invalidation records a deletion that predates eventing.
+
+    There is no row to close, and that must not read as a payload/row drift —
+    otherwise replaying the repaired log raises thousands of false alarms.
+    """
+    import json as _json
+
+    from knowledge.graph.projection import build_graph_handler
+    from shared import metrics
+    from shared.events import full_type
+    from shared.events.dispatch import dispatch_once
+
+    scope = "test:projection-backfill"
+    gone = mint("ent")
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM events WHERE scope = %s", (scope,))
+            await cur.execute(
+                "INSERT INTO events (id, type, subject, scope, data) "
+                "VALUES (%s, %s, %s, %s, %s::jsonb)",
+                (mint("evt"), full_type("knowledge.entity.invalidated"), gone, scope,
+                 _json.dumps({"entity_id": gone, "backfilled": True})),
+            )
+
+    async def factory():
+        return pool
+
+    handler = build_graph_handler(factory)
+    before = metrics.snapshot()["counters"].get(
+        "event.graph_projection.discrepancies", 0)
+    await dispatch_once(pool, scope, handler_list=[handler], backfill=True)
+    after = metrics.snapshot()["counters"].get(
+        "event.graph_projection.discrepancies", 0)
+    assert after == before
+
+    # The same event without the flag IS a discrepancy: the verifier still works.
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM events WHERE scope = %s", (scope,))
+            await cur.execute(
+                "INSERT INTO events (id, type, subject, scope, data) "
+                "VALUES (%s, %s, %s, %s, %s::jsonb)",
+                (mint("evt"), full_type("knowledge.entity.invalidated"), gone, scope,
+                 _json.dumps({"entity_id": gone})),
+            )
+    await dispatch_once(pool, scope, handler_list=[handler], backfill=True)
+    assert metrics.snapshot()["counters"].get(
+        "event.graph_projection.discrepancies", 0) > after
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM events WHERE scope = %s", (scope,))
