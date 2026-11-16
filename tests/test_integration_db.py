@@ -355,6 +355,9 @@ async def test_decision_reviews_become_intentions_once(pool):
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute("DELETE FROM intentions WHERE scope = %s", (scope,))
+            await cur.execute(
+                "DELETE FROM outcomes WHERE scope = %s", (scope,),
+            )
             await cur.execute("DELETE FROM decisions WHERE scope = %s", (scope,))
             await cur.execute(
                 "INSERT INTO decisions "
@@ -375,6 +378,9 @@ async def test_decision_reviews_become_intentions_once(pool):
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute("DELETE FROM intentions WHERE scope = %s", (scope,))
+            await cur.execute(
+                "DELETE FROM outcomes WHERE scope = %s", (scope,),
+            )
             await cur.execute("DELETE FROM decisions WHERE scope = %s", (scope,))
 
 
@@ -421,4 +427,55 @@ async def test_resolve_already_closed_identity_candidate(pool):
             )
             await cur.execute(
                 "DELETE FROM contradiction_candidates WHERE scope = %s", (scope,),
+            )
+
+
+@pytest.mark.asyncio
+async def test_decision_review_closes_the_loop(pool):
+    from datetime import datetime, timedelta, timezone
+
+    from cognition.prospective import surface_due_intentions, sync_decision_reviews
+    from goals import review_decision
+
+    pub = _Publisher()
+    scope = "test:intentions"
+    decision_id = mint("dec")
+    past = datetime.now(timezone.utc) - timedelta(hours=1)
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM intentions WHERE scope = %s", (scope,))
+            await cur.execute(
+                "DELETE FROM outcomes WHERE scope = %s", (scope,),
+            )
+            await cur.execute("DELETE FROM decisions WHERE scope = %s", (scope,))
+            await cur.execute(
+                "INSERT INTO decisions "
+                "(id, scope, title, chosen, rationale, review_at, decided_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, now())",
+                (decision_id, scope, "Loop decision", "option A", "because", past),
+            )
+
+    await sync_decision_reviews(pool, pub, scope)
+    await surface_due_intentions(pool, pub, scope)
+
+    result = await review_decision(
+        pool, pub, scope, decision_id,
+        outcome="the chosen option worked", valence="success",
+    )
+    assert result["outcome_id"]
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT outcome FROM decisions WHERE id = %s", (decision_id,),
+            )
+            assert (await cur.fetchone())[0] == "the chosen option worked"
+            await cur.execute(
+                "DELETE FROM intentions WHERE scope = %s", (scope,),
+            )
+            await cur.execute(
+                "DELETE FROM outcomes WHERE scope = %s", (scope,),
+            )
+            await cur.execute(
+                "DELETE FROM decisions WHERE scope = %s", (scope,),
             )
