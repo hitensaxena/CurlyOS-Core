@@ -138,6 +138,21 @@ app.add_middleware(
 )
 
 
+def _enforce_scope(scope: str) -> None:
+    """Reject a scope outside CURLYOS_ALLOWED_SCOPES.
+
+    Reads used to accept any scope while writes checked theirs, so setting an
+    allowlist restricted what you could change but not what you could see. The
+    allowlist stays permissive unless the env var is set.
+    """
+    from shared.scope import ScopeNotAllowed, require_scope
+
+    try:
+        require_scope(scope)
+    except ScopeNotAllowed:
+        raise HTTPException(status_code=403, detail=f"scope not allowed: {scope}")
+
+
 def _api_token() -> str:
     """The bearer token this process requires, or "" when the gate is dormant.
 
@@ -419,6 +434,7 @@ def stats():
 def stats_composition(scope: str = SCOPE):
     """Breakdown of memory + identity by epistemic status / tier, plus how many
     beliefs changed recently. Powers the dashboard's "state of mind" view."""
+    _enforce_scope(scope)
     def _group(conn, sql):
         try:
             return {r["k"]: r["n"] for r in conn.execute(sql, [scope]).fetchall() if r["k"]}
@@ -471,6 +487,7 @@ def list_memories(
     offset: int = 0,
     q: str | None = None,
 ):
+    _enforce_scope(scope)
     conditions = ["scope = %s"]
     params: list[Any] = [scope]
 
@@ -674,6 +691,7 @@ def list_episodes(
     limit: int = Query(default=50, le=200),
     offset: int = 0,
 ):
+    _enforce_scope(scope)
     conditions = ["scope = %s"]
     params: list[Any] = [scope]
     if modality:
@@ -735,6 +753,7 @@ async def invalidate_identity(fact_id: str, scope: str = SCOPE):
 def list_identity(scope: str = SCOPE, predicates: str | None = None, valid: bool | None = True):
     """valid=True (default) → current facts; False → superseded; None → all.
     The webapp uses None to show a fact's history alongside the live value."""
+    _enforce_scope(scope)
     conditions = ["scope = %s"]
     params: list[Any] = [scope]
     if predicates:
@@ -810,6 +829,7 @@ def get_graph(
     # window of the newest leaf nodes. Default limit is set well above the live
     # graph size (was 1500, which silently truncated once the graph grew past it
     # — the webapp passes no limit and so only ever saw the top-degree 1500).
+    _enforce_scope(scope)
     with get_conn() as conn:
         entities = conn.execute(
             "WITH deg AS ("
@@ -914,6 +934,7 @@ def expand_graph(entity_id: str, k: int = Query(default=1, le=3)):
 
 @app.get("/api/search")
 def search(q: str, scope: str = SCOPE, limit: int = Query(default=20, le=50)):
+    _enforce_scope(scope)
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT id, statement, kind, valid_from, valid_to, source_episode_id, epistemic_status, "
@@ -936,6 +957,7 @@ async def recall(body: RecallRequest):
 
     Body: {"query": "...", "scope": "user:usr_hiten", "mode": "fast"|"deep"|"divergent", "k": 6}
     """
+    _enforce_scope(body.scope)
 
     from memory.recall_service import RecallSettings, recall_query
     from shared.settings import get_setting_cached
@@ -986,6 +1008,7 @@ async def recall(body: RecallRequest):
 
 @app.get("/api/cognition/meta")
 def cognition_meta(scope: str = SCOPE):
+    _enforce_scope(scope)
     with get_conn() as conn:
         principles = conn.execute(
             "SELECT id, statement, domain, epistemic_status FROM principles "
@@ -1017,6 +1040,7 @@ def cognition_meta(scope: str = SCOPE):
 @app.get("/api/cognition/working-set")
 async def working_set_list(scope: str = SCOPE, limit: int = Query(default=20, le=100)):
     """The current salience-ranked working memory for a scope."""
+    _enforce_scope(scope)
     from cognition.working_set import get_working_set
 
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
@@ -1064,6 +1088,7 @@ async def contradictions_list(
     limit: int = Query(default=50, ge=1, le=200),
 ):
     """Open contradiction proposals. Nothing here has been applied."""
+    _enforce_scope(scope)
     from cognition.contradiction import list_candidates
 
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
@@ -1098,6 +1123,7 @@ async def intentions_list(
     scope: str = SCOPE, status: str | None = None,
     limit: int = Query(default=50, le=200),
 ):
+    _enforce_scope(scope)
     from cognition.prospective import list_intentions
 
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
@@ -1108,6 +1134,7 @@ async def intentions_list(
 @app.get("/api/cognition/intentions/due")
 async def intentions_due(scope: str = SCOPE, limit: int = Query(default=50, le=200)):
     """Intentions that are due now, including ones already surfaced."""
+    _enforce_scope(scope)
     from cognition.prospective import due_intentions
 
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
@@ -1242,6 +1269,7 @@ async def curiosity_list(
     limit: int = Query(default=50, ge=1, le=200),
 ):
     """Grounded questions about gaps. Nothing has been researched or written."""
+    _enforce_scope(scope)
     from cognition.curiosity import list_questions
 
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
@@ -1287,6 +1315,7 @@ async def curiosity_answer(question_id: str, body: CuriosityResolveRequest):
 
 @app.get("/api/cognition/reflection")
 def cognition_reflection(scope: str = SCOPE):
+    _enforce_scope(scope)
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT * FROM reflection_reports WHERE scope = %s ORDER BY created_at DESC LIMIT 10",
@@ -1297,6 +1326,7 @@ def cognition_reflection(scope: str = SCOPE):
 
 @app.get("/api/cognition/attention")
 async def cognition_attention(scope: str = SCOPE, window_days: int = 7):
+    _enforce_scope(scope)
     def _fetch_gaps():
         with get_conn() as conn:
             return conn.execute(
@@ -1334,6 +1364,7 @@ async def cognition_attention(scope: str = SCOPE, window_days: int = 7):
 
 @app.get("/api/cognition/narrative")
 def cognition_narrative(scope: str = SCOPE):
+    _enforce_scope(scope)
     with get_conn() as conn:
         chapters = conn.execute(
             "SELECT id, title, summary, start_date, end_date, epistemic_status FROM life_chapters "
@@ -1355,6 +1386,7 @@ async def cognition_narrative_current(scope: str = SCOPE):
     One current chapter plus the active theme names — small enough to inject at
     session start. The full records stay on GET /api/cognition/narrative.
     """
+    _enforce_scope(scope)
     from cognition.narrative import get_chapters, get_themes
 
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
@@ -1492,6 +1524,7 @@ def list_events(
     limit: int = Query(default=50, le=100),
     offset: int = 0,
 ):
+    _enforce_scope(scope)
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT id, type, subject, scope, data, seq, created_at FROM events WHERE scope = %s ORDER BY seq DESC LIMIT %s OFFSET %s",
@@ -2189,6 +2222,7 @@ async def consolidation_run(body: ConsolidationRunRequest | None = None):
       deep  = all passes (dedup, merge_promote, conflict_resolve, summarize, decay, recombine_incubate)
     """
     body = body or ConsolidationRunRequest()
+    _enforce_scope(body.scope)
     scope = body.scope
     deep = body.mode == "deep"
 
@@ -2475,6 +2509,7 @@ async def reflection_weekly(body: ReflectionRequest | None = None):
     Body: {"scope": "user:usr_hiten", "window_days": 7}
     """
     body = body or ReflectionRequest()
+    _enforce_scope(body.scope)
     scope, window_days = body.scope, body.window_days
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -2511,6 +2546,7 @@ async def reflection_monthly(body: ReflectionRequest | None = None):
     Body: {"scope": "user:usr_hiten"}
     """
     body = body or ReflectionRequest()
+    _enforce_scope(body.scope)
     scope = body.scope
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -2568,6 +2604,7 @@ async def meta_audit(body: MetaAuditRequest | None = None):
     Body: {"scope": "user:usr_hiten", "window_days": 30}
     """
     body = body or MetaAuditRequest()
+    _enforce_scope(body.scope)
     scope, window_days = body.scope, body.window_days
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -2612,6 +2649,7 @@ async def meta_distill(body: MetaDistillRequest | None = None):
     Body: {"scope": "user:usr_hiten", "min_confidence": 0.7}
     """
     body = body or MetaDistillRequest()
+    _enforce_scope(body.scope)
     scope, min_confidence = body.scope, body.min_confidence
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -2649,6 +2687,7 @@ async def narrative_generate(body: NarrativeGenerateRequest | None = None):
     graph-degree rankings.
     """
     body = body or NarrativeGenerateRequest()
+    _enforce_scope(body.scope)
     scope = body.scope
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -2686,6 +2725,7 @@ async def attention_scan(body: AttentionScanRequest | None = None):
     supersedes prior hypothesis signals). Allocation/load are computed read-only.
     """
     body = body or AttentionScanRequest()
+    _enforce_scope(body.scope)
     scope, window_days = body.scope, body.window_days
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -3165,6 +3205,7 @@ async def run_engine(name: str, body: EngineRunRequest | None = None):
 @app.get("/api/events/dispatch")
 async def events_dispatch_status(scope: str = SCOPE):
     """Per-handler watermarks and lag over the event log."""
+    _enforce_scope(scope)
     from shared import metrics
     from shared.events.dispatch import dispatch_status
 
@@ -3185,6 +3226,7 @@ async def events_dispatch_run(scope: str = SCOPE, backfill: bool = False):
     ``backfill=true`` replays from seq 0 for handlers that have no watermark;
     the default starts them at the current max seq.
     """
+    _enforce_scope(scope)
     from shared.events.dispatch import dispatch_once, register_default_handlers
 
     register_default_handlers()
@@ -3380,6 +3422,7 @@ async def _pipeline_observability(scope: str) -> dict:
 @app.get("/api/observability/pipeline")
 async def observability_pipeline(scope: str = SCOPE):
     """Backlog of the ingest pipeline (embed/distill) + recent ingest rate + KG size."""
+    _enforce_scope(scope)
     return await _pipeline_observability(scope)
 
 
@@ -3387,6 +3430,7 @@ async def observability_pipeline(scope: str = SCOPE):
 async def observability_overview(request: Request, scope: str = SCOPE):
     """One-call rollup for the home-page monitor: infra + counts + LLM + recall +
     pipeline + scheduler, in a single round trip."""
+    _enforce_scope(scope)
     return {
         "timestamp": now_iso(),
         "health": health(),
