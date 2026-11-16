@@ -853,6 +853,7 @@ async def recall(body: RecallRequest):
         blend_recency=float(await get_setting_cached(pool, "recall_blend_recency", 0.10)),
         blend_half_life_days=float(await get_setting_cached(pool, "recall_blend_half_life_days", 30.0)),
         working_set_boost=float(await get_setting_cached(pool, "recall_working_set_boost", 0.08)),
+        lexical_boost=float(await get_setting_cached(pool, "recall_lexical_boost", 0.0)),
     )
 
     redis = _make_redis() if settings.cache_enabled else None

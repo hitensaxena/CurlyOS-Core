@@ -34,6 +34,7 @@ class RecallSettings:
     blend_recency: float = 0.10
     blend_half_life_days: float = 30.0
     working_set_boost: float = 0.08
+    lexical_boost: float = 0.0
 
 
 def recall_cache_key(
@@ -45,7 +46,7 @@ def recall_cache_key(
         f"{settings.summary_boost}:{settings.chunk_penalty}:"
         f"{settings.blend_cosine}:{settings.blend_fused}:"
         f"{settings.blend_recency}:{settings.blend_half_life_days}:"
-        f"{settings.working_set_boost}:{digest}"
+        f"{settings.working_set_boost}:{settings.lexical_boost}:{digest}"
     )
 
 
@@ -156,6 +157,23 @@ async def recall_query(
                 half_life_days=settings.blend_half_life_days,
             )
             stage_timings["blend"] = round((time.monotonic() - _t_blend) * 1000, 2)
+
+            # Terse stored facts embed below long passages that merely discuss
+            # the same topic. A small exact-term correction lifts them without
+            # overpowering semantic ranking.
+            _t_lex = time.monotonic()
+            if settings.lexical_boost and cand:
+                from shared.text import overlap_score, terms
+
+                query_terms = terms([query], limit=10)
+                for it in cand:
+                    overlap = overlap_score(query_terms, it.text or "")
+                    if overlap:
+                        blend[it.id] = min(
+                            1.0,
+                            blend.get(it.id, 0.0) + settings.lexical_boost * overlap,
+                        )
+            stage_timings["lexical"] = round((time.monotonic() - _t_lex) * 1000, 2)
 
             # Working memory is a bounded boost for candidates the query
             # already retrieved; it never injects unrelated pinned rows.

@@ -116,8 +116,8 @@ async def _sparse_recall(
             # Try plainto_tsquery first (less aggressive stemming)
             await cur.execute(
                 f"SELECT id, statement, kind, valid_from, valid_to, source_episode_id, "
-                f"epistemic_status, ts_rank(search_tsv, "
-                f"plainto_tsquery('english', %s)) AS score "
+                f"epistemic_status, ts_rank_cd(search_tsv, "
+                f"plainto_tsquery('english', %s), 2) AS score "
                 f"FROM memories "
                 f"WHERE scope = %s AND {bt_where} "
                 f"AND epistemic_status = ANY(%s) "
@@ -130,8 +130,8 @@ async def _sparse_recall(
             if not rows:
                 await cur.execute(
                     f"SELECT id, statement, kind, valid_from, valid_to, source_episode_id, "
-                    f"epistemic_status, ts_rank(search_tsv, "
-                    f"websearch_to_tsquery('english', %s)) AS score "
+                    f"epistemic_status, ts_rank_cd(search_tsv, "
+                    f"websearch_to_tsquery('english', %s), 2) AS score "
                     f"FROM memories "
                     f"WHERE scope = %s AND {bt_where} "
                     f"AND epistemic_status = ANY(%s) "
