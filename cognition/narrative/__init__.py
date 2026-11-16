@@ -1,6 +1,9 @@
 """Narrative engine — life chapters, themes, and turning points from bi-temporal events.
 
-Tables: life_chapters (cha_), themes (thm_), theme_chapter_links
+Tables: life_chapters (cha_), themes (thm_).
+
+`theme_chapter_links` was dropped as dead by migration 0021; nothing wrote or
+read it, and declaring it here only re-created a table the schema had retired.
 
 Key APIs:
   GET /narrative/chapters
@@ -51,12 +54,6 @@ CREATE TABLE IF NOT EXISTS themes (
   valid_from        timestamptz NOT NULL DEFAULT now(),
   valid_to          timestamptz,
   created_at        timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS theme_chapter_links (
-  theme_id          text        NOT NULL REFERENCES themes(id),
-  chapter_id        text        NOT NULL REFERENCES life_chapters(id),
-  PRIMARY KEY (theme_id, chapter_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_chapters_scope ON life_chapters (scope);

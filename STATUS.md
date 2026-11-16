@@ -59,16 +59,22 @@ the shadow verifier compares stored rows against payloads on every dispatch.
    with no deleting code in this repo's history for that period. All of them
    are now tracked as invalidated; the cause is unknown and deliberately not
    guessed.
-2. **`theme_chapter_links` is declared in `NARRATIVE_DDL` but does not exist
-   in the database.** Nothing writes or reads it.
-3. **`GET /api/cognition/narrative`** runs on a synchronous connection and
-   blocks the event loop. Its newer sibling `/api/cognition/narrative/current`
-   is async.
-4. **`deploy/bridge_kg_components.py` and `deploy/densify_kg.py`** insert
+2. **`deploy/bridge_kg_components.py` and `deploy/densify_kg.py`** insert
    edges without emitting events, so those rows are not replayable.
-5. **The API token gate is dormant.** `CURLYOS_API_TOKEN` is unset; the API
+3. **The API token gate is dormant.** `CURLYOS_API_TOKEN` is unset; the API
    binds 127.0.0.1. Arming it requires the variable on the server *and* on
    every client — server-first leaves clients failing closed with 401.
+
+## Not a problem (checked, listed so it is not re-raised)
+
+- **Sync routes do not block the event loop.** FastAPI runs `def` endpoints in
+  a threadpool; the 21 sync routes are fine. The three `async` routes that
+  touch the blocking connection (`/api/cognition/attention`,
+  `/api/cognition/narrative/compose`, `/api/attention/scan`) all wrap it in
+  `asyncio.to_thread` or use the async pool.
+- **`theme_chapter_links`** was dropped as dead by migration 0021. The
+  narrative module's DDL still re-created it; that declaration was removed on
+  2026-11-16.
 
 ## Operational notes learned the hard way
 

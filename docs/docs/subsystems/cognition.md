@@ -119,7 +119,7 @@ async def compose_chapters(pool, publisher, scope, llm_client=None, llm_model=""
 
 ### Tables written
 
-`life_chapters` (`cha_`): `id`, `scope`, `title`, `summary`, `start_date`, `end_date`, `epistemic_status`, validity columns. `themes` (`thm_`): `id`, `scope`, `name`, `description`, `frequency`, `epistemic_status`, validity. `theme_chapter_links` (composite PK `theme_id`, `chapter_id`) links the two.
+`life_chapters` (`cha_`): `id`, `scope`, `title`, `summary`, `start_date`, `end_date`, `epistemic_status`, validity columns. `themes` (`thm_`): `id`, `scope`, `name`, `description`, `frequency`, `epistemic_status`, validity. `theme_chapter_links` was dropped as dead by migration 0021.
 
 ## Attention
 
@@ -248,7 +248,6 @@ Constants: `EMBED_DIM = 1024`, `DEFAULT_SURPRISE_THRESHOLD = 0.25`, `DEFAULT_HAL
 | Reflection (write-back) | `identity_facts`, `goals` | `idf_` / `goal_` | via `propose_identity_fact`, `set_goal_reflection` | W |
 | Narrative | `life_chapters` | `cha_` | `title`, `summary`, `start_date`, `end_date`, `epistemic_status` | W |
 | Narrative | `themes` | `thm_` | `name`, `description`, `frequency`, `epistemic_status` | W |
-| Narrative | `theme_chapter_links` | — | `theme_id`, `chapter_id` (composite PK) | W |
 | Attention | `alignment_signals` | `aln_` | `signal_type`, `description`, `severity`, `epistemic_status` | W |
 | Attention | `attention_allocation_weekly`, `focus_heatmap_grid` | — | materialized views (telemetry; not yet populated) | R |
 | Attention (read) | `episodes`, `goals`, `identity_facts`, `knowledge_entities/edges` | — | content/degree | R |
