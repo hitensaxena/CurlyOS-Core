@@ -42,16 +42,33 @@ async def main() -> int:
     parser.add_argument("--scope", default=api_server.SCOPE)
     parser.add_argument("--apply", action="store_true",
                         help="write repairs; default is a dry run")
+    parser.add_argument(
+        "--since", default=None,
+        help="only consider events at or after this ISO timestamp. Use it to "
+             "make untracked deletions an alarm: history before deletions were "
+             "evented will always report gaps that are not new.",
+    )
     args = parser.parse_args()
+
+    since = None
+    if args.since:
+        from datetime import datetime, timezone
+
+        since = datetime.fromisoformat(args.since)
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
 
     pool = await api_server._get_async_pool(row_factory=psycopg.rows.tuple_row)
     dry_run = not args.apply
     result: dict = {"scope": args.scope, "dry_run": dry_run}
+    if since:
+        result["since"] = since.isoformat()
 
     if args.projection in ("coverage", "all"):
         result["coverage"] = await event_coverage(pool, args.scope)
     if args.projection in ("graph", "all"):
-        result["graph"] = await rebuild_graph(pool, args.scope, dry_run=dry_run)
+        result["graph"] = await rebuild_graph(
+            pool, args.scope, dry_run=dry_run, since=since)
     if args.projection in ("identity", "all"):
         result["identity"] = await rebuild_identity(pool, args.scope, dry_run=dry_run)
     if args.projection in ("memories", "all"):

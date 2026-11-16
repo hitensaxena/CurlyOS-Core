@@ -178,7 +178,13 @@ async def _verify(
             (data.get("entity_id"),),
         )
         row = await cur.fetchone()
-        if row is None or row[0] is None:
+        if row is None:
+            # A backfilled invalidation records a deletion that happened before
+            # deletions were evented; there is no row left to close, and that
+            # is exactly what it says.
+            if not data.get("backfilled"):
+                _discrepancy(event_id, "entity invalidation did not close the row")
+        elif row[0] is None:
             _discrepancy(event_id, "entity invalidation did not close the row")
 
     elif short == "knowledge.edge.invalidated":
@@ -187,7 +193,10 @@ async def _verify(
             (data.get("edge_id"),),
         )
         row = await cur.fetchone()
-        if row is None or row[0] is None:
+        if row is None:
+            if not data.get("backfilled"):
+                _discrepancy(event_id, "edge invalidation did not close the row")
+        elif row[0] is None:
             _discrepancy(event_id, "edge invalidation did not close the row")
 
 
