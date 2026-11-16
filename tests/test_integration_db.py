@@ -765,3 +765,78 @@ async def test_dispatcher_delivers_once_and_retries(pool):
             await cur.execute(
                 "DELETE FROM event_dispatch_watermarks WHERE scope = %s", (scope,)
             )
+
+
+@pytest.mark.asyncio
+async def test_graph_projection_handler_is_idempotent(pool):
+    import json as _json
+
+    from knowledge.graph.projection import build_graph_handler
+    from shared.events import full_type
+    from shared.events.dispatch import dispatch_once
+
+    scope = "test:projection"
+    e1, e2, edge = mint("ent"), mint("ent"), mint("cor")
+
+    def event(short, subject, data):
+        return (mint("evt"), full_type(short), subject, scope, _json.dumps(data))
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM events WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM knowledge_edges WHERE id = %s", (edge,))
+            await cur.execute("DELETE FROM knowledge_entities WHERE scope = %s", (scope,))
+            for row in [
+                event("knowledge.entity.created", e1, {
+                    "entity_id": e1, "name": "Projection Alpha", "label": "Entity",
+                    "epistemic_status": "canonical", "scope": scope, "properties": {},
+                }),
+                event("knowledge.entity.created", e2, {
+                    "entity_id": e2, "name": "Projection Beta", "label": "Entity",
+                    "epistemic_status": "canonical", "scope": scope, "properties": {},
+                }),
+                event("knowledge.edge.created", edge, {
+                    "edge_id": edge, "src_entity_id": e1, "dst_entity_id": e2,
+                    "rel_type": "related_to", "scope": scope, "properties": {},
+                }),
+            ]:
+                await cur.execute(
+                    "INSERT INTO events (id, type, subject, scope, data) "
+                    "VALUES (%s, %s, %s, %s, %s::jsonb)",
+                    row,
+                )
+
+    async def factory():
+        return pool
+
+    handler = build_graph_handler(factory)
+    first = await dispatch_once(pool, scope, handler_list=[handler], backfill=True)
+    assert first["dispatched"] == 3
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT count(*) FROM knowledge_entities WHERE scope = %s", (scope,))
+            assert (await cur.fetchone())[0] == 2
+            await cur.execute("SELECT count(*) FROM knowledge_edges WHERE id = %s", (edge,))
+            assert (await cur.fetchone())[0] == 1
+
+    second = await dispatch_once(pool, scope, handler_list=[handler], backfill=True)
+    assert second["dispatched"] == 0
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO events (id, type, subject, scope, data) "
+                "VALUES (%s, %s, %s, %s, %s::jsonb)",
+                event("knowledge.entity.invalidated", e1, {"entity_id": e1}),
+            )
+    await dispatch_once(pool, scope, handler_list=[handler], backfill=True)
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT valid_to FROM knowledge_entities WHERE id = %s", (e1,)
+            )
+            assert (await cur.fetchone())[0] is not None
+            await cur.execute("DELETE FROM events WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM knowledge_edges WHERE id = %s", (edge,))
+            await cur.execute("DELETE FROM knowledge_entities WHERE scope = %s", (scope,))
