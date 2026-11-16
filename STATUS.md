@@ -59,9 +59,7 @@ the shadow verifier compares stored rows against payloads on every dispatch.
    with no deleting code in this repo's history for that period. All of them
    are now tracked as invalidated; the cause is unknown and deliberately not
    guessed.
-2. **`deploy/bridge_kg_components.py` and `deploy/densify_kg.py`** insert
-   edges without emitting events, so those rows are not replayable.
-3. **The API token gate is dormant.** `CURLYOS_API_TOKEN` is unset; the API
+2. **The API token gate is dormant.** `CURLYOS_API_TOKEN` is unset; the API
    binds 127.0.0.1. Arming it requires the variable on the server *and* on
    every client — server-first leaves clients failing closed with 401.
 
@@ -75,6 +73,11 @@ the shadow verifier compares stored rows against payloads on every dispatch.
 - **`theme_chapter_links`** was dropped as dead by migration 0021. The
   narrative module's DDL still re-created it; that declaration was removed on
   2026-11-16.
+- **`densify_kg.py` and `bridge_kg_components.py`** now stage
+  `knowledge.edge.created` events in the same transaction as their edges, via
+  `deploy/edge_events.py`. Their rows are replayable. The helper refuses an
+  async cursor: `AsyncCursor.executemany` returns a coroutine, so an un-awaited
+  call writes nothing and still looks successful.
 
 ## Operational notes learned the hard way
 
