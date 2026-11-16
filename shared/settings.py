@@ -24,6 +24,12 @@ SETTINGS_REGISTRY: dict[str, dict[str, Any]] = {
                                  "description": "TTL for cached recall results, in seconds (1–3600)."},
     "recall_fast_followups": {"type": "bool", "default": False, "category": "recall",
                               "description": "Allow the agentic coverage-gap follow-up round in fast mode (slower, more thorough)."},
+    "recall_max_per_episode": {"type": "int", "default": 2, "category": "recall",
+                               "description": "Maximum results from one conversation/episode after diversification."},
+    "recall_summary_boost": {"type": "float", "default": 0.03, "category": "recall",
+                             "description": "Score boost for promoted archive summaries (0–1)."},
+    "recall_chunk_penalty": {"type": "float", "default": 0.05, "category": "recall",
+                             "description": "Score penalty for raw archive chunks (0–1)."},
     "recall_blend_cosine": {"type": "float", "default": 0.65, "category": "recall",
                             "description": "Weight of query–memory cosine in the final ranking blend (0–1)."},
     "recall_blend_fused": {"type": "float", "default": 0.25, "category": "recall",
@@ -34,6 +40,8 @@ SETTINGS_REGISTRY: dict[str, dict[str, Any]] = {
                                     "description": "Recency half-life in days for the final blend."},
     "recall_working_set_boost": {"type": "float", "default": 0.08, "category": "recall",
                                  "description": "Bounded score boost for working-set members (0–1)."},
+    "recall_lexical_boost": {"type": "float", "default": 0.0, "category": "recall",
+                             "description": "Exact-term overlap correction for terse facts (0–1)."},
     # working memory
     "working_set_enabled": {"type": "bool", "default": True, "category": "cognition",
                             "description": "Run the working-set refresh engine."},
@@ -94,6 +102,8 @@ def coerce_value(key: str, raw: Any) -> Any:
             raise ValueError("recall_cache_ttl_seconds must be 1–3600")
         if key == "working_set_size" and not (1 <= v <= 500):
             raise ValueError("working_set_size must be 1–500")
+        if key == "recall_max_per_episode" and not (1 <= v <= 10):
+            raise ValueError("recall_max_per_episode must be 1–10")
         if key == "working_set_ttl_hours" and not (1 <= v <= 720):
             raise ValueError("working_set_ttl_hours must be 1–720")
         if key == "contradiction_max_pairs" and not (1 <= v <= 200):
@@ -106,7 +116,8 @@ def coerce_value(key: str, raw: Any) -> Any:
             raise ValueError(f"{key} expects a number")
         if key in (
             "recall_blend_cosine", "recall_blend_fused", "recall_blend_recency",
-            "recall_working_set_boost",
+            "recall_working_set_boost", "recall_lexical_boost",
+            "recall_summary_boost", "recall_chunk_penalty",
             "contradiction_similarity_floor", "contradiction_similarity_ceiling",
         ):
             if not (0.0 <= v <= 1.0):

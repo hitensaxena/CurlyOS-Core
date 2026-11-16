@@ -13,7 +13,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from cognition.text import terms
+from shared.text import terms
 from shared.events import build_event
 from shared.scope import scope_parts
 

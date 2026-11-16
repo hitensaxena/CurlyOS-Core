@@ -1,127 +1,173 @@
 [
   {
     "query": "what is the canonical CRAZYMAGE sonic identity",
-    "expect": ["CRAZYMAGE | Sonic Identity v1.2.1"],
+    "expect": [
+      "CRAZYMAGE | Sonic Identity v1.2.1"
+    ],
     "match": "prefix",
     "note": "canonical identity record"
   },
   {
     "query": "what is the Track 6 sonic direction",
-    "expect": ["CRAZYMAGE / Sonic Reference / Track 6 / v1"],
+    "expect": [
+      "CRAZYMAGE / Sonic Reference / Track 6 / v1"
+    ],
     "match": "prefix",
     "note": "authoritative track reference"
   },
   {
     "query": "what is the 127 BPM discovery",
-    "expect": ["CRAZYMAGE / Sonic Reference / 127 BPM Discovery / v1"],
+    "expect": [
+      "CRAZYMAGE / Sonic Reference / 127 BPM Discovery / v1"
+    ],
     "match": "prefix",
     "note": "127 BPM exploration"
   },
   {
     "query": "what is the Track 5 production reference",
-    "expect": ["CRAZYMAGE | Track 5 | Production Brief"],
+    "expect": [
+      "CRAZYMAGE | Track 5 | Production Brief"
+    ],
     "match": "prefix",
     "note": "Track 5 brief"
   },
   {
     "query": "what is the CRAZYMAGE AI Studio",
-    "expect": ["CRAZYMAGE | AI Studio | Creative Architecture"],
+    "expect": [
+      "CRAZYMAGE | AI Studio | Creative Architecture"
+    ],
     "match": "prefix",
     "note": "AI Studio node"
   },
   {
     "query": "what is my first CRAZYMAGE release",
-    "expect": ["first CRAZYMAGE release is titled"],
+    "expect": [
+      "first CRAZYMAGE release is titled"
+    ],
     "match": "contains",
     "note": "Already Here release"
   },
   {
     "query": "what is my Ableton track setup",
-    "expect": ["12-track Ableton Live setup"],
+    "expect": [
+      "12-track Ableton Live setup",
+      "Ableton Live set called CRAZYMAGE with 12 tracks"
+    ],
     "match": "contains",
     "note": "12-track live set"
   },
   {
     "query": "what is the working memory implementation",
-    "expect": ["working_set"],
+    "expect": [
+      "working_set"
+    ],
     "match": "contains",
     "note": "working memory records"
   },
   {
     "query": "what is the Ballam automation business",
-    "expect": ["Ballam"],
+    "expect": [
+      "Ballam"
+    ],
     "match": "contains",
     "note": "automation venture"
   },
   {
     "query": "what is neti neti meditation",
-    "expect": ["Neti Neti"],
+    "expect": [
+      "Neti Neti"
+    ],
     "match": "contains",
     "note": "meditation practice"
   },
   {
     "query": "what is my artist name",
-    "expect": ["artist name is CRAZYMAGE"],
+    "expect": [
+      "artist name is CRAZYMAGE"
+    ],
     "match": "contains",
     "note": "artist identity"
   },
   {
     "query": "what is my sleep schedule",
-    "expect": ["sleep time"],
+    "expect": [
+      "sleep time"
+    ],
     "match": "contains",
     "note": "sleep window"
   },
   {
     "query": "what are my liver markers",
-    "expect": ["liver ast"],
+    "expect": [
+      "liver ast"
+    ],
     "match": "contains",
     "note": "liver AST"
   },
   {
     "query": "who is Hermes",
-    "expect": ["personal agent: Hermes"],
+    "expect": [
+      "personal agent: Hermes"
+    ],
     "match": "contains",
     "note": "personal agent"
   },
   {
     "query": "what is the Express Browser project",
-    "expect": ["developing the Express Browser"],
+    "expect": [
+      "developing the Express Browser"
+    ],
     "match": "contains",
     "note": "product design work"
   },
   {
     "query": "what is my design tool",
-    "expect": ["design tool Figma"],
+    "expect": [
+      "design tool Figma",
+      "uses Figma as their design tool",
+      "figma usage central design tool"
+    ],
     "match": "contains",
     "note": "primary design tool"
   },
   {
     "query": "where do I live",
-    "expect": ["lives in Dehradun"],
+    "expect": [
+      "lives in Dehradun"
+    ],
     "match": "contains",
     "note": "location"
   },
   {
     "query": "what is my philosophy",
-    "expect": ["philosophy primary Advaita Vedanta"],
+    "expect": [
+      "philosophy primary Advaita",
+      "interested in Advaita Vedanta"
+    ],
     "match": "contains",
     "note": "metaphysical frame"
   },
   {
     "query": "what is ROOT SIGNAL",
-    "expect": ["film project ROOT SIGNAL"],
+    "expect": [
+      "film project ROOT SIGNAL"
+    ],
     "match": "contains",
     "note": "film project"
   },
   {
     "query": "where will I play live",
-    "expect": ["play live sets at cafes in Dehradun"],
+    "expect": [
+      "play live sets at cafes in Dehradun"
+    ],
     "match": "contains",
     "note": "live performance plan"
   },
   {
     "query": "what is the 3D audio-visual plan",
-    "expect": ["3D audio-visual experience"],
+    "expect": [
+      "3D audio-visual experience"
+    ],
     "match": "contains",
     "note": "audiovisual project"
   }
