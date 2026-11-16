@@ -51,6 +51,7 @@ PREFIXES: dict[str, str] = {
     "alignment_signal": "aln",
     "insight_report": "rpt",
     "mood_log": "moo",
+    "contradiction_candidate": "ctr",
     # Infrastructure
     "lock": "lck",
     "correlation": "cor",

@@ -41,6 +41,14 @@ SETTINGS_REGISTRY: dict[str, dict[str, Any]] = {
                          "description": "Maximum non-pinned working-set entries."},
     "working_set_ttl_hours": {"type": "int", "default": 24, "category": "cognition",
                               "description": "Lifetime of a non-pinned working-set entry, in hours."},
+    "contradiction_scan_enabled": {"type": "bool", "default": True, "category": "cognition",
+                                   "description": "Run the weekly contradiction scan."},
+    "contradiction_similarity_floor": {"type": "float", "default": 0.80, "category": "cognition",
+                                       "description": "Minimum cosine similarity for a contradiction pair (0–1)."},
+    "contradiction_similarity_ceiling": {"type": "float", "default": 0.97, "category": "cognition",
+                                         "description": "Maximum cosine similarity for a contradiction pair (0–1)."},
+    "contradiction_max_pairs": {"type": "int", "default": 30, "category": "cognition",
+                                "description": "Maximum memory pairs classified per scan."},
     # ingest
     "epistemic_classify_enabled": {"type": "bool", "default": True, "category": "ingest",
                                    "description": "Run the per-ingest LLM epistemic classification (canonical/belief/hypothesis)."},
@@ -84,6 +92,8 @@ def coerce_value(key: str, raw: Any) -> Any:
             raise ValueError("working_set_size must be 1–500")
         if key == "working_set_ttl_hours" and not (1 <= v <= 720):
             raise ValueError("working_set_ttl_hours must be 1–720")
+        if key == "contradiction_max_pairs" and not (1 <= v <= 200):
+            raise ValueError("contradiction_max_pairs must be 1–200")
         return v
     if t == "float":
         try:
@@ -93,6 +103,7 @@ def coerce_value(key: str, raw: Any) -> Any:
         if key in (
             "recall_blend_cosine", "recall_blend_fused", "recall_blend_recency",
             "recall_working_set_boost",
+            "contradiction_similarity_floor", "contradiction_similarity_ceiling",
         ):
             if not (0.0 <= v <= 1.0):
                 raise ValueError(f"{key} must be between 0 and 1")
