@@ -85,6 +85,34 @@ _COUNT_NOUNS = frozenset({
 _QUANTITY = re.compile(r"^[\d,.]+(?:st|nd|rd|th)?\s+([a-z_]+)$")
 
 
+# Credential shapes that must never become graph entities. Extraction already
+# turned one OpenAI key and one Figma token into nodes named after the token;
+# a secret is not a concept, and a node named after one is a copy of it that
+# recall can surface.
+_SECRET_NAME_RE = re.compile(
+    r"^(?:sk-[A-Za-z0-9_-]{16,}|figd_[A-Za-z0-9_-]{10,}|gh[pousr]_[A-Za-z0-9_]{20,}|"
+    r"github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|"
+    r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})$"
+)
+_OPAQUE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,}$")
+
+
+def is_secret_like(name: str | None) -> bool:
+    """True when a proposed entity name is a credential, not a name.
+
+    Two shapes: a known key prefix (sk-, figd_, ghp_, AKIA…), or a single
+    opaque token-length run with no spaces. The second catches the unknown
+    providers — a 40-character alphanumeric string is a key far more often than
+    it is a concept, and a missed one costs more than a false positive.
+    """
+    text = (name or "").strip()
+    if not text:
+        return False
+    if _SECRET_NAME_RE.match(text):
+        return True
+    return bool(_OPAQUE_TOKEN_RE.match(text)) and any(c.isdigit() for c in text)
+
+
 def is_placeholder_name(name: str | None) -> bool:
     """True when a proposed entity name is a bare quantity, not an entity.
 
@@ -162,6 +190,10 @@ async def create_entity(
     """
     if is_placeholder_name(name):
         raise ValueError(f"refusing to create an entity named {name!r}: not a name")
+    if is_secret_like(name):
+        # Never echo the value back in the error: it is the thing we are
+        # keeping out of the store.
+        raise ValueError("refusing to create an entity whose name is a credential")
     entity_id = mint("ent")
     props = properties or {}
     created = datetime.now(timezone.utc)
