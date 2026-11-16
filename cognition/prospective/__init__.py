@@ -163,6 +163,26 @@ async def surface_due_intentions(pool: Any, publisher: Any, scope: str) -> int:
     return len(rows)
 
 
+async def get_intention(pool: Any, scope: str, intention_id: str) -> dict | None:
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT id, text, due_at, context, status, source, source_ref, "
+                "       created_at, surfaced_at, completed_at, snooze_until "
+                "FROM intentions WHERE id = %s AND scope = %s",
+                (intention_id, scope),
+            )
+            r = await cur.fetchone()
+    if r is None:
+        return None
+    return {
+        "id": r[0], "text": r[1], "due_at": r[2], "context": r[3],
+        "status": r[4], "source": r[5], "source_ref": r[6],
+        "created_at": r[7], "surfaced_at": r[8],
+        "completed_at": r[9], "snooze_until": r[10],
+    }
+
+
 async def list_intentions(
     pool: Any, scope: str, status: str | None = None, limit: int = 50,
 ) -> list[dict]:

@@ -246,6 +246,14 @@ class IntentionSnoozeRequest(BaseModel):
     until: datetime
 
 
+class IntentionReviewRequest(BaseModel):
+    scope: str = SCOPE
+    outcome: str
+    valence: Literal["success", "partial", "failure", "mixed", "too_early"] = "mixed"
+    matched_prediction: bool | None = None
+    lesson: str | None = None
+
+
 class ReflectionRequest(BaseModel):
     scope: str = SCOPE
     window_days: int = Field(default=7, ge=1, le=90)
@@ -1045,6 +1053,61 @@ async def intentions_snooze(intention_id: str, body: IntentionSnoozeRequest):
     ):
         raise HTTPException(status_code=404, detail="intention not found or already closed")
     return {"id": intention_id, "status": "pending", "snooze_until": body.until}
+
+
+@app.post("/api/cognition/intentions/{intention_id}/review")
+async def intentions_review(intention_id: str, body: IntentionReviewRequest):
+    """Review the decision behind a decision_review intention and close it.
+
+    This is the operational path for the decision loop that previously had no
+    caller: it records a structured outcome, an optional lesson, and marks the
+    intention done.
+    """
+    from cognition.prospective import complete_intention, get_intention
+    from goals import review_decision
+    from shared.scope import ScopeNotAllowed, require_scope
+
+    try:
+        require_scope(body.scope)
+    except ScopeNotAllowed:
+        raise HTTPException(status_code=403, detail=f"scope not allowed: {body.scope}")
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    intention = await get_intention(pool, body.scope, intention_id)
+    if intention is None:
+        raise HTTPException(status_code=404, detail="intention not found")
+    if intention["source"] != "decision_review" or not intention["source_ref"]:
+        raise HTTPException(status_code=400, detail="intention is not a decision review")
+    if intention["status"] not in ("pending", "surfaced"):
+        raise HTTPException(status_code=409, detail="intention is already closed")
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT outcome FROM decisions WHERE id = %s AND scope = %s",
+                (intention["source_ref"], body.scope),
+            )
+            decision = await cur.fetchone()
+    if decision is None:
+        raise HTTPException(status_code=404, detail="decision not found")
+    if decision[0]:
+        await complete_intention(pool, _make_publisher_sync(), body.scope, intention_id)
+        raise HTTPException(status_code=409, detail="decision already reviewed")
+
+    try:
+        result = await review_decision(
+            pool, _make_publisher_sync(), body.scope, intention["source_ref"],
+            outcome=body.outcome,
+            valence=body.valence,
+            matched_prediction=body.matched_prediction,
+            lesson=body.lesson,
+            embedder=await get_shared_embedder(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    await complete_intention(pool, _make_publisher_sync(), body.scope, intention_id)
+    return {"intention_id": intention_id, "status": "done", "decision": result}
 
 
 @app.get("/api/cognition/reflection")
