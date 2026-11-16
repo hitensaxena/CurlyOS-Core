@@ -334,10 +334,13 @@ _GRAPH_CACHE_MAX = 128
 
 
 def invalidate_caches() -> None:
-    """Drop process-local alias/graph caches after a graph-changing write."""
+    """Drop process-local alias, graph and summary caches after a write."""
     global _ALIAS_CACHE
     _ALIAS_CACHE = None
     _GRAPH_CACHE.clear()
+    _SUMMARY_INDEX["at"] = 0.0
+    _SUMMARY_INDEX["map"] = {}
+    _SUMMARY_INDEX["scope"] = None
 
 
 async def _load_alias_pairs(pool: Any) -> tuple[list[str], list[str]]:
@@ -857,7 +860,7 @@ def is_archive_summary(text: str) -> bool:
     return bool(text) and text.startswith(_ARCHIVE_SUMMARY_PREFIXES)
 
 
-_SUMMARY_INDEX: dict[str, Any] = {"at": 0.0, "map": {}}
+_SUMMARY_INDEX: dict[str, Any] = {"at": 0.0, "map": {}, "scope": None}
 
 
 async def load_summary_index(pool: Any, scope: str, ttl: float = 300.0) -> dict[str, dict]:
@@ -871,7 +874,11 @@ async def load_summary_index(pool: Any, scope: str, ttl: float = 300.0) -> dict[
     generation counter, so a short TTL keeps this off the hot path.
     """
     now = time.monotonic()
-    if now - float(_SUMMARY_INDEX["at"]) < ttl and _SUMMARY_INDEX["map"]:
+    if (
+        now - float(_SUMMARY_INDEX["at"]) < ttl
+        and _SUMMARY_INDEX["map"]
+        and _SUMMARY_INDEX["scope"] == scope
+    ):
         return _SUMMARY_INDEX["map"]
     index: dict[str, dict] = {}
     async with pool.connection() as conn:
@@ -922,6 +929,7 @@ async def load_summary_index(pool: Any, scope: str, ttl: float = 300.0) -> dict[
                     "id": rid, "text": stmt, "source_episode_id": epi,
                     "tier": tier, "epistemic_status": status, "valid_from": vfrom}
     _SUMMARY_INDEX["at"], _SUMMARY_INDEX["map"] = now, index
+    _SUMMARY_INDEX["scope"] = scope
     return index
 
 

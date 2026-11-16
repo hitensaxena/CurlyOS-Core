@@ -175,7 +175,9 @@ class AddMemoryRequest(BaseModel):
     statement: str = Field(min_length=1, max_length=8000)
     source_episode_id: str = Field(min_length=1)
     kind: str = "fact"
-    epistemic_status: str = "canonical"
+    epistemic_status: Literal[
+        "seed", "conjecture", "hypothesis", "canonical", "belief", "possible_world"
+    ] = "canonical"
 
 
 class InvalidateRequest(BaseModel):
@@ -429,34 +431,48 @@ async def add_memory(body: AddMemoryRequest):
     try:
         import hashlib
 
-        from memory.governance import statement_key
+        from memory.governance import statement_key, stronger_epistemic_status
 
         skey = statement_key(body.statement)
         content_hash = hashlib.sha256(skey.encode("utf-8")).hexdigest()
         deduplicated = False
-        with get_conn() as conn:
-            row = conn.execute(
-                "INSERT INTO memories (id, scope, statement, statement_key, content_hash, kind, tier, "
-                "epistemic_status, valid_from, ingested_at, source_episode_id) "
-                "VALUES (gen_random_uuid()::text, %s, %s, %s, %s, %s, 'semantic', %s, now(), now(), %s) "
-                "ON CONFLICT (scope, content_hash) WHERE valid_to IS NULL DO NOTHING "
-                "RETURNING id, created_at",
-                [SCOPE, body.statement, skey, content_hash, body.kind,
-                 body.epistemic_status, body.source_episode_id],
-            ).fetchone()
-            if row is None:
-                row = conn.execute(
-                    "SELECT id, created_at FROM memories "
-                    "WHERE scope = %s AND content_hash = %s AND valid_to IS NULL",
-                    [SCOPE, content_hash],
-                ).fetchone()
-                deduplicated = True
+        promoted = False
+
+        pool = await _get_async_pool(row_factory=psycopg.rows.dict_row)
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT INTO memories (id, scope, statement, statement_key, content_hash, kind, tier, "
+                    "epistemic_status, valid_from, ingested_at, source_episode_id) "
+                    "VALUES (gen_random_uuid()::text, %s, %s, %s, %s, %s, 'semantic', %s, now(), now(), %s) "
+                    "ON CONFLICT (scope, content_hash) WHERE valid_to IS NULL DO NOTHING "
+                    "RETURNING id, created_at",
+                    (SCOPE, body.statement, skey, content_hash, body.kind,
+                     body.epistemic_status, body.source_episode_id),
+                )
+                row = await cur.fetchone()
                 if row is None:
-                    raise HTTPException(500, "content_hash conflict but no active row found")
+                    await cur.execute(
+                        "SELECT id, created_at, epistemic_status FROM memories "
+                        "WHERE scope = %s AND content_hash = %s AND valid_to IS NULL",
+                        (SCOPE, content_hash),
+                    )
+                    existing = await cur.fetchone()
+                    if existing is None:
+                        raise HTTPException(500, "content_hash conflict but no active row found")
+                    deduplicated = True
+                    row = {"id": existing["id"], "created_at": existing["created_at"]}
+                    if stronger_epistemic_status(body.epistemic_status, existing["epistemic_status"]):
+                        await cur.execute(
+                            "UPDATE memories SET epistemic_status = %s "
+                            "WHERE id = %s AND valid_to IS NULL",
+                            (body.epistemic_status, existing["id"]),
+                        )
+                        promoted = True
     except HTTPException:
         raise
     except Exception as e:
-        if "23503" in str(e):
+        if getattr(e, "sqlstate", None) == "23503":
             raise HTTPException(400, f"source_episode_id not found: {body.source_episode_id}")
         raise HTTPException(500, str(e))
 
@@ -467,12 +483,12 @@ async def add_memory(body: AddMemoryRequest):
     # A deduplicated hit already has its vector.
     if not deduplicated:
         try:
-            pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
             embedder = await get_shared_embedder()
             await _embed_row(pool, "memories", mem_id, body.statement, embedder)
         except Exception:
             logger.exception("embed after /api/memories insert failed mem=%s", mem_id)
 
+    if not deduplicated or promoted:
         redis = _make_redis()
         if redis is not None:
             try:
@@ -484,7 +500,7 @@ async def add_memory(body: AddMemoryRequest):
                     await redis.aclose()
 
     return {"id": mem_id, "created_at": row["created_at"].isoformat() if row else None,
-            "deduplicated": deduplicated}
+            "deduplicated": deduplicated, "promoted": promoted}
 
 
 @app.post("/api/memories/{mem_id}/invalidate")
@@ -527,6 +543,10 @@ async def invalidate_memory(mem_id: str, body: InvalidateRequest | None = None):
         raise HTTPException(409, "Memory is locked by another write; retry")
 
     valid_to, scope = row
+    # Graph expansion and the summary index are process-local; without this a
+    # cached item could resurrect the fact this request just closed.
+    from memory.retrieval import invalidate_caches
+    invalidate_caches()
     # Cached recall must stop returning this fact immediately, for hooks and
     # every other REST/MCP client, not just after the cache TTL expires.
     redis = _make_redis()
@@ -1780,6 +1800,10 @@ async def consolidation_run(body: ConsolidationRunRequest | None = None):
             llm_client=llm_client,
             llm_model=llm_model,
         )
+        # Merges/invalidations changed graph and summary rows this process
+        # may have cached; drop them before the next recall.
+        from memory.retrieval import invalidate_caches
+        invalidate_caches()
         return result
     except Exception as e:
         logger.exception("consolidation run failed scope=%s deep=%s", scope, deep)
@@ -2610,8 +2634,13 @@ async def run_engine(name: str, body: EngineRunRequest | None = None):
     from shared.engines import (
         REGISTRY, EngineDisabled, EngineNotFound, EngineNotRunnable,
     )
+    from shared.scope import ScopeNotAllowed, require_scope
 
     scope = body.scope if body else SCOPE
+    try:
+        require_scope(scope)
+    except ScopeNotAllowed:
+        raise HTTPException(status_code=403, detail=f"scope not allowed: {scope}")
     t0 = time.monotonic()
     try:
         result = await REGISTRY.run(name, scope)

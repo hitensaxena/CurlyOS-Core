@@ -22,6 +22,18 @@ log = logging.getLogger("curlyos.memory.governance")
 
 _FK_VIOLATION = "23503"
 _REDACTED = "[REDACTED]"
+
+# Stronger writes promote an existing duplicate instead of being silently
+# dropped. Recall filters to canonical/belief, so a canonical write that
+# collided with a hypothesis row must not stay invisible.
+EPISTEMIC_RANK = {
+    "seed": 0, "possible_world": 0, "conjecture": 1,
+    "hypothesis": 2, "belief": 3, "canonical": 4,
+}
+
+
+def stronger_epistemic_status(new: str, old: str) -> bool:
+    return EPISTEMIC_RANK.get(new, 0) > EPISTEMIC_RANK.get(old, 0)
 _FORGET_ACTION_CLASS = "memory_forget_hard"
 _FORGET_LOCK_NS = 0x4D34F06D  # "M4 forget"
 
@@ -184,17 +196,29 @@ async def add(
                 # of writing a second copy or emitting a second stored event.
                 async with conn.cursor() as cur:
                     await cur.execute(
-                        "SELECT id, valid_from, ingested_at FROM memories "
+                        "SELECT id, valid_from, ingested_at, epistemic_status FROM memories "
                         "WHERE scope = %s AND content_hash = %s AND valid_to IS NULL",
                         (scope_text, content_hash),
                     )
                     existing = await cur.fetchone()
                 if existing is None:
                     raise RuntimeError("content_hash conflict but no active row found")
-                return {"mem_id": existing[0], "valid_from": existing[1],
-                        "ingested_at": existing[2],
+                existing_id, existing_vf, existing_ia, existing_status = existing
+                promoted = False
+                if stronger_epistemic_status(epistemic_status, existing_status):
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "UPDATE memories SET epistemic_status = %s "
+                            "WHERE id = %s AND valid_to IS NULL",
+                            (epistemic_status, existing_id),
+                        )
+                    existing_status = epistemic_status
+                    promoted = True
+                return {"mem_id": existing_id, "valid_from": existing_vf,
+                        "ingested_at": existing_ia,
                         "source_episode_id": source_episode_id,
-                        "deduplicated": True}
+                        "deduplicated": True, "promoted": promoted,
+                        "epistemic_status": existing_status}
 
             vf, ia = inserted
 

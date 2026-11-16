@@ -764,12 +764,19 @@ async def _pass_summarize(
                     return
                 # Embed the batch before inserting: these rows are written
                 # outside the API ingest path, so without an explicit vector
-                # they stayed NULL until a restart ran the sweep.
-                try:
-                    vectors = await embedder.embed([text for text, _ in facts])
-                except Exception:
-                    log.exception("SUMMARIZE embedding failed epi=%s", epi_id)
+                # they stayed NULL until a restart ran the sweep. A fallback
+                # embedder must leave NULL, never store a zero vector the sweep
+                # cannot repair (embedding IS NULL is the only repair signal).
+                from shared.embeddings.implementations import FakeEmbedder
+
+                if isinstance(embedder, FakeEmbedder):
                     vectors = [None] * len(facts)
+                else:
+                    try:
+                        vectors = await embedder.embed([text for text, _ in facts])
+                    except Exception:
+                        log.exception("SUMMARIZE embedding failed epi=%s", epi_id)
+                        vectors = [None] * len(facts)
 
                 for (fact_text, kind), vec in zip(facts, vectors):
                     mem_id = mint("mem")
@@ -970,11 +977,14 @@ async def _pass_recombine_incubate(
                         content_hash = hashlib.sha256(skey.encode("utf-8")).hexdigest()
 
                         vec_literal = None
-                        try:
-                            vec = (await embedder.embed([conjecture_text]))[0]
-                            vec_literal = "[" + ",".join(repr(float(x)) for x in vec) + "]"
-                        except Exception:
-                            log.exception("RECOMBINE embedding failed for %s", mem_id)
+                        from shared.embeddings.implementations import FakeEmbedder
+
+                        if not isinstance(embedder, FakeEmbedder):
+                            try:
+                                vec = (await embedder.embed([conjecture_text]))[0]
+                                vec_literal = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+                            except Exception:
+                                log.exception("RECOMBINE embedding failed for %s", mem_id)
 
                         async with conn.cursor() as cur:
                             await cur.execute(

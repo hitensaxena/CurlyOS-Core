@@ -42,6 +42,23 @@ def strip_scaffolding(text: str) -> str:
     return cleaned.strip()
 
 
+async def _mark_duplicate_episode(pool: Any, scope: str, epi_id: str) -> None:
+    """Record a closed, non-recallable marker for a fully deduplicated episode."""
+    from shared.types.ulid import mint
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO memories "
+                "(id, scope, statement, statement_key, kind, tier, epistemic_status, "
+                " content_hash, valid_from, valid_to, ingested_at, source_episode_id) "
+                "VALUES (%s, %s, '(duplicate capture)', %s, 'fact', 'working', "
+                "        'hypothesis', NULL, now(), now(), now(), %s) "
+                "ON CONFLICT DO NOTHING",
+                (mint("mem"), scope, f"_duplicate:{epi_id}", epi_id),
+            )
+
+
 async def ingest_text(
     pool: Any,
     publisher: Any,
@@ -65,6 +82,7 @@ async def ingest_text(
     epi_id = epi["epi_id"]
 
     mem_chunks: list[tuple[str, str]] = []
+    new_memories = 0
     if add_memory:
         for chunk in split_text(text):
             mem = await add(
@@ -77,6 +95,14 @@ async def ingest_text(
                 epistemic_status=epistemic_status,
             )
             mem_chunks.append((mem["mem_id"], chunk))
+            if not mem.get("deduplicated"):
+                new_memories += 1
+
+        if new_memories == 0:
+            # Every chunk collided with an active memory. Close this duplicate
+            # episode with an invisible marker, otherwise SUMMARIZE selects it
+            # as undistilled on every run and spends an LLM call forever.
+            await _mark_duplicate_episode(pool, scope, epi_id)
 
     return {
         "epi_id": epi_id,

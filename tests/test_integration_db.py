@@ -16,6 +16,7 @@ from psycopg_pool import AsyncConnectionPool
 import migrate
 from memory.chunking import split_text
 from memory.governance import add, invalidate, record_episode
+from memory.ingest_service import ingest_text
 
 DSN = os.environ.get("CURLYOS_TEST_DATABASE_URL")
 pytestmark = pytest.mark.skipif(not DSN, reason="CURLYOS_TEST_DATABASE_URL is not set")
@@ -78,6 +79,29 @@ async def test_add_deduplicates_active_fact(pool):
     assert third["deduplicated"] is False
     assert third["mem_id"] != first["mem_id"]
     await invalidate(pool, pub, scope, third["mem_id"], reason="integration cleanup")
+
+
+@pytest.mark.asyncio
+async def test_duplicate_ingest_leaves_a_closed_marker(pool):
+    pub = _Publisher()
+    scope = "test:integration"
+    text = f"Duplicate capture {uuid.uuid4()}: the second write must not re-summarize forever."
+    source = "test:integration"
+
+    first = await ingest_text(pool, pub, scope, text, source_ref=source)
+    second = await ingest_text(pool, pub, scope, text, source_ref=source)
+
+    assert first["mem_chunks"][0][0] == second["mem_chunks"][0][0]
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT count(*) FROM memories WHERE source_episode_id = %s AND valid_to IS NOT NULL",
+                (second["epi_id"],),
+            )
+            assert (await cur.fetchone())[0] == 1
+
+    await invalidate(pool, pub, scope, first["mem_chunks"][0][0], reason="integration cleanup")
 
 
 @pytest.mark.asyncio
