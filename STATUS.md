@@ -39,8 +39,9 @@ overlap), dedups on a content hash, embeds on write, and marks duplicate
 episodes closed instead of re-summarising them.
 
 **Retrieval** blends dense, sparse, entity and graph candidates with RRF, then
-re-ranks by cosine, recency, lexical overlap and working-set salience. Stage
-timings are returned with every response. Golden eval: hit@k 0.90 over 21
+re-ranks by cosine, recency, lexical overlap and working-set salience, with a
+multiplier demoting rows graph hygiene flagged as chatter. Stage timings are
+returned with every response. Golden eval: hit@8 0.95, MRR 0.658 over 22
 queries.
 
 **Cognition** keeps a salience-ranked working set that boosts recall,

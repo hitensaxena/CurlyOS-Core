@@ -86,3 +86,32 @@ def test_missing_cosine_does_not_crash():
 
 def test_empty_candidates():
     assert blend_rank_scores({}, {}, {}, now=NOW) == {}
+
+
+def test_chatter_is_demoted_not_dropped():
+    """A flagged row must lose to an equal unflagged one, and still be scored.
+
+    "It's live." ranked first for "where do I live" on the word 'live' alone.
+    Dropping flagged rows entirely would be wrong the other way: when chatter is
+    the only match, returning it beats returning nothing.
+    """
+    scores = blend_rank_scores(
+        {"clean": 0.9, "noise": 0.9},
+        {"clean": 0.1, "noise": 0.1},
+        {"clean": NOW, "noise": NOW},
+        w_cosine=1.0, w_fused=0.0, w_recency=0.0,
+        chatter={"noise"}, chatter_factor=0.5, now=NOW,
+    )
+    assert scores["clean"] > scores["noise"]
+    assert scores["noise"] > 0
+
+
+def test_chatter_factor_of_one_disables_the_penalty():
+    scores = blend_rank_scores(
+        {"clean": 0.9, "noise": 0.9},
+        {"clean": 0.1, "noise": 0.1},
+        {"clean": NOW, "noise": NOW},
+        w_cosine=1.0, w_fused=0.0, w_recency=0.0,
+        chatter={"noise"}, chatter_factor=1.0, now=NOW,
+    )
+    assert scores["clean"] == scores["noise"]
