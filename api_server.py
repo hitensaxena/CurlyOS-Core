@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import json
 import logging
 import os
@@ -724,209 +723,46 @@ async def recall(body: RecallRequest):
 
     Body: {"query": "...", "scope": "user:usr_hiten", "mode": "fast"|"deep"|"divergent", "k": 6}
     """
-    query, scope, mode, k = body.query, body.scope, body.mode, body.k
 
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from memory.retrieval import (
-        blend_rank_scores, conversation_key, diversify_by_episode, is_archive_summary,
-        load_summary_index, lookup_summary, retrieve,
-    )
-    from shared.types import RetrievalRequest, RetrievedItem
-    from shared.embeddings.implementations import FakeReranker, CachingEmbedder
-
-    from shared import metrics
+    from memory.recall_service import RecallSettings, recall_query
     from shared.settings import get_setting_cached
 
-    # memory.retrieval uses positional/tuple row access → tuple_row (see consolidation).
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
-    metrics.incr("recall.requests")
-    t_start = time.monotonic()
+    settings = RecallSettings(
+        cache_enabled=bool(await get_setting_cached(pool, "recall_cache_enabled", True)),
+        cache_ttl=int(await get_setting_cached(pool, "recall_cache_ttl_seconds", _RECALL_CACHE_TTL)),
+        fast_followup=bool(await get_setting_cached(pool, "recall_fast_followups", False)),
+        max_per_episode=int(await get_setting_cached(pool, "recall_max_per_episode", 2)),
+        summary_boost=float(await get_setting_cached(pool, "recall_summary_boost", 0.03)),
+        chunk_penalty=float(await get_setting_cached(pool, "recall_chunk_penalty", 0.05)),
+        blend_cosine=float(await get_setting_cached(pool, "recall_blend_cosine", 0.65)),
+        blend_fused=float(await get_setting_cached(pool, "recall_blend_fused", 0.25)),
+        blend_recency=float(await get_setting_cached(pool, "recall_blend_recency", 0.10)),
+        blend_half_life_days=float(await get_setting_cached(pool, "recall_blend_half_life_days", 30.0)),
+    )
 
-    cache_enabled = bool(await get_setting_cached(pool, "recall_cache_enabled", True))
-    cache_ttl = int(await get_setting_cached(pool, "recall_cache_ttl_seconds", _RECALL_CACHE_TTL))
-    fast_followup = bool(await get_setting_cached(pool, "recall_fast_followups", False))
-    # Read before the cache key: changing either must not serve a stale ranking.
-    max_per_ep = int(await get_setting_cached(pool, "recall_max_per_episode", 2))
-    summary_boost = float(await get_setting_cached(pool, "recall_summary_boost", 0.03))
-    chunk_penalty = float(await get_setting_cached(pool, "recall_chunk_penalty", 0.05))
-    blend_cosine = float(await get_setting_cached(pool, "recall_blend_cosine", 0.65))
-    blend_fused = float(await get_setting_cached(pool, "recall_blend_fused", 0.25))
-    blend_recency = float(await get_setting_cached(pool, "recall_blend_recency", 0.10))
-    blend_half_life = float(await get_setting_cached(pool, "recall_blend_half_life_days", 30.0))
-
-    # Cache lookup — generation-versioned, so an ingest invalidates instantly.
-    redis = _make_redis() if cache_enabled else None
-    cache_key = None
-    if redis is not None:
-        gen = await _recall_gen(redis, scope)
-        digest = hashlib.sha256(query.encode()).hexdigest()[:16]
-        cache_key = (f"cache:recall:{scope}:{gen}:{mode}:{k}:{max_per_ep}:"
-                     f"{summary_boost}:{chunk_penalty}:"
-                     f"{blend_cosine}:{blend_fused}:{blend_recency}:{blend_half_life}:{digest}")
-        try:
-            hit = await redis.get(cache_key)
-            if hit is not None:
-                payload = hit.decode() if isinstance(hit, (bytes, bytearray)) else hit
-                cached = json.loads(payload)
-                cached["cached"] = True
-                cached["timings"] = {"cached": True}
-                metrics.incr("recall.cache_hits")
-                metrics.timing("recall.latency_cached", (time.monotonic() - t_start) * 1000)
-                return cached
-        except Exception:
-            pass
-    metrics.incr("recall.cache_misses")
+    redis = _make_redis() if settings.cache_enabled else None
+    generation = await _recall_gen(redis, body.scope) if redis is not None else ""
     try:
-        # Per-request memo so the query is embedded once across the dense stage,
-        # the re-score pass below, and any agentic follow-up rounds (was 2-4x).
-        emb = CachingEmbedder(await get_shared_embedder())
-        # Large token_budget so retrieve() returns its full candidate pool — its
-        # assembler otherwise truncates by budget and can drop dense-strong items
-        # that RRF rank-fusion ranked low. We re-rank the pool ourselves below;
-        # the assembled context string is unused here.
-        result = await retrieve(
-            RetrievalRequest(query=query, scope=scope, mode=mode, token_budget=50000),
-            pool=pool, embedder=emb, reranker=FakeReranker(), fast_followup=fast_followup,
+        embedder = await get_shared_embedder()
+        return await recall_query(
+            query=body.query,
+            scope=body.scope,
+            mode=body.mode,
+            k=body.k,
+            pool=pool,
+            embedder=embedder,
+            redis=redis,
+            generation=generation,
+            settings=settings,
         )
-        cand = result.items
-        stage_timings: dict[str, float] = dict(result.timings)
-        for _name, _ms in stage_timings.items():
-            metrics.timing(f"recall.stage.{_name}", _ms)
-        _t_post = time.monotonic()
-        # Rerank by true cosine relevance using the STORED memory embeddings:
-        # embed the query once + one SQL pass over the candidate ids (NO per-doc
-        # re-encoding, which is far too slow on this CPU box). This surfaces the
-        # dense-relevant memories that rank-fusion buries.
-        sims: dict[str, float] = {}
-        blend: dict[str, float] = {}
-
-        def rank_of(it):
-            """Relevance used for ordering and for the reported score.
-
-            Blend of cosine, the retrieval layer's fused score and recency. A
-            raw archive chunk is literal query text, so its cosine beats the
-            distilled summary of the same conversation. Demote it so recall
-            surfaces the recall-shaped version; the raw text stays in episodes
-            and the markdown mirror.
-            """
-            sc = blend.get(it.id, it.score or 0.0)
-            if (it.text or "").startswith("# archives/chatgpt/"):
-                sc -= chunk_penalty
-            return sc
-
-        def shown_score(it):
-            """What /api/recall reports: the ordering score, boost included, so
-            the numbers read in the same order as the list."""
-            boost = summary_boost if is_archive_summary(getattr(it, "text", "") or "") else 0.0
-            return rank_of(it) + boost
-
-        if cand:
-            _t_embed = time.monotonic()
-            qv = (await emb.embed([query]))[0]
-            qlit = "[" + ",".join(repr(float(x)) for x in qv) + "]"
-            stage_timings["query_embed"] = round((time.monotonic() - _t_embed) * 1000, 2)
-            _t_score = time.monotonic()
-            async with pool.connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        "SELECT id, 1 - (embedding <=> %s::vector) FROM memories "
-                        "WHERE id = ANY(%s) AND embedding IS NOT NULL",
-                        (qlit, [it.id for it in cand]),
-                    )
-                    for rid, sim in await cur.fetchall():
-                        sims[rid] = float(sim)
-            stage_timings["cosine_rescore"] = round((time.monotonic() - _t_score) * 1000, 2)
-
-            _t_blend = time.monotonic()
-            blend = blend_rank_scores(
-                sims,
-                {it.id: float(it.score or 0.0) for it in cand},
-                {it.id: it.valid_from for it in cand},
-                w_cosine=blend_cosine,
-                w_fused=blend_fused,
-                w_recency=blend_recency,
-                half_life_days=blend_half_life,
-            )
-            stage_timings["blend"] = round((time.monotonic() - _t_blend) * 1000, 2)
-            cand = sorted(cand, key=lambda it: -rank_of(it))
-
-            # A raw archive chunk is literal query text, so it out-scores the
-            # distilled summary of the same conversation — and for some queries
-            # no summary reaches the candidate pool at all. Pull the summaries
-            # for the strongest chunks so the conversation is represented by
-            # the form recall can actually use.
-            def key_of(it):
-                return (
-                    conversation_key(getattr(it, "text", "") or "")
-                    or (getattr(it, "source_episode_id", "") or it.id)
-                )
-
-            _t_sum = time.monotonic()
-            try:
-                summary_index = await load_summary_index(pool, scope)
-            except Exception:
-                logger.debug("summary index unavailable", exc_info=True)
-                summary_index = {}
-            stage_timings["summary_index"] = round((time.monotonic() - _t_sum) * 1000, 2)
-            best_chunk: dict[str, float] = {}
-            for it in cand[:12]:
-                ck = key_of(it)
-                if ck.startswith(("conv:", "doc:", "site:")):
-                    best_chunk[ck] = max(best_chunk.get(ck, 0.0), rank_of(it))
-            if best_chunk:
-                known = {it.id for it in cand}
-                for ck, sc in best_chunk.items():
-                    s = lookup_summary(summary_index, ck)
-                    if not s or s["id"] in known:
-                        continue
-                    cand.append(RetrievedItem(
-                        id=s["id"], tier=s["tier"] or "semantic", text=s["text"],
-                        score=sc + summary_boost, valid_from=s["valid_from"],
-                        valid_to=None, source_episode_id=s["source_episode_id"] or "",
-                        signals={"promoted_from_chunk": True},
-                        epistemic_status=s["epistemic_status"] or "canonical",
-                    ))
-            # Cosine alone lets one long conversation fill every slot: bulk
-            # imports put dozens of transcript chunks on a single item.
-            # Cap per-conversation contribution, summaries first.
-            _t_div = time.monotonic()
-            cand = diversify_by_episode(
-                cand, rank_of,
-                max_per_episode=max_per_ep, summary_boost=summary_boost, key_of=key_of,
-            )
-            stage_timings["diversify"] = round((time.monotonic() - _t_div) * 1000, 2)
-        items = [
-            {"id": it.id, "text": it.text[:200],
-             "score": round(shown_score(it), 4),
-             "tier": it.tier, "epistemic_status": it.epistemic_status}
-            for it in cand[:k]
-        ]
-        stage_timings["postprocess"] = round((time.monotonic() - _t_post) * 1000, 2)
-        stage_timings["total"] = round((time.monotonic() - t_start) * 1000, 2)
-        out = {"results": items, "count": len(items), "timings": stage_timings}
-        if redis is not None and cache_key is not None:
-            try:
-                # Cache the payload, not the timings: a cache hit is not a stage run.
-                await redis.set(
-                    cache_key,
-                    json.dumps({"results": items, "count": len(items)}),
-                    ex=cache_ttl,
-                )
-            except Exception:
-                pass
-        metrics.timing("recall.latency", (time.monotonic() - t_start) * 1000)
-        return out
     except Exception as e:
-        metrics.incr("recall.errors")
-        logger.exception("recall failed query=%r", query[:80])
+        logger.exception("recall failed query=%r", body.query[:80])
         return {"error": str(e), "results": [], "count": 0}
     finally:
         if redis is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await redis.aclose()
-            except Exception:
-                pass
-
 
 # ---------------------------------------------------------------------------
 # Cognition
