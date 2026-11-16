@@ -304,3 +304,75 @@ async def test_memory_contradiction_scan_and_resolve(pool):
             await cur.execute(
                 "DELETE FROM contradiction_candidates WHERE scope = %s", (scope,),
             )
+
+
+@pytest.mark.asyncio
+async def test_intention_surface_complete_and_snooze(pool):
+    from datetime import datetime, timedelta, timezone
+
+    from cognition.prospective import (
+        complete_intention, create_intention, due_intentions,
+        snooze_intention, surface_due_intentions,
+    )
+
+    pub = _Publisher()
+    scope = "test:intentions"
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM intentions WHERE scope = %s", (scope,))
+
+    past = datetime.now(timezone.utc) - timedelta(hours=1)
+    first = await create_intention(pool, pub, scope, "Test intention A", due_at=past)
+    second = await create_intention(pool, pub, scope, "Test intention B", due_at=past)
+
+    assert await surface_due_intentions(pool, pub, scope) == 2
+    due = await due_intentions(pool, scope)
+    assert {item["id"] for item in due} == {first["id"], second["id"]}
+    assert all(item["status"] == "surfaced" for item in due)
+    assert await surface_due_intentions(pool, pub, scope) == 0
+
+    future = datetime.now(timezone.utc) + timedelta(hours=2)
+    assert await snooze_intention(pool, pub, scope, first["id"], future)
+    due = await due_intentions(pool, scope)
+    assert first["id"] not in {item["id"] for item in due}
+
+    assert await complete_intention(pool, pub, scope, second["id"])
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM intentions WHERE scope = %s", (scope,))
+
+
+@pytest.mark.asyncio
+async def test_decision_reviews_become_intentions_once(pool):
+    from datetime import datetime, timedelta, timezone
+
+    from cognition.prospective import list_intentions, sync_decision_reviews
+
+    pub = _Publisher()
+    scope = "test:intentions"
+    decision_id = mint("dec")
+    past = datetime.now(timezone.utc) - timedelta(hours=1)
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM intentions WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM decisions WHERE scope = %s", (scope,))
+            await cur.execute(
+                "INSERT INTO decisions "
+                "(id, scope, title, chosen, rationale, review_at, decided_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, now())",
+                (decision_id, scope, "Test decision", "option A", "because", past),
+            )
+
+    assert await sync_decision_reviews(pool, pub, scope) == 1
+    assert await sync_decision_reviews(pool, pub, scope) == 0
+
+    items = await list_intentions(pool, scope)
+    assert any(
+        item["source"] == "decision_review" and item["source_ref"] == decision_id
+        for item in items
+    )
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM intentions WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM decisions WHERE scope = %s", (scope,))

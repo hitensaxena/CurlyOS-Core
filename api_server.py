@@ -234,6 +234,18 @@ class ContradictionResolveRequest(BaseModel):
     resolved_by: str = "user"
 
 
+class IntentionCreateRequest(BaseModel):
+    scope: str = SCOPE
+    text: str
+    due_at: datetime | None = None
+    context: str | None = None
+
+
+class IntentionSnoozeRequest(BaseModel):
+    scope: str = SCOPE
+    until: datetime
+
+
 class ReflectionRequest(BaseModel):
     scope: str = SCOPE
     window_days: int = Field(default=7, ge=1, le=90)
@@ -944,6 +956,94 @@ async def contradictions_resolve(
         )
     except ContradictionError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/cognition/intentions")
+async def intentions_list(
+    scope: str = SCOPE, status: str | None = None,
+    limit: int = Query(default=50, le=200),
+):
+    from cognition.prospective import list_intentions
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    items = await list_intentions(pool, scope, status, limit)
+    return {"items": items, "count": len(items), "scope": scope}
+
+
+@app.get("/api/cognition/intentions/due")
+async def intentions_due(scope: str = SCOPE, limit: int = Query(default=50, le=200)):
+    """Intentions that are due now, including ones already surfaced."""
+    from cognition.prospective import due_intentions
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    items = await due_intentions(pool, scope, limit)
+    return {"items": items, "count": len(items), "scope": scope}
+
+
+@app.post("/api/cognition/intentions")
+async def intentions_create(body: IntentionCreateRequest):
+    from cognition.prospective import IntentionError, create_intention
+    from shared.scope import ScopeNotAllowed, require_scope
+
+    try:
+        require_scope(body.scope)
+    except ScopeNotAllowed:
+        raise HTTPException(status_code=403, detail=f"scope not allowed: {body.scope}")
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    try:
+        return await create_intention(
+            pool, _make_publisher_sync(), body.scope, body.text,
+            due_at=body.due_at, context=body.context,
+        )
+    except IntentionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/cognition/intentions/{intention_id}/complete")
+async def intentions_complete(intention_id: str, scope: str = SCOPE):
+    from cognition.prospective import complete_intention
+    from shared.scope import ScopeNotAllowed, require_scope
+
+    try:
+        require_scope(scope)
+    except ScopeNotAllowed:
+        raise HTTPException(status_code=403, detail=f"scope not allowed: {scope}")
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    if not await complete_intention(pool, _make_publisher_sync(), scope, intention_id):
+        raise HTTPException(status_code=404, detail="intention not found or already closed")
+    return {"id": intention_id, "status": "done"}
+
+
+@app.post("/api/cognition/intentions/{intention_id}/dismiss")
+async def intentions_dismiss(intention_id: str, scope: str = SCOPE):
+    from cognition.prospective import dismiss_intention
+    from shared.scope import ScopeNotAllowed, require_scope
+
+    try:
+        require_scope(scope)
+    except ScopeNotAllowed:
+        raise HTTPException(status_code=403, detail=f"scope not allowed: {scope}")
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    if not await dismiss_intention(pool, _make_publisher_sync(), scope, intention_id):
+        raise HTTPException(status_code=404, detail="intention not found or already closed")
+    return {"id": intention_id, "status": "dismissed"}
+
+
+@app.post("/api/cognition/intentions/{intention_id}/snooze")
+async def intentions_snooze(intention_id: str, body: IntentionSnoozeRequest):
+    from cognition.prospective import snooze_intention
+    from shared.scope import ScopeNotAllowed, require_scope
+
+    try:
+        require_scope(body.scope)
+    except ScopeNotAllowed:
+        raise HTTPException(status_code=403, detail=f"scope not allowed: {body.scope}")
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    if not await snooze_intention(
+        pool, _make_publisher_sync(), body.scope, intention_id, body.until,
+    ):
+        raise HTTPException(status_code=404, detail="intention not found or already closed")
+    return {"id": intention_id, "status": "pending", "snooze_until": body.until}
 
 
 @app.get("/api/cognition/reflection")
@@ -2471,6 +2571,18 @@ def _register_engines() -> None:
         await _sweep_unembedded()
         return {"ok": True}
 
+    async def _intention_scan(scope: str) -> dict:
+        from cognition.prospective import surface_due_intentions, sync_decision_reviews
+        from shared.settings import get_setting_cached
+
+        pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+        if not bool(await get_setting_cached(pool, "intentions_enabled", True)):
+            return {"skipped": "disabled"}
+        pub = _make_publisher_sync()
+        synced = await sync_decision_reviews(pool, pub, scope)
+        surfaced = await surface_due_intentions(pool, pub, scope)
+        return {"synced": synced, "surfaced": surfaced}
+
     async def _contradiction_scan(scope: str) -> dict:
         from cognition.contradiction import scan
         from shared.settings import get_setting_cached
@@ -2543,6 +2655,16 @@ def _register_engines() -> None:
             inputs=("memories", "goals", "identity_facts", "working_set"),
             outputs=("working_set",),
             run=_working_set_refresh,
+        ),
+        Engine(
+            name="intention_scan",
+            category="cognition",
+            description="Materialize due decision reviews and surface due intentions once.",
+            schedule="every 5m",
+            cadence=Every(5),
+            inputs=("decisions", "intentions"),
+            outputs=("intentions",),
+            run=_intention_scan,
         ),
         Engine(
             name="contradiction_scan",

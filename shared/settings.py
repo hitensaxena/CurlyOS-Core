@@ -49,6 +49,8 @@ SETTINGS_REGISTRY: dict[str, dict[str, Any]] = {
                                          "description": "Maximum cosine similarity for a contradiction pair (0–1)."},
     "contradiction_max_pairs": {"type": "int", "default": 30, "category": "cognition",
                                 "description": "Maximum memory pairs classified per scan."},
+    "intentions_enabled": {"type": "bool", "default": True, "category": "cognition",
+                           "description": "Run the prospective-memory scan and surface due intentions."},
     # ingest
     "epistemic_classify_enabled": {"type": "bool", "default": True, "category": "ingest",
                                    "description": "Run the per-ingest LLM epistemic classification (canonical/belief/hypothesis)."},
