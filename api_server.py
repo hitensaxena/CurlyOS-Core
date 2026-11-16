@@ -92,7 +92,9 @@ async def lifespan(app: FastAPI):
 
         register_default_handlers()
         register_graph_handler(
-            lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row)
+            lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row),
+            shadow=os.environ.get("CURLYOS_GRAPH_SHADOW", "1").lower()
+            not in ("0", "false", "off"),
         )
         dispatcher = Dispatcher(
             lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row), SCOPE,
@@ -3104,10 +3106,17 @@ async def run_engine(name: str, body: EngineRunRequest | None = None):
 @app.get("/api/events/dispatch")
 async def events_dispatch_status(scope: str = SCOPE):
     """Per-handler watermarks and lag over the event log."""
+    from shared import metrics
     from shared.events.dispatch import dispatch_status
 
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
-    return await dispatch_status(pool, scope)
+    result = await dispatch_status(pool, scope)
+    snapshot = metrics.snapshot()
+    result["projection"] = {
+        key: value for key, value in snapshot["counters"].items()
+        if key.startswith("event.graph_projection")
+    }
+    return result
 
 
 @app.post("/api/events/dispatch/run")

@@ -75,13 +75,22 @@ async def _read_watermark(pool: Any, scope: str, name: str) -> tuple[int, int] |
     return (int(row[0]), int(row[1])) if row else None
 
 
-async def _max_seq(pool: Any, scope: str) -> int:
+async def _max_seq(
+    pool: Any, scope: str, types: frozenset[str] | None = None,
+) -> int:
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT coalesce(max(seq), 0) FROM events WHERE scope = %s",
-                (scope,),
-            )
+            if types is None:
+                await cur.execute(
+                    "SELECT coalesce(max(seq), 0) FROM events WHERE scope = %s",
+                    (scope,),
+                )
+            else:
+                await cur.execute(
+                    "SELECT coalesce(max(seq), 0) FROM events "
+                    "WHERE scope = %s AND type = ANY(%s)",
+                    (scope, [full_type(t) for t in types]),
+                )
             return int((await cur.fetchone())[0])
 
 
@@ -160,8 +169,11 @@ async def dispatch_once(
     for handler in handlers:
         watermark = await _read_watermark(pool, scope, handler.name)
         if watermark is None and not backfill:
-            # Start new handlers at "now"; history is opt-in.
-            await _save_watermark(pool, scope, handler.name, await _max_seq(pool, scope), None, 0)
+            # Start new handlers at "now" for their own types; history is opt-in.
+            await _save_watermark(
+                pool, scope, handler.name,
+                await _max_seq(pool, scope, handler.types), None, 0,
+            )
             result["skipped_initial"] += 1
             continue
 
@@ -200,6 +212,7 @@ async def dispatch_once(
 
 async def dispatch_status(pool: Any, scope: str) -> dict:
     max_seq = await _max_seq(pool, scope)
+    types_by_name = {handler.name: handler.types for handler in registered()}
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -208,18 +221,27 @@ async def dispatch_status(pool: Any, scope: str) -> dict:
                 (scope,),
             )
             rows = await cur.fetchall()
-    return {
-        "scope": scope,
-        "max_seq": max_seq,
-        "handlers": [
-            {
-                "handler": r[0], "last_seq": int(r[1]), "lag": max_seq - int(r[1]),
-                "last_error": r[2], "error_count": int(r[3]),
-                "updated_at": r[4].isoformat() if isinstance(r[4], datetime) else r[4],
-            }
-            for r in rows
-        ],
-    }
+            handlers = []
+            for r in rows:
+                handler_types = types_by_name.get(r[0])
+                if handler_types is None:
+                    relevant_max = max_seq
+                else:
+                    # Lag for a typed handler is measured over its own types;
+                    # an unrelated event must not look like a backlog.
+                    await cur.execute(
+                        "SELECT coalesce(max(seq), 0) FROM events "
+                        "WHERE scope = %s AND type = ANY(%s)",
+                        (scope, [full_type(t) for t in handler_types]),
+                    )
+                    relevant_max = int((await cur.fetchone())[0])
+                handlers.append({
+                    "handler": r[0], "last_seq": int(r[1]),
+                    "lag": max(0, relevant_max - int(r[1])),
+                    "last_error": r[2], "error_count": int(r[3]),
+                    "updated_at": r[4].isoformat() if isinstance(r[4], datetime) else r[4],
+                })
+    return {"scope": scope, "max_seq": max_seq, "handlers": handlers}
 
 
 class Dispatcher:

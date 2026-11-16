@@ -823,6 +823,27 @@ async def test_graph_projection_handler_is_idempotent(pool):
     second = await dispatch_once(pool, scope, handler_list=[handler], backfill=True)
     assert second["dispatched"] == 0
 
+    # Shadow verification reports a row/event mismatch instead of repairing it.
+    from shared import metrics
+    from shared.events.dispatch import Handler
+
+    before = metrics.snapshot()["counters"].get(
+        "event.graph_projection.discrepancies", 0
+    )
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE knowledge_entities SET name = 'Shadow Mismatch' WHERE id = %s",
+                (e1,),
+            )
+    base = build_graph_handler(factory)
+    shadow_handler = Handler("graph_shadow_test", base.fn, base.types)
+    await dispatch_once(pool, scope, handler_list=[shadow_handler], backfill=True)
+    after = metrics.snapshot()["counters"].get(
+        "event.graph_projection.discrepancies", 0
+    )
+    assert after > before
+
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
