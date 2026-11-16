@@ -581,8 +581,9 @@ async def invalidate_memory(mem_id: str, body: InvalidateRequest | None = None):
     valid_to, scope = row
     # Graph expansion and the summary index are process-local; without this a
     # cached item could resurrect the fact this request just closed.
-    from memory.retrieval import invalidate_caches
+    from memory.retrieval import invalidate_caches, invalidate_summary_index
     invalidate_caches()
+    invalidate_summary_index()
     # Cached recall must stop returning this fact immediately, for hooks and
     # every other REST/MCP client, not just after the cache TTL expires.
     redis = _make_redis()
@@ -2130,8 +2131,9 @@ async def consolidation_run(body: ConsolidationRunRequest | None = None):
         )
         # Merges/invalidations changed graph and summary rows this process
         # may have cached; drop them before the next recall.
-        from memory.retrieval import invalidate_caches
+        from memory.retrieval import invalidate_caches, invalidate_summary_index
         invalidate_caches()
+        invalidate_summary_index()
         return result
     except Exception as e:
         logger.exception("consolidation run failed scope=%s deep=%s", scope, deep)
