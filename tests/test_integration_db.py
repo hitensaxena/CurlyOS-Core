@@ -6,6 +6,7 @@ service container; local runs can point at a scratch database.
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 
@@ -14,9 +15,11 @@ import pytest
 from psycopg_pool import AsyncConnectionPool
 
 import migrate
+from cognition.contradiction import list_candidates, resolve_candidate, scan
 from cognition.working_set import (
     get_working_set, pin_memory, refresh_working_set, working_set_boost,
 )
+from shared.types.ulid import mint
 from memory.chunking import split_text
 from memory.governance import add, invalidate, record_episode
 from memory.ingest_service import ingest_text
@@ -178,3 +181,126 @@ async def test_chunked_statements_cover_the_tail(pool):
 
     for mem_id in mem_ids:
         await invalidate(pool, pub, scope, mem_id, reason="integration cleanup")
+
+
+class _FakeLLM:
+    def __init__(self):
+        payload = json.dumps([{
+            "index": 1,
+            "relation": "contradiction",
+            "reason": "the two statements cannot both hold",
+        }])
+        message = type("Message", (), {"content": payload})()
+        choice = type("Choice", (), {"message": message})()
+        response = type("Response", (), {"choices": [choice]})()
+
+        class Completions:
+            async def create(self, **kwargs):
+                return response
+
+        self.chat = type("Chat", (), {"completions": Completions()})()
+
+
+@pytest.mark.asyncio
+async def test_identity_conflict_scan_and_resolve(pool):
+    pub = _Publisher()
+    scope = "test:integration"
+    epi = await record_episode(pool, pub, scope, content="identity conflict")
+
+    ids = []
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            for obj in ("value one", "value two"):
+                fact_id = mint("idf")
+                ids.append(fact_id)
+                await cur.execute(
+                    "INSERT INTO identity_facts "
+                    "(id, scope, predicate, object, confidence, epistemic_status, "
+                    " valid_from, ingested_at, created_at, source_episode_id) "
+                    "VALUES (%s, %s, %s, %s, 0.9, 'canonical', now(), now(), now(), %s)",
+                    (fact_id, scope, "test_predicate", obj, epi["epi_id"]),
+                )
+
+    result = await scan(pool, pub, scope)
+    assert result["identity_conflicts"] == 1
+    assert result["inserted"] == 1
+
+    candidates = await list_candidates(pool, scope)
+    candidate = next(c for c in candidates if c["kind"] == "identity_identity")
+    resolved = await resolve_candidate(pool, pub, scope, candidate["id"], "supersede_left")
+    assert resolved["status"] == "resolved"
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT count(*) FROM identity_facts "
+                "WHERE id = ANY(%s) AND valid_to IS NULL",
+                (ids,),
+            )
+            assert (await cur.fetchone())[0] == 1
+            await cur.execute(
+                "UPDATE identity_facts SET valid_to = now() "
+                "WHERE scope = %s AND predicate = 'test_predicate' AND valid_to IS NULL",
+                (scope,),
+            )
+            await cur.execute(
+                "DELETE FROM contradiction_candidates WHERE scope = %s", (scope,),
+            )
+
+
+@pytest.mark.asyncio
+async def test_memory_contradiction_scan_and_resolve(pool):
+    pub = _Publisher()
+    scope = "test:integration"
+    epi = await record_episode(pool, pub, scope, content="memory conflict")
+    left = await add(
+        pool, pub, scope,
+        f"The test setting is enabled {uuid.uuid4()}", epi["epi_id"],
+    )
+    right = await add(
+        pool, pub, scope,
+        f"The test setting is disabled {uuid.uuid4()}", epi["epi_id"],
+    )
+
+    base = [1.0] * 1024
+    alternate = [1.0] * 1024
+    for i in range(100):
+        alternate[i] = -1.0
+
+    def vector(values):
+        return "[" + ",".join(repr(float(v)) for v in values) + "]"
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE memories SET embedding = %s::vector WHERE id = %s",
+                (vector(base), left["mem_id"]),
+            )
+            await cur.execute(
+                "UPDATE memories SET embedding = %s::vector WHERE id = %s",
+                (vector(alternate), right["mem_id"]),
+            )
+
+    result = await scan(
+        pool, pub, scope,
+        llm_client=_FakeLLM(), llm_model="fake",
+        similarity_floor=0.80, similarity_ceiling=0.97, max_pairs=10,
+    )
+    assert result["memory_conflicts"] >= 1
+    assert result["inserted"] >= 1
+
+    candidates = await list_candidates(pool, scope)
+    candidate = next(c for c in candidates if c["kind"] == "memory_memory")
+    resolved = await resolve_candidate(pool, pub, scope, candidate["id"], "supersede_left")
+    assert resolved["status"] == "resolved"
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE memories SET valid_to = now() "
+                "WHERE id = ANY(%s) AND valid_to IS NULL",
+                ([left["mem_id"], right["mem_id"]],),
+            )
+            await cur.execute(
+                "DELETE FROM contradiction_candidates WHERE scope = %s", (scope,),
+            )

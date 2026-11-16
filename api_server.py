@@ -228,6 +228,12 @@ class WorkingSetPinRequest(BaseModel):
     reason: str = ""
 
 
+class ContradictionResolveRequest(BaseModel):
+    scope: str = SCOPE
+    action: Literal["supersede_left", "supersede_right", "keep_both", "dismiss"]
+    resolved_by: str = "user"
+
+
 class ReflectionRequest(BaseModel):
     scope: str = SCOPE
     window_days: int = Field(default=7, ge=1, le=90)
@@ -904,6 +910,40 @@ async def working_set_unpin(memory_id: str, scope: str = SCOPE):
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
     unpinned = await unpin_memory(pool, scope, memory_id)
     return {"unpinned": unpinned, "memory_id": memory_id, "scope": scope}
+
+
+@app.get("/api/cognition/contradictions")
+async def contradictions_list(
+    scope: str = SCOPE, status: str = "open", limit: int = Query(default=50, le=200),
+):
+    """Open contradiction proposals. Nothing here has been applied."""
+    from cognition.contradiction import list_candidates
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    items = await list_candidates(pool, scope, status, limit)
+    return {"items": items, "count": len(items), "scope": scope, "status": status}
+
+
+@app.post("/api/cognition/contradictions/{candidate_id}/resolve")
+async def contradictions_resolve(
+    candidate_id: str, body: ContradictionResolveRequest,
+):
+    """Apply or dismiss a proposal. This is the only path that edits data."""
+    from cognition.contradiction import ContradictionError, resolve_candidate
+    from shared.scope import ScopeNotAllowed, require_scope
+
+    try:
+        require_scope(body.scope)
+    except ScopeNotAllowed:
+        raise HTTPException(status_code=403, detail=f"scope not allowed: {body.scope}")
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    try:
+        return await resolve_candidate(
+            pool, _make_publisher_sync(), body.scope, candidate_id,
+            body.action, body.resolved_by,
+        )
+    except ContradictionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.get("/api/cognition/reflection")
@@ -2431,6 +2471,25 @@ def _register_engines() -> None:
         await _sweep_unembedded()
         return {"ok": True}
 
+    async def _contradiction_scan(scope: str) -> dict:
+        from cognition.contradiction import scan
+        from shared.settings import get_setting_cached
+
+        pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+        if not bool(await get_setting_cached(pool, "contradiction_scan_enabled", True)):
+            return {"skipped": "disabled"}
+        llm, model = _make_llm_client("fast")
+        return await scan(
+            pool, _make_publisher_sync(), scope,
+            llm_client=llm,
+            llm_model=model,
+            similarity_floor=float(await get_setting_cached(
+                pool, "contradiction_similarity_floor", 0.80)),
+            similarity_ceiling=float(await get_setting_cached(
+                pool, "contradiction_similarity_ceiling", 0.97)),
+            max_pairs=int(await get_setting_cached(pool, "contradiction_max_pairs", 30)),
+        )
+
     async def _working_set_refresh(scope: str) -> dict:
         from cognition.working_set import refresh_working_set
         from shared.settings import get_setting_cached
@@ -2484,6 +2543,16 @@ def _register_engines() -> None:
             inputs=("memories", "goals", "identity_facts", "working_set"),
             outputs=("working_set",),
             run=_working_set_refresh,
+        ),
+        Engine(
+            name="contradiction_scan",
+            category="cognition",
+            description="Propose contradictions between recent memories and identity predicates.",
+            schedule="Sun 06:40",
+            cadence=WeeklyAt((6,), "06:40"),
+            inputs=("memories", "identity_facts"),
+            outputs=("contradiction_candidates",),
+            run=_contradiction_scan,
         ),
         Engine(
             name="attention_scan",
