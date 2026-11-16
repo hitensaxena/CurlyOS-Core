@@ -49,6 +49,11 @@ class Engine:
     inputs: tuple[str, ...] = field(default_factory=tuple)
     outputs: tuple[str, ...] = field(default_factory=tuple)
     enabled: bool = True
+    # Opaque scheduler cadence (Every/DailyAt/WeeklyAt/MonthlyAt). Kept out of
+    # the descriptor because it is not JSON-serialisable; `schedule` is the
+    # human-readable label.
+    cadence: Any = None
+    period_guard: Callable[..., Awaitable[bool]] | None = None
 
     def descriptor(self) -> dict[str, Any]:
         """JSON-safe description; never includes the callable."""

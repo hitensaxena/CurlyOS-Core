@@ -10,7 +10,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -63,6 +62,10 @@ async def lifespan(app: FastAPI):
     # RAM-pressure: the model is ~1.3GB resident (see macbook-ram-tuning).
     prewarm = asyncio.create_task(_prewarm_embedder())
 
+    # Engines must be registered before the scheduler builds its job list:
+    # jobs are derived from the registry.
+    _register_engines()
+
     # The cognitive heartbeat (curlyos-final/06 §3) — replaces Hermes cron.
     # CURLYOS_SCHEDULER=0 disables (tests, one-off scripts).
     scheduler = None
@@ -81,8 +84,6 @@ async def lifespan(app: FastAPI):
         )
         scheduler.start()
     app.state.scheduler = scheduler
-
-    _register_engines()
 
     yield
     if scheduler is not None:
@@ -1799,35 +1800,6 @@ async def _sweep_unembedded() -> None:
         logger.exception("unembedded sweep failed")
 
 
-# Harness/tooling scaffolding that leaks into captured "user" turns: task
-# notifications delivered as user messages, injected system reminders, and
-# slash-command wrappers. None of it is personal content — left in, it became
-# episodes/memories, derailed narrative compose, and polluted recall/search.
-_SCAFFOLD_TAGS = (
-    "system-reminder", "task-notification", "command-name", "command-message",
-    "command-args", "command-output", "local-command-stdout",
-    "local-command-stderr", "user-prompt-submit-hook",
-)
-_SCAFFOLD_BLOCK_RE = re.compile(
-    r"<(" + "|".join(_SCAFFOLD_TAGS) + r")\b[^>]*>.*?</\1\s*>",
-    re.DOTALL | re.IGNORECASE,
-)
-_SCAFFOLD_TAG_RE = re.compile(
-    r"</?(" + "|".join(_SCAFFOLD_TAGS) + r")\b[^>]*>", re.IGNORECASE
-)
-
-
-def _strip_scaffolding(text: str) -> str:
-    """Strip harness scaffolding blocks from a captured turn, returning only the
-    human content. Returns "" when the turn was pure scaffolding (e.g. a bare
-    <task-notification> delivered as a user message)."""
-    if not text:
-        return ""
-    cleaned = _SCAFFOLD_BLOCK_RE.sub("", text)
-    cleaned = _SCAFFOLD_TAG_RE.sub("", cleaned)  # drop any unpaired leftovers
-    return cleaned.strip()
-
-
 @app.post("/api/ingest")
 async def ingest(body: IngestRequest, background_tasks: BackgroundTasks):
     """Record raw text as an episode in curlyos-memory and process it.
@@ -1842,13 +1814,15 @@ async def ingest(body: IngestRequest, background_tasks: BackgroundTasks):
            "kind"?: "fact"|"procedure"|"preference" (default "fact"),
            "epistemic_status"?: "canonical"|"hypothesis"|"belief" (default "canonical")}
     """
-    text = body.text.strip()
-    if not text:
+    from memory.ingest_service import ingest_text, strip_scaffolding
+
+    raw = body.text.strip()
+    if not raw:
         raise HTTPException(status_code=400, detail="text is required")
     # Remove harness scaffolding before anything is recorded. A turn that is
     # *only* scaffolding has no human content and is skipped without creating
     # rows, so it can't pollute episodes/memories/extraction/recall.
-    text = _strip_scaffolding(text)
+    text = strip_scaffolding(raw)
     if not text:
         return {"skipped": "scaffolding-only"}
     source_ref = body.source_ref or "web:capture"
@@ -1856,41 +1830,21 @@ async def ingest(body: IngestRequest, background_tasks: BackgroundTasks):
     add_memory = body.add_memory
     extract_knowledge = body.extract_knowledge
 
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from memory.governance import record_episode, add
-
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
     pub = _make_publisher_sync()
     epi_id = None
     mem_chunks: list[tuple[str, str]] = []
     result: dict = {}
     try:
-        epi = await record_episode(
-            pool, pub, scope, content=text, source_ref=source_ref,
+        result = await ingest_text(
+            pool, pub, scope, text,
+            source_ref=source_ref,
+            add_memory=add_memory,
+            kind=body.kind,
+            epistemic_status=body.epistemic_status,
         )
-        epi_id = epi["epi_id"]
-        result["epi_id"] = epi_id
-        if add_memory:
-            from memory.chunking import split_text
-
-            # Store every chunk rather than truncating at 4,000 characters:
-            # anything past the cap used to be unreachable by recall.
-            for chunk in split_text(text):
-                mem = await add(
-                    pool, pub, scope,
-                    statement=chunk,
-                    source_episode_id=epi_id,
-                    kind=body.kind,
-                    # canonical (default) so it's recallable: fast/deep recall
-                    # filter to epistemic_status='canonical' only ("belief" is in
-                    # no mode's filter, so belief memories never surface). Callers
-                    # that want non-recallable drafts pass "hypothesis".
-                    epistemic_status=body.epistemic_status,
-                )
-                mem_chunks.append((mem["mem_id"], chunk))
-            result["mem_id"] = mem_chunks[0][0] if mem_chunks else None
-            result["mem_ids"] = [mid for mid, _ in mem_chunks]
-            result["chunks"] = len(mem_chunks)
+        mem_chunks = result.pop("mem_chunks", [])
+        epi_id = result.get("epi_id")
     except Exception as e:
         logger.exception("ingest failed source_ref=%s", source_ref)
         return {"error": str(e)}
@@ -2508,8 +2462,9 @@ def _register_engines() -> None:
     next step is to derive jobs from these descriptors.
     """
     from shared.engines import REGISTRY, Engine
+    from shared.scheduler import DailyAt, Every, MonthlyAt, WeeklyAt
 
-    if REGISTRY.names():
+    if "consolidation_fast" in REGISTRY.names():
         return
 
     async def _consolidation(scope: str, mode: str) -> dict:
@@ -2525,6 +2480,7 @@ def _register_engines() -> None:
             category="memory",
             description="Dedup, conflict resolution and summarization of recent episodes.",
             schedule="every 20m",
+            cadence=Every(20),
             inputs=("episodes", "memories", "events"),
             outputs=("memories",),
             run=lambda scope: _consolidation(scope, "fast"),
@@ -2534,6 +2490,7 @@ def _register_engines() -> None:
             category="memory",
             description="Full consolidation: dedup, merge, summarize, decay, recombine.",
             schedule="daily 03:05",
+            cadence=DailyAt("03:05"),
             inputs=("episodes", "memories", "events"),
             outputs=("memories", "knowledge_edges"),
             run=lambda scope: _consolidation(scope, "deep"),
@@ -2543,6 +2500,7 @@ def _register_engines() -> None:
             category="operations",
             description="Embed any active or historical rows left without a vector.",
             schedule="every 5m",
+            cadence=Every(5),
             inputs=("memories", "episodes"),
             outputs=("memories", "episodes"),
             run=_embedding_sweep,
@@ -2552,6 +2510,7 @@ def _register_engines() -> None:
             category="cognition",
             description="Heuristic focus, neglect, breadth and alignment scan.",
             schedule="Mon,Thu 08:10",
+            cadence=WeeklyAt((0, 3), "08:10"),
             inputs=("episodes", "knowledge_entities", "identity_facts", "goals"),
             outputs=("alignment_signals",),
             run=lambda scope: attention_scan(AttentionScanRequest(scope=scope)),
@@ -2561,6 +2520,8 @@ def _register_engines() -> None:
             category="cognition",
             description="Weekly reflection report with identity and goal write-back.",
             schedule="Mon 06:20",
+            cadence=WeeklyAt((0,), "06:20"),
+            period_guard=_reflection_period_guard("weekly", "week"),
             inputs=("episodes", "identity_facts", "goals", "knowledge_entities"),
             outputs=("reflection_reports", "identity_facts", "goals"),
             run=lambda scope: reflection_weekly(ReflectionRequest(scope=scope)),
@@ -2570,15 +2531,30 @@ def _register_engines() -> None:
             category="cognition",
             description="Monthly reflection and long-horizon synthesis.",
             schedule="monthly 1st 06:40",
+            cadence=MonthlyAt(1, "06:40"),
+            period_guard=_reflection_period_guard("monthly", "month"),
             inputs=("episodes", "identity_facts", "goals"),
             outputs=("reflection_reports", "identity_facts", "goals"),
             run=lambda scope: reflection_monthly(ReflectionRequest(scope=scope)),
+        ),
+        Engine(
+            name="reflection_daily",
+            category="cognition",
+            description="Lightweight daily reflection report.",
+            schedule="daily 22:00",
+            cadence=DailyAt("22:00"),
+            period_guard=_reflection_period_guard("daily", "day"),
+            inputs=("episodes",),
+            outputs=("reflection_reports",),
+            run=lambda scope: reflection_daily(ReflectionRequest(scope=scope)),
         ),
         Engine(
             name="meta_audit",
             category="cognition",
             description="Decision audits and principle distillation.",
             schedule="monthly 1st 07:20",
+            cadence=MonthlyAt(1, "07:20"),
+            period_guard=_table_period_guard("decision_audits", "month"),
             inputs=("decisions", "episodes", "memories"),
             outputs=("decision_audits", "principles", "memories"),
             run=lambda scope: meta_audit(MetaAuditRequest(scope=scope)),
@@ -2588,6 +2564,8 @@ def _register_engines() -> None:
             category="cognition",
             description="Themes and life chapters from episodes and the knowledge graph.",
             schedule="Sun 05:20",
+            cadence=WeeklyAt((6,), "05:20"),
+            period_guard=_table_period_guard("themes", "week"),
             inputs=("episodes", "knowledge_entities"),
             outputs=("themes", "life_chapters"),
             run=lambda scope: narrative_generate(NarrativeGenerateRequest(scope=scope)),
@@ -2597,7 +2575,8 @@ def _register_engines() -> None:
 
 
 def _scheduler_jobs():
-    from shared.scheduler import DailyAt, Every, Job, MonthlyAt, WeeklyAt
+    from shared.engines import REGISTRY
+    from shared.scheduler import DailyAt, Job, WeeklyAt
 
     async def _goal_derive_job() -> dict:
         from goals import derive_goals_from_memories
@@ -2616,40 +2595,23 @@ def _scheduler_jobs():
             auto_record=True, llm_client=llm, llm_model=model,
         )
 
-    async def _embedding_sweep_job() -> dict:
-        # Safety net: consolidation and direct SQL paths can create memories
-        # without a vector. Startup-only sweeping left them dark indefinitely.
-        await _sweep_unembedded()
-        return {"ok": True}
+    async def _run_engine(name: str) -> dict:
+        return await REGISTRY.run(name, SCOPE)
 
-    return [
-        # consolidation is internally locked per scope — overlap-safe at any cadence
-        Job("consolidation_fast", Every(20),
-            lambda: consolidation_run(ConsolidationRunRequest(mode="fast"))),
-        # bounded, sequential; no-op when nothing is NULL
-        Job("embedding_sweep", Every(5), _embedding_sweep_job),
-        Job("consolidation_deep", DailyAt("03:05"),
-            lambda: consolidation_run(ConsolidationRunRequest(mode="deep"))),
-        # LLM-bearing cognition: output-based period guards prevent double-spend
-        Job("reflection_weekly", WeeklyAt((0,), "06:20"),     # Hermes: Mon 06:00
-            lambda: reflection_weekly(None),
-            period_guard=_reflection_period_guard("weekly", "week")),
-        Job("reflection_monthly", MonthlyAt(1, "06:40"),      # no Hermes equivalent
-            lambda: reflection_monthly(None),
-            period_guard=_reflection_period_guard("monthly", "month")),
-        Job("meta_audit", MonthlyAt(1, "07:20"),              # Hermes: 1st 07:00
-            lambda: meta_audit(None),
-            period_guard=_table_period_guard("decision_audits", "month")),
-        Job("narrative_generate", WeeklyAt((6,), "05:20"),    # Hermes: Sun 05:00
-            lambda: narrative_generate(None),
-            period_guard=_table_period_guard("themes", "week")),
-        # heuristic, no LLM — duplicates are harmless
-        Job("attention_scan", WeeklyAt((0, 3), "08:10"),      # Hermes: Mon,Thu 08:00
-            lambda: attention_scan(None)),
-        # daily reflection — heuristic-only, no LLM cost
-        Job("reflection_daily", DailyAt("22:00"),
-            lambda: reflection_daily(None),
-            period_guard=_reflection_period_guard("daily", "day")),
+    # Engine jobs are generated from the registry: adding an engine with a
+    # cadence schedules it without editing this list. The three below are
+    # goal/attention maintenance that do not (yet) have engine descriptors.
+    jobs = [
+        Job(
+            engine.name,
+            engine.cadence,
+            lambda n=engine.name: _run_engine(n),
+            period_guard=engine.period_guard,
+        )
+        for engine in REGISTRY.list()
+        if engine.cadence is not None
+    ]
+    jobs += [
         # mood inference — lightweight, runs after daily reflection
         Job("mood_inference", DailyAt("23:30"),
             lambda: attention_infer_mood(SCOPE)),
@@ -2662,6 +2624,7 @@ def _scheduler_jobs():
             _decision_extract_job,
             period_guard=_table_period_guard("decisions", "day")),
     ]
+    return jobs
 
 
 def _duration_ms(start, end) -> int | None:
