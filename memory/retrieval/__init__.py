@@ -334,10 +334,19 @@ _GRAPH_CACHE_MAX = 128
 
 
 def invalidate_caches() -> None:
-    """Drop process-local alias, graph and summary caches after a write."""
+    """Drop process-local alias and graph caches after a write.
+
+    The summary index is deliberately not cleared here: ordinary captures do
+    not change it, and clearing it on every ingest made the 129 ms rebuild run
+    constantly. Callers that actually invalidate a summary use
+    `invalidate_summary_index`.
+    """
     global _ALIAS_CACHE
     _ALIAS_CACHE = None
     _GRAPH_CACHE.clear()
+
+
+def invalidate_summary_index() -> None:
     _SUMMARY_INDEX["at"] = 0.0
     _SUMMARY_INDEX["map"] = {}
     _SUMMARY_INDEX["scope"] = None

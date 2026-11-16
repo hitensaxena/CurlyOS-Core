@@ -13,3 +13,16 @@ def test_invalidate_caches_clears_both():
 
     assert retrieval._ALIAS_CACHE is None
     assert retrieval._GRAPH_CACHE == {}
+
+
+def test_invalidate_summary_index_is_separate():
+    retrieval._ALIAS_CACHE = (10**18, (["raw"], ["canon"]))
+    retrieval._GRAPH_CACHE[("k",)] = (10**18, [{"id": "x"}])
+    retrieval._SUMMARY_INDEX["at"], retrieval._SUMMARY_INDEX["map"] = 1.0, {"x": 1}
+
+    retrieval.invalidate_caches()
+    assert retrieval._SUMMARY_INDEX["map"] == {"x": 1}
+
+    retrieval.invalidate_summary_index()
+    assert retrieval._SUMMARY_INDEX["map"] == {}
+    assert retrieval._SUMMARY_INDEX["at"] == 0.0
