@@ -639,6 +639,25 @@ def get_episode(epi_id: str):
 # Identity
 # ---------------------------------------------------------------------------
 
+@app.post("/api/identity/{fact_id}/invalidate")
+async def invalidate_identity(fact_id: str, scope: str = SCOPE):
+    """Retire an identity fact (confirm/drop flow for hypothesis claims)."""
+    from identity import invalidate_identity_fact
+    from shared.scope import ScopeNotAllowed, require_scope
+
+    try:
+        require_scope(scope)
+    except ScopeNotAllowed:
+        raise HTTPException(status_code=403, detail=f"scope not allowed: {scope}")
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    result = await invalidate_identity_fact(
+        pool, _make_publisher_sync(), scope, fact_id,
+    )
+    if result.get("valid_to") is None:
+        raise HTTPException(status_code=409, detail="identity fact not found or already invalidated")
+    return result
+
+
 @app.get("/api/identity")
 def list_identity(scope: str = SCOPE, predicates: str | None = None, valid: bool | None = True):
     """valid=True (default) → current facts; False → superseded; None → all.

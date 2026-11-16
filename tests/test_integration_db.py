@@ -573,3 +573,30 @@ async def test_curiosity_scan_finds_gaps_once(pool):
             await cur.execute("DELETE FROM identity_facts WHERE scope = %s", (scope,))
             await cur.execute("DELETE FROM knowledge_entities WHERE scope = %s", (scope,))
             await cur.execute("DELETE FROM goals WHERE scope = %s", (scope,))
+
+
+@pytest.mark.asyncio
+async def test_identity_fact_can_be_retired(pool):
+    from identity import invalidate_identity_fact
+
+    pub = _Publisher()
+    scope = "test:identity"
+    epi = await record_episode(pool, pub, scope, content="identity retire probe")
+    fact_id = mint("idf")
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO identity_facts "
+                "(id, scope, predicate, object, confidence, epistemic_status, "
+                " valid_from, ingested_at, created_at, source_episode_id) "
+                "VALUES (%s, %s, 'retired_probe', 'value', 0.7, 'hypothesis', "
+                "        now(), now(), now(), %s)",
+                (fact_id, scope, epi["epi_id"]),
+            )
+
+    result = await invalidate_identity_fact(pool, pub, scope, fact_id)
+    assert result["valid_to"] is not None
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM identity_facts WHERE id = %s", (fact_id,))
