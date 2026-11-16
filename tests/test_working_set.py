@@ -31,6 +31,14 @@ def test_identity_overlap_raises_salience():
     assert identity > base
 
 
+def test_attention_terms_raise_salience():
+    plain = compute_salience("walk daily", NOW, set(), set(), now=NOW)
+    attentive = compute_salience(
+        "walk daily", NOW, set(), set(), attention_terms={"walk"}, now=NOW,
+    )
+    assert attentive > plain
+
+
 def test_output_is_bounded():
     score = compute_salience(
         "one two three four five six", NOW, {"one", "two", "three"}, {"four", "five", "six"}, now=NOW,

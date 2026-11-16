@@ -479,3 +479,33 @@ async def test_decision_review_closes_the_loop(pool):
             await cur.execute(
                 "DELETE FROM decisions WHERE scope = %s", (scope,),
             )
+
+
+@pytest.mark.asyncio
+async def test_attention_terms_raise_working_set_salience(pool):
+    pub = _Publisher()
+    scope = "test:attention"
+    epi = await record_episode(pool, pub, scope, content="attention salience probe")
+    walked = await add(pool, pub, scope, "Walk daily for thirty minutes", epi["epi_id"])
+    control = await add(pool, pub, scope, "Read a book about oceans", epi["epi_id"])
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM alignment_signals WHERE scope = %s", (scope,))
+            await cur.execute(
+                "INSERT INTO alignment_signals "
+                "(id, scope, signal_type, description, severity, epistemic_status) "
+                "VALUES (%s, %s, 'value_action_gap', %s, 0.9, 'hypothesis')",
+                (mint("aln"), scope, "Value 'walk daily' gets little recent attention"),
+            )
+
+    await refresh_working_set(pool, pub, scope, size=10, ttl_hours=1)
+    items = {item["memory_id"]: item for item in await get_working_set(pool, scope, 10)}
+    assert items[walked["mem_id"]]["salience"] > items[control["mem_id"]]["salience"]
+
+    for mem_id in (walked["mem_id"], control["mem_id"]):
+        await invalidate(pool, pub, scope, mem_id, reason="integration cleanup")
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM alignment_signals WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM working_set WHERE scope = %s", (scope,))
