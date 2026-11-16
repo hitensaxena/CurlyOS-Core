@@ -24,6 +24,14 @@ SETTINGS_REGISTRY: dict[str, dict[str, Any]] = {
                                  "description": "TTL for cached recall results, in seconds (1–3600)."},
     "recall_fast_followups": {"type": "bool", "default": False, "category": "recall",
                               "description": "Allow the agentic coverage-gap follow-up round in fast mode (slower, more thorough)."},
+    "recall_blend_cosine": {"type": "float", "default": 0.65, "category": "recall",
+                            "description": "Weight of query–memory cosine in the final ranking blend (0–1)."},
+    "recall_blend_fused": {"type": "float", "default": 0.25, "category": "recall",
+                           "description": "Weight of the retrieval layer's RRF/graph fused score in the final blend (0–1)."},
+    "recall_blend_recency": {"type": "float", "default": 0.10, "category": "recall",
+                             "description": "Weight of recency in the final blend (0–1)."},
+    "recall_blend_half_life_days": {"type": "float", "default": 30.0, "category": "recall",
+                                    "description": "Recency half-life in days for the final blend."},
     # ingest
     "epistemic_classify_enabled": {"type": "bool", "default": True, "category": "ingest",
                                    "description": "Run the per-ingest LLM epistemic classification (canonical/belief/hypothesis)."},
@@ -66,9 +74,15 @@ def coerce_value(key: str, raw: Any) -> Any:
         return v
     if t == "float":
         try:
-            return float(raw)
+            v = float(raw)
         except (TypeError, ValueError):
             raise ValueError(f"{key} expects a number")
+        if key in ("recall_blend_cosine", "recall_blend_fused", "recall_blend_recency"):
+            if not (0.0 <= v <= 1.0):
+                raise ValueError(f"{key} must be between 0 and 1")
+        if key == "recall_blend_half_life_days" and v <= 0:
+            raise ValueError("recall_blend_half_life_days must be positive")
+        return v
     return str(raw)
 
 

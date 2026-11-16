@@ -3,10 +3,10 @@ import importlib.util
 import json
 from pathlib import Path
 
-import httpx
 import pytest
 
 from mcp_server import server
+from shared.client import ClientError, clean
 
 
 @pytest.mark.asyncio
@@ -23,26 +23,35 @@ async def test_tool_surface():
 @pytest.mark.asyncio
 async def test_recall_fallback_and_scope(monkeypatch):
     calls = []
-    async def fake(method, path, **kwargs):
-        calls.append((method, path, kwargs))
-        if method == "POST":
-            raise httpx.ConnectError("offline")
+
+    async def fake_recall(query, k=6, mode="fast", *, fallback=False):
+        calls.append((k, fallback))
+        if not fallback:
+            raise ClientError("offline")
         return {"items": [{"id": "mem_123", "statement": "grounded"}]}
-    monkeypatch.setattr(server, "_api", fake)
+
+    monkeypatch.setattr(server.CLIENT, "recall", fake_recall)
     result = await server.recall("topic", k=100)
     assert result["fallback"] == "keyword"
-    assert calls[0][2]["body"]["k"] == 20
-    assert calls[1][2]["params"]["scope"] == server.SCOPE
+    assert calls[0] == (20, False)   # k is clamped before the call
+    assert calls[1] == (20, True)
 
 
 @pytest.mark.asyncio
 async def test_cached_recall_has_provenance_and_filters_invalidated(monkeypatch):
-    async def fake(method, path, **kwargs):
-        if path == "/api/recall":
-            return {"results": [{"id": "active"}, {"id": "old"}], "cached": True}
-        return {"memory": {"scope": server.SCOPE, "statement": "Full supported statement",
-                           "source_episode_id": "epi_source", "valid_to": "2026-01-01" if path.endswith("old") else None}}
-    monkeypatch.setattr(server, "_api", fake)
+    async def fake_recall(query, k=6, mode="fast", *, fallback=False):
+        return {"results": [{"id": "active"}, {"id": "old"}], "cached": True}
+
+    async def fake_get(mem_id):
+        return {"memory": {
+            "scope": server.CLIENT.scope,
+            "statement": "Full supported statement",
+            "source_episode_id": "epi_source",
+            "valid_to": "2026-01-01" if mem_id == "old" else None,
+        }}
+
+    monkeypatch.setattr(server.CLIENT, "recall", fake_recall)
+    monkeypatch.setattr(server.CLIENT, "get_memory", fake_get)
     result = await server.recall("topic")
     assert result["count"] == 1
     assert result["results"][0]["source_episode_id"] == "epi_source"
@@ -51,14 +60,11 @@ async def test_cached_recall_has_provenance_and_filters_invalidated(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_ingest_errors_are_not_reported_as_success(monkeypatch):
-    class Client:
-        def __init__(self, **kwargs): pass
-        async def __aenter__(self): return self
-        async def __aexit__(self, *args): pass
-        async def request(self, *args, **kwargs):
-            return httpx.Response(200, json={"error": "database write failed"}, request=httpx.Request("POST", "http://localhost"))
-    monkeypatch.setattr(server.httpx, "AsyncClient", Client)
-    with pytest.raises(ValueError, match="database write failed"):
+    async def fake_request(*args, **kwargs):
+        raise ClientError("database write failed")
+
+    monkeypatch.setattr(server.CLIENT, "request", fake_request)
+    with pytest.raises(ClientError, match="database write failed"):
         await server.add_fact("a real fact")
 
 
@@ -78,4 +84,4 @@ def test_capture_excludes_system_tools_and_analysis(tmp_path):
 
 
 def test_clean_vectors():
-    assert server._clean({"items": [{"id": "x", "embedding": [1, 2]}]}) == {"items": [{"id": "x"}]}
+    assert clean({"items": [{"id": "x", "embedding": [1, 2]}]}) == {"items": [{"id": "x"}]}

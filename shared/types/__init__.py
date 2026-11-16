@@ -197,3 +197,5 @@ class RetrievalResult(BaseModel):
     cache_key: str
     graph_skipped: bool = False
     reranked: bool = True
+    # Per-stage latency in milliseconds (dense, sparse, entity, graph, ...).
+    timings: dict[str, float] = Field(default_factory=dict)

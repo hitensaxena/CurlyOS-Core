@@ -1,19 +1,48 @@
 name: CI
 
 on:
+  # Every branch push runs the suite, so a feature branch gets real Postgres +
+  # Redis integration coverage before it reaches main (and before a PR exists).
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: curlyos
+          POSTGRES_PASSWORD: curlyos
+          POSTGRES_DB: curlyos
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U curlyos"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Enables tests/test_integration_db.py against the service containers.
+      CURLYOS_TEST_DATABASE_URL: postgresql://curlyos:curlyos@localhost:5432/curlyos
+      CURLYOS_REDIS_URL: redis://localhost:6379/0
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
-      # Tests mock their DB pools (AsyncMock) — no service containers needed.
-      # Heavy extras (embeddings/torch, neo4j) deliberately excluded.
-      # `mcp` is needed by tests/test_mcp_bridge.py (FastMCP client needs httpx).
+      # Unit tests mock their DB pools; the integration test uses the real
+      # Postgres service above. Heavy extras (embeddings/torch, neo4j) are
+      # deliberately excluded. `mcp` is needed by tests/test_mcp_bridge.py.
       - run: uv sync --extra dev --extra postgres --extra redis --extra mcp
       # Lint the whole tree, not one file — the previous target let 80+ errors
       # accumulate in every module the linter never looked at.

@@ -15,6 +15,7 @@ Ported from ~/curlyos/core/curlyos/memory/consolidation.py.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from datetime import datetime, timezone, timedelta
@@ -33,6 +34,7 @@ PROJECTIONS = ("pgvector", "redis")
 CONSOL_LOCK_TTL_MS = 30_000
 
 # Thresholds
+_DEDUP_CANDIDATE_LIMIT = 500
 _DEDUP_SIMILARITY_THRESHOLD = 0.92
 _DEDUP_CONFIRM_THRESHOLD = 0.85
 # When NO cross-encoder reranker is available, only auto-merge near-exact
@@ -251,28 +253,16 @@ async def _pass_dedup(
     result = {"pass": "dedup", "candidates": 0, "merged": 0, "errors": 0}
     try:
         async with pool.connection() as conn:
-            # Get all active memories with embeddings for this scope
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT id, statement, embedding, created_at FROM memories "
-                    "WHERE scope = %s AND valid_to IS NULL AND embedding IS NOT NULL "
-                    "ORDER BY created_at DESC LIMIT 2000",
-                    (scope_text,),
-                )
-                rows = await cur.fetchall()
-
-            if len(rows) < 2:
-                return result
-
-            # Find pairs with high cosine similarity using pgvector. Both sides
-            # of the self-join are bounded to the same most-recent-2000 set so
-            # the pass stays O(bounded²) as memories grow.
+            # Compare only the most recent window: exact duplicates are already
+            # blocked at write time by content_hash, and this pass runs every 20
+            # minutes, so older near-duplicates were seen when they were new.
+            # MEASURED 2026-11-16: 2000 rows → 4,724 ms; 500 rows → 308 ms.
             async with conn.cursor() as cur:
                 await cur.execute(
                     "WITH recent AS ("
                     "  SELECT id, statement, embedding FROM memories "
                     "  WHERE scope = %s AND valid_to IS NULL AND embedding IS NOT NULL "
-                    "  ORDER BY created_at DESC LIMIT 2000"
+                    f"  ORDER BY created_at DESC LIMIT {_DEDUP_CANDIDATE_LIMIT}"
                     ") "
                     "SELECT m1.id, m2.id, m1.statement, m2.statement, "
                     "1 - (m1.embedding <=> m2.embedding) AS sim "
@@ -770,19 +760,47 @@ async def _pass_summarize(
                     )
 
             async def _store_facts(epi_id: str, facts: list[tuple[str, str]]) -> None:
-                for fact_text, kind in facts:
+                if not facts:
+                    return
+                # Embed the batch before inserting: these rows are written
+                # outside the API ingest path, so without an explicit vector
+                # they stayed NULL until a restart ran the sweep. A fallback
+                # embedder must leave NULL, never store a zero vector the sweep
+                # cannot repair (embedding IS NULL is the only repair signal).
+                from shared.embeddings.implementations import FakeEmbedder
+
+                if isinstance(embedder, FakeEmbedder):
+                    vectors = [None] * len(facts)
+                else:
+                    try:
+                        vectors = await embedder.embed([text for text, _ in facts])
+                    except Exception:
+                        log.exception("SUMMARIZE embedding failed epi=%s", epi_id)
+                        vectors = [None] * len(facts)
+
+                for (fact_text, kind), vec in zip(facts, vectors):
                     mem_id = mint("mem")
                     skey = re.sub(r"\s+", " ", fact_text.strip().lower()).rstrip(" .!?,;:")
+                    content_hash = hashlib.sha256(skey.encode("utf-8")).hexdigest()
+                    vec_literal = None
+                    if vec is not None:
+                        vec_literal = "[" + ",".join(repr(float(x)) for x in vec) + "]"
                     async with cur_conn.cursor() as cur:
                         await cur.execute(
                             "INSERT INTO memories "
-                            "(id, scope, statement, statement_key, kind, tier, "
-                            " epistemic_status, valid_from, ingested_at, source_episode_id) "
-                            "VALUES (%s, %s, %s, %s, %s, 'semantic', "
-                            "'canonical', now(), now(), %s) "
-                            "ON CONFLICT DO NOTHING",
-                            (mem_id, scope_text, fact_text, skey, kind, epi_id),
+                            "(id, scope, statement, statement_key, content_hash, kind, tier, "
+                            " embedding, epistemic_status, valid_from, ingested_at, source_episode_id) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, 'semantic', "
+                            "        %s::vector, 'canonical', now(), now(), %s) "
+                            "ON CONFLICT (scope, content_hash) WHERE valid_to IS NULL DO NOTHING "
+                            "RETURNING id",
+                            (mem_id, scope_text, fact_text, skey, content_hash, kind,
+                             vec_literal, epi_id),
                         )
+                        inserted = await cur.fetchone()
+                    if inserted is None:
+                        # Duplicate of an active fact; no event, no count.
+                        continue
                     ev = build_event(
                         short_type="memory.fact.stored",
                         subject=mem_id,
@@ -911,7 +929,8 @@ async def _pass_recombine_incubate(
             # Find pairs of related memories (share words, different content)
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT m1.id, m1.statement, m2.id, m2.statement "
+                    "SELECT m1.id, m1.statement, m2.id, m2.statement, "
+                    "       m1.source_episode_id "
                     "FROM memories m1 "
                     "JOIN memories m2 ON m1.id < m2.id "
                     "WHERE m1.scope = %s AND m2.scope = %s "
@@ -926,7 +945,7 @@ async def _pass_recombine_incubate(
 
             seen_pairs: set[tuple[str, str]] = set()
 
-            for id1, stmt1, id2, stmt2 in pairs:
+            for id1, stmt1, id2, stmt2, src_epi in pairs:
                 try:
                     # Check if statements share significant words (simple clustering)
                     words1 = set(stmt1.lower().split()) - {"the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "to", "of", "and", "or", "for", "with", "that", "this", "it", "as", "by", "from"}
@@ -955,17 +974,33 @@ async def _pass_recombine_incubate(
 
                         mem_id = mint("mem")
                         skey = re.sub(r"\s+", " ", conjecture_text.strip().lower()).rstrip(" .!?,;:")
+                        content_hash = hashlib.sha256(skey.encode("utf-8")).hexdigest()
+
+                        vec_literal = None
+                        from shared.embeddings.implementations import FakeEmbedder
+
+                        if not isinstance(embedder, FakeEmbedder):
+                            try:
+                                vec = (await embedder.embed([conjecture_text]))[0]
+                                vec_literal = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+                            except Exception:
+                                log.exception("RECOMBINE embedding failed for %s", mem_id)
 
                         async with conn.cursor() as cur:
                             await cur.execute(
                                 "INSERT INTO memories "
-                                "(id, scope, statement, statement_key, kind, tier, "
-                                " epistemic_status, valid_from, ingested_at, source_episode_id) "
-                                "VALUES (%s, %s, %s, %s, 'fact', 'semantic', "
-                                "'conjecture', now(), now(), %s) "
-                                "ON CONFLICT DO NOTHING",
-                                (mem_id, scope_text, conjecture_text, skey, id1),
+                                "(id, scope, statement, statement_key, content_hash, kind, tier, "
+                                " embedding, epistemic_status, valid_from, ingested_at, source_episode_id) "
+                                "VALUES (%s, %s, %s, %s, %s, 'fact', 'semantic', "
+                                "        %s::vector, 'conjecture', now(), now(), %s) "
+                                "ON CONFLICT (scope, content_hash) WHERE valid_to IS NULL DO NOTHING "
+                                "RETURNING id",
+                                (mem_id, scope_text, conjecture_text, skey, content_hash,
+                                 vec_literal, src_epi),
                             )
+                            inserted = await cur.fetchone()
+                        if inserted is None:
+                            continue
 
                         ev = build_event(
                             short_type="memory.fact.stored",
@@ -975,7 +1010,7 @@ async def _pass_recombine_incubate(
                                 "mem_id": mem_id,
                                 "scope": scope_text,
                                 "epistemic_status": "conjecture",
-                                "source_episode_id": id1,
+                                "source_episode_id": src_epi,
                             },
                             actor="agent:consolidation",
                             source="curlyos-core/consolidation",

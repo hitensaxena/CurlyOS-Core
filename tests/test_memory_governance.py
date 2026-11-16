@@ -271,22 +271,15 @@ class TestInvalidate:
         now = datetime.now(timezone.utc)
         mem_id = mint("mem")
 
-        mc1 = AsyncMock()
-        mc1.fetchone.return_value = (None,)  # SELECT valid_to → None means not invalidated
+        mc = AsyncMock()
+        mc.fetchone.return_value = (now, None)  # atomic UPDATE RETURNING valid_to, superseded_by
 
-        mc2 = AsyncMock()
-        mc2.fetchone.return_value = (now, None)  # UPDATE RETURNING valid_to, superseded_by
-
-        cm1 = AsyncMock()
-        cm1.__aenter__ = AsyncMock(return_value=mc1)
-        cm1.__aexit__ = AsyncMock(return_value=False)
-
-        cm2 = AsyncMock()
-        cm2.__aenter__ = AsyncMock(return_value=mc2)
-        cm2.__aexit__ = AsyncMock(return_value=False)
+        cm = AsyncMock()
+        cm.__aenter__ = AsyncMock(return_value=mc)
+        cm.__aexit__ = AsyncMock(return_value=False)
 
         conn = AsyncMock()
-        conn.cursor = MagicMock(side_effect=[cm1, cm2])
+        conn.cursor = MagicMock(return_value=cm)
 
         conn_cm = AsyncMock()
         conn_cm.__aenter__ = AsyncMock(return_value=conn)
@@ -313,7 +306,8 @@ class TestInvalidate:
         existing_valid_to = datetime.now(timezone.utc)
 
         mc = AsyncMock()
-        mc.fetchone.return_value = (existing_valid_to,)  # Already has valid_to
+        # UPDATE returns no row, fallback SELECT finds the closed interval.
+        mc.fetchone.side_effect = [None, (existing_valid_to,)]
 
         cm = AsyncMock()
         cm.__aenter__ = AsyncMock(return_value=mc)

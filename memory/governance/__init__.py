@@ -9,6 +9,7 @@ Ported from ~/curlyos/core/curlyos/memory/governance.py.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from datetime import datetime
@@ -21,6 +22,18 @@ log = logging.getLogger("curlyos.memory.governance")
 
 _FK_VIOLATION = "23503"
 _REDACTED = "[REDACTED]"
+
+# Stronger writes promote an existing duplicate instead of being silently
+# dropped. Recall filters to canonical/belief, so a canonical write that
+# collided with a hypothesis row must not stay invisible.
+EPISTEMIC_RANK = {
+    "seed": 0, "possible_world": 0, "conjecture": 1,
+    "hypothesis": 2, "belief": 3, "canonical": 4,
+}
+
+
+def stronger_epistemic_status(new: str, old: str) -> bool:
+    return EPISTEMIC_RANK.get(new, 0) > EPISTEMIC_RANK.get(old, 0)
 _FORGET_ACTION_CLASS = "memory_forget_hard"
 _FORGET_LOCK_NS = 0x4D34F06D  # "M4 forget"
 
@@ -160,21 +173,54 @@ async def add(
 
     mem_id = mint("mem")
     skey = statement_key(statement)
+    content_hash = hashlib.sha256(skey.encode("utf-8")).hexdigest()
 
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "INSERT INTO memories "
-                    "(id, scope, statement, statement_key, kind, tier, embedding, "
+                    "(id, scope, statement, statement_key, content_hash, kind, tier, embedding, "
                     " epistemic_status, valid_from, valid_to, ingested_at, source_episode_id) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, NULL, "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, "
                     "        %s, COALESCE(%s, now()), NULL, now(), %s) "
+                    "ON CONFLICT (scope, content_hash) WHERE valid_to IS NULL DO NOTHING "
                     "RETURNING valid_from, ingested_at",
-                    (mem_id, scope_text, statement, skey, kind, tier,
+                    (mem_id, scope_text, statement, skey, content_hash, kind, tier,
                      epistemic_status, valid_from, source_episode_id),
                 )
-                vf, ia = await cur.fetchone()
+                inserted = await cur.fetchone()
+
+            if inserted is None:
+                # Duplicate of an active memory: return the existing row instead
+                # of writing a second copy or emitting a second stored event.
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT id, valid_from, ingested_at, epistemic_status FROM memories "
+                        "WHERE scope = %s AND content_hash = %s AND valid_to IS NULL",
+                        (scope_text, content_hash),
+                    )
+                    existing = await cur.fetchone()
+                if existing is None:
+                    raise RuntimeError("content_hash conflict but no active row found")
+                existing_id, existing_vf, existing_ia, existing_status = existing
+                promoted = False
+                if stronger_epistemic_status(epistemic_status, existing_status):
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "UPDATE memories SET epistemic_status = %s "
+                            "WHERE id = %s AND valid_to IS NULL",
+                            (epistemic_status, existing_id),
+                        )
+                    existing_status = epistemic_status
+                    promoted = True
+                return {"mem_id": existing_id, "valid_from": existing_vf,
+                        "ingested_at": existing_ia,
+                        "source_episode_id": source_episode_id,
+                        "deduplicated": True, "promoted": promoted,
+                        "epistemic_status": existing_status}
+
+            vf, ia = inserted
 
             ev = build_event(
                 short_type="memory.fact.stored",
@@ -193,7 +239,7 @@ async def add(
 
     await _emit(publisher, subject, stamped, ev["type"])
     return {"mem_id": mem_id, "valid_from": vf, "ingested_at": ia,
-            "source_episode_id": source_episode_id}
+            "source_episode_id": source_episode_id, "deduplicated": False}
 
 
 # ── invalidate ──────────────────────────────────────────────────────────────
@@ -211,19 +257,11 @@ async def invalidate(
         raise SupersededByNotFound(superseded_by)
 
     async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT valid_to FROM memories WHERE id = %s AND scope = %s",
-                (mem_id, scope_text),
-            )
-            existing = await cur.fetchone()
-        if existing is None:
-            raise MemoryNotFound(mem_id)
-        if existing[0] is not None:
-            raise AlreadyInvalidated(mem_id)
-
         try:
             async with conn.cursor() as cur:
+                # Atomic close: no SELECT-then-UPDATE window for concurrent
+                # invalidations to block on. A short lock timeout fails fast.
+                await cur.execute("SET LOCAL lock_timeout = '5s'")
                 await cur.execute(
                     "UPDATE memories SET valid_to = now(), superseded_by = %s "
                     "WHERE id = %s AND scope = %s AND valid_to IS NULL "
@@ -231,8 +269,15 @@ async def invalidate(
                     (superseded_by, mem_id, scope_text),
                 )
                 updated = await cur.fetchone()
-            if updated is None:
-                raise AlreadyInvalidated(mem_id)
+                if updated is None:
+                    await cur.execute(
+                        "SELECT valid_to FROM memories WHERE id = %s AND scope = %s",
+                        (mem_id, scope_text),
+                    )
+                    existing = await cur.fetchone()
+                    if existing is None:
+                        raise MemoryNotFound(mem_id)
+                    raise AlreadyInvalidated(mem_id)
             valid_to, sup_by = updated
 
             ev = build_event(
