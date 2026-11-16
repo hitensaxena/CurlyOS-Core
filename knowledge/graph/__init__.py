@@ -559,19 +559,19 @@ async def invalidate_entity(
         async with conn.cursor() as cur:
             await cur.execute(
                 "UPDATE knowledge_entities SET valid_to = now() WHERE id = %s "
-                "RETURNING id, valid_to",
+                "RETURNING id, valid_to, scope",
                 (entity_id,),
             )
             row = await cur.fetchone()
             if row is None:
                 raise ValueError(f"Entity {entity_id} not found")
 
-        # Stage event inside the same transaction
+        # Stage event inside the same transaction, scoped to the entity's owner.
         event = build_event(
             short_type="knowledge.entity.invalidated",
             subject=entity_id,
-            scope={"level": "user"},
-            data={"entity_id": entity_id},
+            scope=scope_parts(row[2]),
+            data={"entity_id": entity_id, "scope": row[2]},
         )
         await publisher.stage(event, conn)
 
@@ -588,19 +588,24 @@ async def invalidate_edge(
         async with conn.cursor() as cur:
             await cur.execute(
                 "UPDATE knowledge_edges SET valid_to = now() WHERE id = %s "
-                "RETURNING id, valid_to",
+                "RETURNING id, valid_to, src_entity_id",
                 (edge_id,),
             )
             row = await cur.fetchone()
             if row is None:
                 raise ValueError(f"Edge {edge_id} not found")
+            await cur.execute(
+                "SELECT scope FROM knowledge_entities WHERE id = %s", (row[2],)
+            )
+            scope_row = await cur.fetchone()
+            edge_scope = scope_row[0] if scope_row else "user"
 
-        # Stage event inside the same transaction
+        # Stage event inside the same transaction, scoped to the source entity.
         event = build_event(
             short_type="knowledge.edge.invalidated",
             subject=edge_id,
-            scope={"level": "user"},
-            data={"edge_id": edge_id},
+            scope=scope_parts(edge_scope),
+            data={"edge_id": edge_id, "scope": edge_scope},
         )
         await publisher.stage(event, conn)
 

@@ -87,9 +87,13 @@ async def lifespan(app: FastAPI):
     dispatcher = None
     dispatcher_task = None
     if os.environ.get("CURLYOS_DISPATCHER", "1").lower() not in ("0", "false", "off"):
+        from knowledge.graph.projection import register_graph_handler
         from shared.events.dispatch import Dispatcher, register_default_handlers
 
         register_default_handlers()
+        register_graph_handler(
+            lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row)
+        )
         dispatcher = Dispatcher(
             lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row), SCOPE,
         )
@@ -3107,13 +3111,17 @@ async def events_dispatch_status(scope: str = SCOPE):
 
 
 @app.post("/api/events/dispatch/run")
-async def events_dispatch_run(scope: str = SCOPE):
-    """Run one dispatcher pass now (the background loop does this every 2s)."""
+async def events_dispatch_run(scope: str = SCOPE, backfill: bool = False):
+    """Run one dispatcher pass now (the background loop does this every 2s).
+
+    ``backfill=true`` replays from seq 0 for handlers that have no watermark;
+    the default starts them at the current max seq.
+    """
     from shared.events.dispatch import dispatch_once, register_default_handlers
 
     register_default_handlers()
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
-    return await dispatch_once(pool, scope)
+    return await dispatch_once(pool, scope, backfill=backfill)
 
 
 @app.get("/api/agent-runs")
