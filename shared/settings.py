@@ -42,6 +42,8 @@ SETTINGS_REGISTRY: dict[str, dict[str, Any]] = {
                                  "description": "Bounded score boost for working-set members (0–1)."},
     "recall_lexical_boost": {"type": "float", "default": 0.0, "category": "recall",
                              "description": "Exact-term overlap correction for terse facts (0–1)."},
+    "recall_chatter_factor": {"type": "float", "default": 0.5, "category": "recall",
+                              "description": "Score multiplier for memories flagged as chatter; 1.0 disables the demotion (0–1)."},
     # working memory
     "working_set_enabled": {"type": "bool", "default": True, "category": "cognition",
                             "description": "Run the working-set refresh engine."},

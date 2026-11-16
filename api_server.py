@@ -680,7 +680,13 @@ def list_episodes(
             f"SELECT * FROM episodes WHERE {where} ORDER BY created_at DESC LIMIT %s OFFSET %s",
             params + [limit, offset],
         ).fetchall()
-    return {"items": rows, "count": len(rows)}
+        total = conn.execute(
+            f"SELECT count(*) AS n FROM episodes WHERE {where}", params,
+        ).fetchone()["n"]
+    # `count` is the page size (kept for existing callers); `total` is the
+    # number of matching episodes, which is what a header or a Next button
+    # actually needs.
+    return {"items": rows, "count": len(rows), "total": total}
 
 
 @app.get("/api/episodes/{epi_id}")
@@ -915,6 +921,7 @@ async def recall(body: RecallRequest):
         blend_half_life_days=float(await get_setting_cached(pool, "recall_blend_half_life_days", 30.0)),
         working_set_boost=float(await get_setting_cached(pool, "recall_working_set_boost", 0.08)),
         lexical_boost=float(await get_setting_cached(pool, "recall_lexical_boost", 0.0)),
+        chatter_factor=float(await get_setting_cached(pool, "recall_chatter_factor", 0.5)),
     )
 
     redis = _make_redis() if settings.cache_enabled else None
@@ -1469,13 +1476,6 @@ LOG_SOURCES: dict[str, str] = {
 
 # Autonomous-cognition engines surfaced on the systems dashboard. Activity is
 # derived from the `events` table by matching dotted event types via ILIKE.
-SYSTEM_ENGINES: list[dict[str, str]] = [
-    {"name": "consolidation", "label": "Memory Consolidation", "keyword": "consolidation"},
-    {"name": "reflection", "label": "Reflection", "keyword": "reflection"},
-    {"name": "meta", "label": "Meta-Cognition", "keyword": "meta"},
-    {"name": "memory", "label": "Memory / Episodes", "keyword": "memory"},
-    {"name": "knowledge", "label": "Knowledge Graph", "keyword": "knowledge"},
-]
 
 
 def _file_meta(path: str) -> dict[str, Any]:
@@ -1592,70 +1592,35 @@ def systems(request: Request):
         {"name": "api_server", "ok": True, "detail": f"uvicorn :{port}"},
     ]
 
+    # Engine status comes from the registry and the scheduler's own snapshot.
+    # This used to be faked by matching event types with ILIKE, which reported
+    # activity for engines that were disabled and none for engines that ran
+    # without emitting a matching event.
     engines: list[dict[str, Any]] = []
     try:
-        conn = get_conn()
-    except Exception as e:
-        # DB unreachable — still return infra + stats; mark every engine errored.
-        for eng in SYSTEM_ENGINES:
-            engines.append({"name": eng["name"], "label": eng["label"], "error": str(e)})
-        return {
-            "timestamp": now_iso(),
-            "infrastructure": infrastructure,
-            "stats": stats_data,
-            "engines": engines,
-            "scheduler": _scheduler_summary(request),
-        }
+        from shared.engines import REGISTRY
 
-    with conn:
-        for eng in SYSTEM_ENGINES:
-            like = f"%{eng['keyword']}%"
-            entry: dict[str, Any] = {
-                "name": eng["name"],
-                "label": eng["label"],
-                "last_run": None,
-                "last_event_type": None,
+        sched = getattr(request.app.state, "scheduler", None)
+        jobs = {job["name"]: job for job in sched.snapshot()["jobs"]} if sched else {}
+        for engine in REGISTRY.list():
+            desc = engine.descriptor()
+            job = jobs.get(engine.name, {})
+            engines.append({
+                "name": engine.name,
+                "label": desc.get("description") or engine.name,
+                "category": desc.get("category"),
+                "schedule": desc.get("schedule"),
+                "enabled": desc.get("enabled"),
+                "inputs": desc.get("inputs"),
+                "outputs": desc.get("outputs"),
+                "last_run": job.get("last_fired"),
+                "last_status": job.get("last_status"),
+                "last_error": job.get("last_error"),
                 "runs_24h": 0,
-                "runs_7d": 0,
                 "recent": [],
-            }
-            try:
-                latest = conn.execute(
-                    "SELECT type, created_at FROM events WHERE scope = %s AND type ILIKE %s "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    [SCOPE, like],
-                ).fetchone()
-                if latest:
-                    entry["last_run"] = latest["created_at"].isoformat() if latest["created_at"] else None
-                    entry["last_event_type"] = latest["type"]
-                entry["runs_24h"] = conn.execute(
-                    "SELECT count(*) AS n FROM events WHERE scope = %s AND type ILIKE %s "
-                    "AND created_at > now() - interval '24 hours'",
-                    [SCOPE, like],
-                ).fetchone()["n"]
-                entry["runs_7d"] = conn.execute(
-                    "SELECT count(*) AS n FROM events WHERE scope = %s AND type ILIKE %s "
-                    "AND created_at > now() - interval '7 days'",
-                    [SCOPE, like],
-                ).fetchone()["n"]
-                recent = conn.execute(
-                    "SELECT id, type, subject, created_at, data FROM events "
-                    "WHERE scope = %s AND type ILIKE %s ORDER BY created_at DESC LIMIT 5",
-                    [SCOPE, like],
-                ).fetchall()
-                entry["recent"] = [
-                    {
-                        "id": r["id"],
-                        "type": r["type"],
-                        "subject": r["subject"],
-                        "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                        "data": r["data"],
-                    }
-                    for r in recent
-                ]
-            except Exception as e:
-                entry = {"name": eng["name"], "label": eng["label"], "error": str(e)}
-            engines.append(entry)
+            })
+    except Exception as e:
+        engines = [{"name": "registry", "label": "Engine registry", "error": str(e)}]
 
     return {
         "timestamp": now_iso(),

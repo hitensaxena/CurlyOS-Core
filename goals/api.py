@@ -54,6 +54,13 @@ class RecordDecisionRequest(BaseModel):
     prediction_confidence: float | None = Field(default=None, ge=0, le=1)
 
 
+class RecordOutcomeRequest(BaseModel):
+    outcome: str = Field(min_length=1, max_length=4000)
+    valence: str = Field(default="too_early",
+                         pattern="^(success|partial|failure|mixed|too_early)$")
+    matched_prediction: bool | None = None
+
+
 class CreateOpportunityRequest(BaseModel):
     title: str = Field(min_length=1, max_length=300)
     description: str = Field(min_length=1, max_length=4000)
@@ -149,10 +156,26 @@ def make_router(
             prediction_confidence=body.prediction_confidence,
         )
 
-    # POST /decisions/{id}/review was retired 2026-11-11 (see the weekly
-    # reflection endpoint): it was the only writer of `outcomes`, and nothing
-    # ever called it, so `lessons` could not fill. goals.review_decision and
-    # cognition.decision_loop remain if decision scoring is revived.
+    # POST /decisions/{id}/review was retired 2026-11-11 on the belief that
+    # nothing called it. Something did: the webapp's "record outcome" form, via
+    # a proxy path that swallowed the 404. Restored here on top of
+    # cognition.decision_loop, which still scores the prediction.
+    @router.post("/decisions/{decision_id}/review")
+    async def decisions_review(decision_id: str, body: RecordOutcomeRequest):
+        from cognition.decision_loop import record_outcome_async
+
+        pool = await pool_factory()
+        async with pool.connection() as conn:
+            try:
+                outcome_id = await record_outcome_async(
+                    conn, scope=scope, decision_id=decision_id,
+                    summary=body.outcome, valence=body.valence,
+                    matched_prediction=body.matched_prediction,
+                )
+            except ValueError as exc:
+                raise HTTPException(404, str(exc))
+        return {"decision_id": decision_id, "outcome_id": outcome_id,
+                "status": "reviewed"}
 
     # ── opportunities ────────────────────────────────────────────────────────
     @router.get("/opportunities")
