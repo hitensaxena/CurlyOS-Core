@@ -56,6 +56,14 @@ _LABELLED = re.compile(
     r"\s*(?:is|are|was)?\s*[:=]\s*[`'\"]?([A-Za-z0-9._/+=:-]{6,})"
 )
 
+# The hardest class: an opaque value with no label at all, sitting near a
+# credential word. "Delta Exchange API keys (r1ay… / -jGSo…)" and "API key and
+# secret … account access (2N8r…)" both defeated the labelled pattern and were
+# only found because recall returned them after the first scrub pass.
+_PROXIMITY_VALUE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])")
+_PROXIMITY_WORD = re.compile(
+    r"(?i)(?:api|access|auth|secret|private)?[ _-]?(?:key|keys|secret|token|credential|credentials)")
+
 # Custody statements name a place, not a value.
 _CUSTODY = re.compile(
     r"(?i)(?:stored|stored in|kept|lives? in|located|in)\s+[`'\"]?(?:~|/|\.config|\.env)"
@@ -101,6 +109,28 @@ def scan_statement(statement: str) -> list[dict]:
             found.append({"kind": kind, "masked": _mask(match.group(0)),
                           "span": list(match.span()),
                           "context": _context(statement, match)})
+    for match in _PROXIMITY_VALUE.finditer(statement):
+        value = match.group(0)
+        # Require both a letter and a digit: that skips words, paths, hashes of
+        # pure digits, and ULIDs (which are still reported by other patterns
+        # only when they carry a credential word, which they never do here).
+        if not (any(c.isdigit() for c in value) and any(c.isalpha() for c in value)):
+            continue
+        # A filename or a version is not a secret: "intrl_…csv", "v1.2.3".
+        after = statement[match.end():match.end() + 1]
+        if ("." in value or after == "."
+                or statement[max(0, match.start() - 1):match.start()] in ("/", "\\")):
+            continue
+        # Presigned URLs carry an expiring signature, handled separately.
+        if "X-Amz-Credential=" in statement[max(0, match.start() - 40):match.start()]:
+            continue
+        window = statement[max(0, match.start() - 80):match.start()]
+        if not _PROXIMITY_WORD.search(window):
+            continue
+        found.append({"kind": "proximity", "masked": _mask(value),
+                      "span": list(match.span()),
+                      "context": _context(statement, match)})
+
     for match in _LABELLED.finditer(statement):
         value = match.group(1)
         # "password:" followed by a path or a word is custody, not a secret.
@@ -122,6 +152,25 @@ def scan_statement(statement: str) -> list[dict]:
     return found
 
 
+def pool2(dsn: str):
+    from psycopg_pool import AsyncConnectionPool
+
+    pool = AsyncConnectionPool(dsn, min_size=1, max_size=4, open=False)
+    return _PoolContext(pool)
+
+
+class _PoolContext:
+    def __init__(self, pool):
+        self.pool = pool
+
+    async def __aenter__(self):
+        await self.pool.open()
+        return self.pool
+
+    async def __aexit__(self, *exc):
+        await self.pool.close()
+
+
 async def main() -> int:
     import psycopg.rows
     from psycopg_pool import AsyncConnectionPool
@@ -129,6 +178,16 @@ async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--scope", default=None)
     parser.add_argument("--json", type=Path, default=None)
+    parser.add_argument("--apply", action="store_true",
+                        help="invalidate the credential-bearing memories and write "
+                             "redacted replacements. Reversible: the originals stay "
+                             "in the table, only closed.")
+    parser.add_argument("--only-ids", type=Path, default=None,
+                        help="restrict --apply to ids listed in this file (one per line)")
+    parser.add_argument("--apply-episodes", action="store_true",
+                        help="ALSO rewrite episode content in place. Irreversible — "
+                             "episodes have no valid_to, so the original text is "
+                             "gone. Take your own copy first if you want one.")
     args = parser.parse_args()
 
     scope = args.scope or os.environ.get("CURLYOS_SCOPE") or "user:usr_hiten"
@@ -186,7 +245,81 @@ async def main() -> int:
     if args.json:
         args.json.write_text(json.dumps(hits, indent=1))
         print(f"\nfull report: {args.json}")
-    print("\nnothing was modified")
+
+    if not args.apply:
+        print("\nnothing was modified (pass --apply to redact)")
+        return 0
+
+    from memory.governance import add, invalidate
+    from shared.events.implementations import PgOnlyPublisher
+
+    if args.only_ids:
+        allow = {line.strip() for line in args.only_ids.read_text().splitlines() if line.strip()}
+        hits = [h for h in hits if h["id"] in allow]
+        print(f"\nrestricted to {len(hits)} ids from {args.only_ids}")
+
+    publisher = PgOnlyPublisher()
+    redacted_memories = replaced_memories = redacted_episodes = 0
+
+    async with pool2(dsn) as pool:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                for hit in hits:
+                    await cur.execute(
+                        "SELECT statement, kind, tier, epistemic_status, source_episode_id, "
+                        "       valid_to FROM memories WHERE id = %s", (hit["id"],))
+                    row = await cur.fetchone()
+                    if row is None or row[5] is not None:
+                        continue
+                    statement, kind, tier, status, epi, _ = row
+                    found = scan_statement(statement)
+                    if not found:
+                        continue
+                    safe = redact(statement, [f["span"] for f in found])
+                    if safe == statement:
+                        continue
+                    created = await add(
+                        pool, publisher, scope, statement=safe,
+                        source_episode_id=epi, kind=kind, tier=tier,
+                        epistemic_status=status,
+                    )
+                    await invalidate(
+                        pool, publisher, scope, hit["id"],
+                        superseded_by=created.get("mem_id"),
+                        reason="credentials redacted",
+                    )
+                    redacted_memories += 1
+                    replaced_memories += 1
+
+        if not args.apply_episodes:
+            print("\nepisodes untouched (pass --apply-episodes to rewrite them in place; "
+                  "irreversible)")
+            print(f"\nredacted memories: {redacted_memories} (invalidated {replaced_memories} originals)")
+            return 0
+
+        # Episodes have no valid_to: they are raw capture, not derived facts.
+        # Redacting the span in place is the only option short of deleting the
+        # transcript, and the embedding is dropped so the sweep re-embeds from
+        # the redacted text.
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT id, content FROM episodes WHERE scope = %s", (scope,))
+                    for epi_id, content in await cur.fetchall():
+                        found = scan_statement(content or "")
+                        if not found:
+                            continue
+                        safe = redact(content or "", [f["span"] for f in found])
+                        if safe == content:
+                            continue
+                        await cur.execute(
+                            "UPDATE episodes SET content = %s, embedding = NULL "
+                            "WHERE id = %s", (safe, epi_id))
+                        redacted_episodes += 1
+
+    print(f"\nredacted memories: {redacted_memories} (invalidated {replaced_memories} originals)")
+    print(f"redacted episodes: {redacted_episodes} (embedding cleared for re-embed)")
     return 0
 
 
