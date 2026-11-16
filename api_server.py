@@ -1272,6 +1272,31 @@ def cognition_narrative(scope: str = SCOPE):
     return {"chapters": chapters, "themes": themes}
 
 
+@app.get("/api/cognition/narrative/current")
+async def cognition_narrative_current(scope: str = SCOPE):
+    """Compact narrative snapshot for prompt context.
+
+    One current chapter plus the active theme names — small enough to inject at
+    session start. The full records stay on GET /api/cognition/narrative.
+    """
+    from cognition.narrative import get_chapters, get_themes
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    chapters = await get_chapters(pool, scope)
+    themes = await get_themes(pool, scope)
+    chapter = chapters[0] if chapters else None
+    return {
+        "scope": scope,
+        "chapter": (
+            {"title": chapter["title"], "summary": chapter["summary"],
+             "start": chapter["start"], "end": chapter["end"]}
+            if chapter else None
+        ),
+        "themes": [{"name": t["name"], "frequency": t["frequency"]} for t in themes],
+        "counts": {"chapters": len(chapters), "themes": len(themes)},
+    }
+
+
 @app.post("/api/cognition/narrative/compose")
 async def compose_narrative(body: ComposeNarrativeRequest):
     query, since, domain = body.query, body.since, body.domain
