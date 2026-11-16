@@ -9,43 +9,20 @@ Reads the extracted triples JSON and:
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 
-# Pool adapter (works in both venvs)
 import psycopg
+import psycopg.rows
+from dotenv import load_dotenv
 
-DSN = os.environ.get("CURLYOS_DATABASE_URL", "postgresql://curlyos:***@localhost:54321/curlyos")
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+load_dotenv(ROOT / ".env")
+
+DSN = os.environ.get("CURLYOS_DATABASE_URL")
 SCOPE = "user:usr_hiten"
 MIND_DIR = Path.home() / "mind"
-
-
-class SyncPool:
-    def __init__(self, d):
-        self._dsn = d
-    def connection(self): return _CtxMgr(self._dsn)
-class _CtxMgr:
-    def __init__(self, d):
-        self._dsn = d
-        self._conn = None
-    async def __aenter__(self):
-        self._conn = psycopg.connect(self._dsn, autocommit=False)
-        return _CW(self._conn)
-    async def __aexit__(self, *a):
-        if self._conn:
-            self._conn.commit()
-            self._conn.close()
-class _CW:
-    def __init__(self, c): self._c = c
-    def cursor(self): return _CC(self._c)
-class _CC:
-    def __init__(self, c): self._c = c
-    async def __aenter__(self): return _CA(self._c.cursor())
-    async def __aexit__(self, *a): pass
-class _CA:
-    def __init__(self, c): self._c = c
-    async def execute(self, q, p=None): self._c.execute(q, p)
-    async def fetchone(self): return self._c.fetchone()
-    async def fetchall(self): return self._c.fetchall()
 
 
 def normalize_predicate(pred: str) -> str:
@@ -98,8 +75,14 @@ def normalize_predicate(pred: str) -> str:
 
 
 def classify_triple(triple: dict) -> str:
-    """Classify a triple into: identity, fact, relationship, project, health, skill, other."""
-    pred = triple.get("predicate", "").lower()
+    """Classify a triple into: identity, fact, relationship, project, health, skill, other.
+
+    The predicate is normalised first: the sets below are written in normalised
+    vocabulary (`prefers_editor`), while triples carry raw forms
+    (`preferred_editor`). Comparing raw values silently classified most identity
+    triples as plain facts, so they never reached identity_facts or the graph.
+    """
+    pred = normalize_predicate(triple.get("predicate", ""))
 
     identity_preds = {"name", "age", "nationality", "location", "role", "occupation",
                       "diagnosis", "relationship_status", "friendship_pattern",
@@ -125,11 +108,55 @@ def classify_triple(triple: dict) -> str:
     return "fact"
 
 
+async def _resolve_or_create(
+    pool, pub, scope: str, name: str, *, label: str = "Entity",
+) -> tuple[str, bool]:
+    """Reuse an existing node for this mention, or mint one.
+
+    A bulk import re-run must not mint a second copy of every entity; without
+    this the graph doubles on the second pass. `resolve_entity` matches on the
+    same normalised name the graph indexes on, plus known spelling variants.
+
+    Returns (entity_id, created).
+    """
+    from knowledge.graph import create_entity
+    from knowledge.resolution import ResolutionDecision, resolve_entity
+
+    decision, existing = await resolve_entity(name, scope=scope, pool=pool)
+    if decision is ResolutionDecision.MERGE and existing:
+        return existing, False
+    created = await create_entity(pool, pub, scope, name, label=label)
+    return created["id"], True
+
+
+async def _ensure_edge(
+    pool, pub, src_id: str, dst_id: str, rel_type: str, properties: dict,
+) -> bool:
+    """Create the edge only if this live (src, dst, rel_type) is not present.
+
+    `create_edge` mints a fresh id every call, so a re-run would add a second
+    copy of every relationship — exactly the duplicate edges the graph-hygiene
+    janitor was built to clean up. Returns True when a row was created.
+    """
+    from knowledge.graph import create_edge
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM knowledge_edges WHERE src_entity_id = %s "
+                "AND dst_entity_id = %s AND rel_type = %s AND valid_to IS NULL",
+                (src_id, dst_id, rel_type),
+            )
+            if await cur.fetchone() is not None:
+                return False
+    await create_edge(pool, pub, src_id, dst_id, rel_type, properties=properties)
+    return True
+
+
 async def import_triples(triples: list[dict], pool, pub, scope: str) -> dict:
     """Import triples into CurlyOS."""
     from memory.governance import record_episode, add
     from identity import propose_identity_fact
-    from knowledge.graph import create_entity, create_edge
 
     stats = {
         "episodes_created": 0,
@@ -196,15 +223,19 @@ async def import_triples(triples: list[dict], pool, pub, scope: str) -> dict:
 
                 # 3. Project into knowledge graph (entity + edge)
                 if category in ("identity", "relationship", "project", "skill"):
-                    # Create subject entity
-                    s_ent = await create_entity(pool, scope, subject, label="Person" if subject == "Hiten" else "Entity")
-                    # Create object entity
-                    o_ent = await create_entity(pool, scope, obj, label=category.capitalize())
-                    # Create edge
-                    await create_edge(pool, s_ent["id"], o_ent["id"], predicate,
-                        properties={"confidence": confidence, "source": source_file})
-                    stats["knowledge_entities"] += 2
-                    stats["knowledge_edges"] += 1
+                    s_id, s_new = await _resolve_or_create(
+                        pool, pub, scope, subject,
+                        label="Person" if subject == "Hiten" else "Entity",
+                    )
+                    o_id, o_new = await _resolve_or_create(
+                        pool, pub, scope, obj, label=category.capitalize(),
+                    )
+                    stats["knowledge_entities"] += int(s_new) + int(o_new)
+                    if await _ensure_edge(
+                        pool, pub, s_id, o_id, predicate,
+                        {"confidence": confidence, "source": source_file},
+                    ):
+                        stats["knowledge_edges"] += 1
 
             except Exception as e:
                 stats["errors"] += 1
@@ -226,12 +257,24 @@ async def main():
 
     print(f"Loaded {len(triples)} triples from {triples_path}")
 
-    pool = SyncPool(DSN)
+    if not DSN:
+        raise SystemExit("CURLYOS_DATABASE_URL is not set (checked the environment and .env)")
+
+    from psycopg_pool import AsyncConnectionPool
+
+    pool = AsyncConnectionPool(
+        DSN, min_size=1, max_size=4, open=False,
+        kwargs={"row_factory": psycopg.rows.tuple_row},
+    )
+    await pool.open()
     from shared.events.implementations import PgOnlyPublisher
     pub = PgOnlyPublisher()
 
     print(f"\nImporting into CurlyOS (scope={SCOPE})...")
-    stats = await import_triples(triples, pool, pub, SCOPE)
+    try:
+        stats = await import_triples(triples, pool, pub, SCOPE)
+    finally:
+        await pool.close()
 
     print(f"\n{'='*60}")
     print("IMPORT RESULTS:")
