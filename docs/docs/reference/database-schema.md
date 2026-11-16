@@ -465,16 +465,10 @@ Recurring themes identified across episodes and life chapters. Bi-temporal.
 
 ---
 
-#### `theme_chapter_links`
+#### `theme_chapter_links` — dropped
 
-Many-to-many join between themes and life chapters.
-
-| Column | Type | Notes |
-|---|---|---|
-| `theme_id` | `text NOT NULL REFERENCES themes(id)` | FK to themes |
-| `chapter_id` | `text NOT NULL REFERENCES life_chapters(id)` | FK to life_chapters |
-
-**Primary key:** `(theme_id, chapter_id)`
+Declared in the baseline and dropped by `0021_drop_dead_tables.sql`: nothing
+wrote or read it.
 
 ---
 
