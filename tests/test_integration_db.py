@@ -700,3 +700,68 @@ async def test_event_rebuild_restores_missing_rows(pool):
             await cur.execute("DELETE FROM knowledge_entities WHERE scope = %s", (scope,))
             await cur.execute("DELETE FROM identity_facts WHERE scope = %s", (scope,))
             await cur.execute("DELETE FROM memories WHERE scope = %s", (scope,))
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_delivers_once_and_retries(pool):
+    import json as _json
+
+    from shared.events import full_type
+    from shared.events.dispatch import Handler, dispatch_once, dispatch_status
+
+    scope = "test:dispatch"
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM events WHERE scope = %s", (scope,))
+            await cur.execute(
+                "DELETE FROM event_dispatch_watermarks WHERE scope = %s", (scope,)
+            )
+            for i in range(3):
+                await cur.execute(
+                    "INSERT INTO events (id, type, subject, scope, data) "
+                    "VALUES (%s, %s, %s, %s, %s::jsonb)",
+                    (mint("evt"), full_type("memory.fact.stored"),
+                     f"mem_{i}", scope, _json.dumps({"i": i})),
+                )
+
+    seen: list[int] = []
+
+    async def collect(event):
+        seen.append(event["seq"])
+
+    handler = Handler("collect", collect, frozenset({"memory.fact.stored"}))
+    first = await dispatch_once(pool, scope, handler_list=[handler], backfill=True)
+    assert first["dispatched"] == 3
+    assert len(seen) == 3
+
+    second = await dispatch_once(pool, scope, handler_list=[handler], backfill=True)
+    assert second["dispatched"] == 0
+
+    status = await dispatch_status(pool, scope)
+    assert all(item["lag"] == 0 for item in status["handlers"])
+
+    calls: list[int] = []
+
+    async def flaky(event):
+        calls.append(event["seq"])
+        if len(calls) == 2:
+            raise RuntimeError("boom")
+
+    failing = Handler("flaky", flaky, frozenset({"memory.fact.stored"}))
+    result = await dispatch_once(pool, scope, handler_list=[failing], backfill=True)
+    assert result["errors"] == 1
+    assert len(calls) == 2
+
+    async def recovered(event):
+        calls.append(event["seq"])
+
+    retried = Handler("flaky", recovered, frozenset({"memory.fact.stored"}))
+    result = await dispatch_once(pool, scope, handler_list=[retried], backfill=True)
+    assert result["dispatched"] == 2
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM events WHERE scope = %s", (scope,))
+            await cur.execute(
+                "DELETE FROM event_dispatch_watermarks WHERE scope = %s", (scope,)
+            )

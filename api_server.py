@@ -84,9 +84,27 @@ async def lifespan(app: FastAPI):
         scheduler.start()
     app.state.scheduler = scheduler
 
+    dispatcher = None
+    dispatcher_task = None
+    if os.environ.get("CURLYOS_DISPATCHER", "1").lower() not in ("0", "false", "off"):
+        from shared.events.dispatch import Dispatcher, register_default_handlers
+
+        register_default_handlers()
+        dispatcher = Dispatcher(
+            lambda: _get_async_pool(row_factory=psycopg.rows.tuple_row), SCOPE,
+        )
+        dispatcher_task = asyncio.create_task(dispatcher.run())
+    app.state.dispatcher = dispatcher
+
     yield
     if scheduler is not None:
         await scheduler.stop()
+    if dispatcher is not None:
+        dispatcher.stop()
+    if dispatcher_task is not None:
+        dispatcher_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await dispatcher_task
     sweep.cancel()
     prewarm.cancel()
     with contextlib.suppress(asyncio.CancelledError):
@@ -3077,6 +3095,25 @@ async def run_engine(name: str, body: EngineRunRequest | None = None):
     metrics.incr(f"engine.{name}.runs")
     metrics.timing(f"engine.{name}.latency", elapsed)
     return {"engine": name, "scope": scope, "duration_ms": round(elapsed, 1), "result": result}
+
+
+@app.get("/api/events/dispatch")
+async def events_dispatch_status(scope: str = SCOPE):
+    """Per-handler watermarks and lag over the event log."""
+    from shared.events.dispatch import dispatch_status
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    return await dispatch_status(pool, scope)
+
+
+@app.post("/api/events/dispatch/run")
+async def events_dispatch_run(scope: str = SCOPE):
+    """Run one dispatcher pass now (the background loop does this every 2s)."""
+    from shared.events.dispatch import dispatch_once, register_default_handlers
+
+    register_default_handlers()
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    return await dispatch_once(pool, scope)
 
 
 @app.get("/api/agent-runs")
