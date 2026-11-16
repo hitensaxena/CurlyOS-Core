@@ -26,6 +26,7 @@ log = logging.getLogger("curlyos.knowledge.projection")
 GRAPH_EVENT_TYPES = frozenset({
     "knowledge.entity.created",
     "knowledge.edge.created",
+    "knowledge.edge.restored",
     "knowledge.entity.invalidated",
     "knowledge.edge.invalidated",
 })
@@ -109,6 +110,25 @@ async def apply_event(
         )
         return cur.rowcount or 0
 
+    if short == "knowledge.edge.restored":
+        # Re-opens an edge that a backfilled invalidation closed. Replay order
+        # puts this last, so a rebuild ends with the edge open.
+        await cur.execute(
+            "INSERT INTO knowledge_edges "
+            "(id, src_entity_id, dst_entity_id, rel_type, properties, "
+            " valid_from, valid_to, source_episode_id, created_at) "
+            "VALUES (%s, %s, %s, %s, %s::jsonb, %s, NULL, %s, %s) "
+            "ON CONFLICT (id) DO UPDATE SET valid_to = NULL",
+            (
+                data.get("edge_id"), data.get("src_entity_id"),
+                data.get("dst_entity_id"), data.get("rel_type"),
+                json.dumps(data.get("properties") or {}),
+                _dt(data.get("valid_from"), created),
+                data.get("source_episode_id"), created,
+            ),
+        )
+        return cur.rowcount or 0
+
     if short == "knowledge.entity.invalidated":
         await cur.execute(
             "UPDATE knowledge_entities SET valid_to = %s "
@@ -171,6 +191,17 @@ async def _verify(
         )
         if tuple(row) != expected:
             _discrepancy(event_id, f"edge fields differ: row={tuple(row)} event={expected}")
+
+    elif short == "knowledge.edge.restored":
+        await cur.execute(
+            "SELECT valid_to FROM knowledge_edges WHERE id = %s",
+            (data.get("edge_id"),),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            _discrepancy(event_id, "edge restore did not create the row")
+        elif row[0] is not None:
+            _discrepancy(event_id, "edge restore did not reopen the row")
 
     elif short == "knowledge.entity.invalidated":
         await cur.execute(

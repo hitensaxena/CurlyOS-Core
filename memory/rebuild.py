@@ -28,6 +28,9 @@ _GRAPH_INVALIDATED = (
     full_type("knowledge.entity.invalidated"),
     full_type("knowledge.edge.invalidated"),
 )
+# A restored edge was invalidated (backfilled) and then explicitly reopened.
+# Replay must end with it open, so a restore wins over the invalidation.
+_GRAPH_RESTORED = (full_type("knowledge.edge.restored"),)
 _IDENTITY_TYPES = (full_type("identity.fact.updated"),)
 _MEMORY_TYPES = (
     full_type("memory.fact.stored"),
@@ -138,6 +141,7 @@ async def rebuild_graph(
     diff = await graph_diff(pool, scope, since)
     invalidated_entities = await _invalidated_ids(pool, scope, (_GRAPH_INVALIDATED[0],))
     invalidated_edges = await _invalidated_ids(pool, scope, (_GRAPH_INVALIDATED[1],))
+    invalidated_edges -= await _invalidated_ids(pool, scope, _GRAPH_RESTORED)
     restored_entities = 0
     restored_edges = 0
     skipped_edges = 0

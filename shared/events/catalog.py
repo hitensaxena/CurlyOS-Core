@@ -38,6 +38,7 @@ EVENT_CATALOG: dict[str, str] = {
     "knowledge.entity.invalidated": "MEMORY",
     "knowledge.edge.created": "MEMORY",
     "knowledge.edge.invalidated": "MEMORY",
+    "knowledge.edge.restored": "MEMORY",
     # ── cognition ───────────────────────────────────────────────────────────
     "metacog.assumption.created": "MEMORY",
     "metacog.model.created": "MEMORY",
