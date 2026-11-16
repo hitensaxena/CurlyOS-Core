@@ -509,3 +509,67 @@ async def test_attention_terms_raise_working_set_salience(pool):
         async with conn.cursor() as cur:
             await cur.execute("DELETE FROM alignment_signals WHERE scope = %s", (scope,))
             await cur.execute("DELETE FROM working_set WHERE scope = %s", (scope,))
+
+
+@pytest.mark.asyncio
+async def test_curiosity_scan_finds_gaps_once(pool):
+    from cognition.curiosity import dismiss_question, list_questions, scan_curiosity
+
+    pub = _Publisher()
+    scope = "test:curiosity"
+    epi = await record_episode(pool, pub, scope, content="curiosity probe")
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM curiosity_questions WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM identity_facts WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM knowledge_entities WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM goals WHERE scope = %s", (scope,))
+            await cur.execute(
+                "INSERT INTO goals (id, scope, title, description, status) "
+                "VALUES (%s, %s, %s, %s, 'active')",
+                (mint("goal"), scope, "Visit the ocean observatory",
+                 "Plan a trip to the ocean observatory"),
+            )
+            await cur.execute(
+                "INSERT INTO knowledge_entities (id, scope, name) VALUES (%s, %s, %s)",
+                (mint("ent"), scope, "Abyssal Sounding Array"),
+            )
+            noisy_id = mint("ent")
+            await cur.execute(
+                "INSERT INTO knowledge_entities (id, scope, name) VALUES (%s, %s, %s)",
+                (noisy_id, scope, "Artifact (mem_01ABCDEFGH1234567890)"),
+            )
+            await cur.execute(
+                "INSERT INTO identity_facts "
+                "(id, scope, predicate, object, confidence, epistemic_status, "
+                " valid_from, ingested_at, created_at, source_episode_id) "
+                "VALUES (%s, %s, %s, %s, 0.6, 'hypothesis', now(), now(), now(), %s)",
+                (mint("idf"), scope, "favourite_marine_biology_topic", "abyssal acoustics",
+                 epi["epi_id"]),
+            )
+
+    await add(pool, pub, scope, "An unrelated note about studio wiring", epi["epi_id"])
+
+    first = await scan_curiosity(pool, pub, scope)
+    assert first["goal_gaps"] >= 1
+    assert first["entity_gaps"] >= 1
+    assert first["hypothesis_gaps"] >= 1
+    assert first["inserted"] >= 3
+
+    second = await scan_curiosity(pool, pub, scope)
+    assert second["inserted"] == 0
+
+    questions = await list_questions(pool, scope)
+    assert len(questions) >= 3
+    assert all(q["evidence"].get("entity_id") != noisy_id for q in questions)
+    assert await dismiss_question(pool, pub, scope, questions[0]["id"], "not useful")
+    open_now = await list_questions(pool, scope)
+    assert all(q["id"] != questions[0]["id"] for q in open_now)
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM curiosity_questions WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM identity_facts WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM knowledge_entities WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM goals WHERE scope = %s", (scope,))
