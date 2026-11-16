@@ -800,7 +800,11 @@ async def propose_identity(body: ProposeIdentityRequest):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/graph")
-def get_graph(scope: str = SCOPE, limit: int = Query(default=20000, le=50000)):
+def get_graph(
+    scope: str = SCOPE,
+    limit: int = Query(default=20000, le=50000),
+    edges_per_node: int = Query(default=12, ge=0, le=200),
+):
     # Order by full-graph degree (not recency) so the hubs are always in view
     # when the limit truncates — recency ordering buried Hiten et al. behind a
     # window of the newest leaf nodes. Default limit is set well above the live
@@ -836,6 +840,22 @@ def get_graph(scope: str = SCOPE, limit: int = Query(default=20000, le=50000)):
     _idset = set(entity_ids)
     edges = [e for e in edges if e["src_entity_id"] in _idset and e["dst_entity_id"] in _idset]
 
+    # Hub nodes connect to almost everything, so a 400-node slice arrives with
+    # ~4,700 edges and the force simulation crawls. Keep at most N incident
+    # edges per node, in a stable order, so the slice stays drawable. 0 disables
+    # the cap (full edge set for programmatic callers).
+    if edges_per_node:
+        kept: list[dict] = []
+        per_node: dict[str, int] = {}
+        for edge in sorted(edges, key=lambda e: e["id"]):
+            src, dst = edge["src_entity_id"], edge["dst_entity_id"]
+            if per_node.get(src, 0) >= edges_per_node or per_node.get(dst, 0) >= edges_per_node:
+                continue
+            per_node[src] = per_node.get(src, 0) + 1
+            per_node[dst] = per_node.get(dst, 0) + 1
+            kept.append(edge)
+        edges = kept
+
     # degree is the FULL-graph degree (from SQL), so a node shows its true
     # connectivity even when some neighbors fall outside a truncated window.
     nodes = [
@@ -846,7 +866,14 @@ def get_graph(scope: str = SCOPE, limit: int = Query(default=20000, le=50000)):
         {"source": e["src_entity_id"], "target": e["dst_entity_id"], "rel_type": e["rel_type"]}
         for e in edges
     ]
-    return {"nodes": nodes, "links": links}
+    # The node list is a top-degree slice, so a client needs to know how much of
+    # the graph it is looking at. Counted separately: `len(nodes)` is the slice.
+    with get_conn() as conn:
+        total = conn.execute(
+            "SELECT count(*) AS n FROM knowledge_entities "
+            "WHERE scope = %s AND valid_to IS NULL", [scope],
+        ).fetchone()["n"]
+    return {"nodes": nodes, "links": links, "total": total}
 
 
 @app.get("/api/graph/{entity_id}/expand")
