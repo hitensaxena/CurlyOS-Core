@@ -101,13 +101,17 @@ def main():
     payload = [(mint("cor"), a, b, "related_to",
                 json.dumps({"inferred": True, "method": "bridge", "score": sim}))
                for a, b, sim in new]
-    with conn.cursor() as cur:
-        cur.executemany(
-            "INSERT INTO knowledge_edges (id, src_entity_id, dst_entity_id, rel_type, properties) "
-            "VALUES (%s, %s, %s, %s, %s)",
-            payload,
-        )
-    log(f"inserted {len(payload)} bridge edges")
+    from deploy.edge_events import stage_edge_created_events
+
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO knowledge_edges (id, src_entity_id, dst_entity_id, rel_type, properties) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                payload,
+            )
+        staged = stage_edge_created_events(cur, SCOPE, payload)
+    log(f"inserted {len(payload)} bridge edges ({staged} events)")
 
     # verify single component
     edges2 = conn.execute(

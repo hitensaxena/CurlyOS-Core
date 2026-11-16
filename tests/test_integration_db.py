@@ -1077,3 +1077,88 @@ async def test_backfilled_invalidation_is_not_a_discrepancy(pool):
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute("DELETE FROM events WHERE scope = %s", (scope,))
+
+
+async def _purge_scope_edges(cur, scope: str) -> None:
+    """Delete edges touching this scope's entities, either endpoint first."""
+    await cur.execute(
+        "DELETE FROM knowledge_edges WHERE src_entity_id IN "
+        "(SELECT id FROM knowledge_entities WHERE scope = %s) "
+        "OR dst_entity_id IN (SELECT id FROM knowledge_entities WHERE scope = %s)",
+        (scope, scope),
+    )
+
+
+@pytest.mark.asyncio
+async def test_script_written_edges_are_evented(pool):
+    """deploy/edge_events.py must describe exactly the rows it is given.
+
+    The densify and bridge scripts insert edges with raw SQL for speed. Without
+    this, their edges exist in the projection and nowhere in the event log, so
+    a rebuild reports them as unexplained and a backfill cannot track them.
+    """
+    from deploy.edge_events import stage_edge_created_events
+    from knowledge.graph.projection import build_graph_handler
+    from shared.events.dispatch import Handler, dispatch_once
+
+    scope = "test:script-edges"
+    src, dst, edge_id = mint("ent"), mint("ent"), mint("cor")
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM events WHERE scope = %s", (scope,))
+            await _purge_scope_edges(cur, scope)
+            await cur.execute(
+                "DELETE FROM knowledge_entities WHERE scope = %s", (scope,))
+            await cur.execute(
+                "INSERT INTO knowledge_entities (id, scope, name) "
+                "VALUES (%s, %s, %s), (%s, %s, %s)",
+                (src, scope, "Script Alpha", dst, scope, "Script Beta"),
+            )
+
+    payload = [(edge_id, src, dst, "related_to", json.dumps({"inferred": True}))]
+    # A sync connection on purpose: the densify/bridge scripts are synchronous,
+    # and the helper refuses an async cursor rather than silently writing nothing.
+    sync_conn = psycopg.connect(DSN)
+    try:
+        with sync_conn.transaction():
+            with sync_conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO knowledge_edges "
+                    "(id, src_entity_id, dst_entity_id, rel_type, properties) "
+                    "VALUES (%s, %s, %s, %s, %s)", payload,
+                )
+                staged = stage_edge_created_events(cur, scope, payload)
+    finally:
+        sync_conn.close()
+    assert staged == 1
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT data FROM events WHERE scope = %s "
+                "AND type LIKE %s", (scope, "%knowledge.edge.created"))
+            rows = await cur.fetchall()
+    assert len(rows) == 1
+    data = rows[0][0]
+    assert data["edge_id"] == edge_id
+    assert data["src_entity_id"] == src and data["dst_entity_id"] == dst
+    assert data["rel_type"] == "related_to"
+    assert data["properties"] == {"inferred": True}
+
+    # Replaying the event must not disturb the row the script already wrote.
+    async def factory():
+        return pool
+
+    base = build_graph_handler(pool_factory=factory)
+    handler = Handler("script_replay_test", base.fn, base.types)
+    await dispatch_once(pool, scope, handler_list=[handler], backfill=True)
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT count(*) FROM knowledge_edges WHERE id = %s", (edge_id,))
+            assert (await cur.fetchone())[0] == 1
+            await cur.execute("DELETE FROM events WHERE scope = %s", (scope,))
+            await _purge_scope_edges(cur, scope)
+            await cur.execute(
+                "DELETE FROM knowledge_entities WHERE scope = %s", (scope,))

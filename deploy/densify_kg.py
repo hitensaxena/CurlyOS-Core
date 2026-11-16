@@ -206,13 +206,19 @@ def main():
     # ── apply ─────────────────────────────────────────────────────────────────
     payload = [(mint("cor"), a, b, rel, json.dumps(props))
                for (a, b), (rel, props) in candidates.items()]
-    with conn.cursor() as cur:
-        cur.executemany(
-            "INSERT INTO knowledge_edges (id, src_entity_id, dst_entity_id, rel_type, properties) "
-            "VALUES (%s, %s, %s, %s, %s)",
-            payload,
-        )
-    log(f"inserted {len(payload)} edges")
+    from deploy.edge_events import stage_edge_created_events
+
+    # One transaction: an edge without its event is a row the projection cannot
+    # explain, and rebuild/backfill would treat it as never having existed.
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO knowledge_edges (id, src_entity_id, dst_entity_id, rel_type, properties) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                payload,
+            )
+        staged = stage_edge_created_events(cur, SCOPE, payload)
+    log(f"inserted {len(payload)} edges ({staged} events)")
     conn.close()
     log("DONE")
 
