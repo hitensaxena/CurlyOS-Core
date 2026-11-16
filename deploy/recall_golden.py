@@ -32,7 +32,7 @@ SCOPE = os.environ.get("CURLYOS_SCOPE", "user:usr_hiten")
 def _auth() -> dict[str, str]:
     """Bearer token when the API gate is armed (dormant by default)."""
     token = os.environ.get("CURLYOS_API_TOKEN", "").strip()
-    return {"Authorization": f"Bearer {token}"} if token else ""
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 
