@@ -14,6 +14,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
+from shared import metrics
 from shared.events.dispatch import Handler, register, registered
 
 log = logging.getLogger("curlyos.knowledge.projection")
@@ -100,8 +101,71 @@ async def apply_event(
     return 0
 
 
+def _discrepancy(event_id: str, detail: str) -> None:
+    metrics.incr("event.graph_projection.discrepancies")
+    log.warning("graph projection shadow discrepancy event=%s: %s", event_id, detail)
+
+
+async def _verify(
+    cur: Any, short: str, data: dict, scope: str, event_id: str,
+) -> None:
+    """Compare the stored row with the event payload. Report, never repair."""
+    if short == "knowledge.entity.created":
+        await cur.execute(
+            "SELECT name, label, scope, epistemic_status FROM knowledge_entities "
+            "WHERE id = %s",
+            (data.get("entity_id"),),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            _discrepancy(event_id, "entity row missing after apply")
+            return
+        expected = (
+            data.get("name") or data.get("entity_id"),
+            data.get("label") or "Entity",
+            scope,
+            data.get("epistemic_status") or "canonical",
+        )
+        if tuple(row) != expected:
+            _discrepancy(event_id, f"entity fields differ: row={tuple(row)} event={expected}")
+
+    elif short == "knowledge.edge.created":
+        await cur.execute(
+            "SELECT src_entity_id, dst_entity_id, rel_type FROM knowledge_edges "
+            "WHERE id = %s",
+            (data.get("edge_id"),),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            _discrepancy(event_id, "edge row missing after apply")
+            return
+        expected = (
+            data.get("src_entity_id"), data.get("dst_entity_id"), data.get("rel_type"),
+        )
+        if tuple(row) != expected:
+            _discrepancy(event_id, f"edge fields differ: row={tuple(row)} event={expected}")
+
+    elif short == "knowledge.entity.invalidated":
+        await cur.execute(
+            "SELECT valid_to FROM knowledge_entities WHERE id = %s",
+            (data.get("entity_id"),),
+        )
+        row = await cur.fetchone()
+        if row is None or row[0] is None:
+            _discrepancy(event_id, "entity invalidation did not close the row")
+
+    elif short == "knowledge.edge.invalidated":
+        await cur.execute(
+            "SELECT valid_to FROM knowledge_edges WHERE id = %s",
+            (data.get("edge_id"),),
+        )
+        row = await cur.fetchone()
+        if row is None or row[0] is None:
+            _discrepancy(event_id, "edge invalidation did not close the row")
+
+
 def build_graph_handler(
-    pool_factory: Callable[[], Awaitable[Any]],
+    pool_factory: Callable[[], Awaitable[Any]], *, shadow: bool = True,
 ) -> Handler:
     async def _apply(event: dict) -> None:
         pool = await pool_factory()
@@ -112,13 +176,19 @@ def build_graph_handler(
                         cur, event["short_type"], event["data"],
                         event["scope"], event["created_at"],
                     )
+                    metrics.incr("event.graph_projection.applied")
+                    if shadow:
+                        await _verify(
+                            cur, event["short_type"], event["data"],
+                            event["scope"], event["subject"],
+                        )
 
     return Handler("graph_projection", _apply, GRAPH_EVENT_TYPES)
 
 
 def register_graph_handler(
-    pool_factory: Callable[[], Awaitable[Any]],
+    pool_factory: Callable[[], Awaitable[Any]], *, shadow: bool = True,
 ) -> None:
     if "graph_projection" in {handler.name for handler in registered()}:
         return
-    register(build_graph_handler(pool_factory))
+    register(build_graph_handler(pool_factory, shadow=shadow))
