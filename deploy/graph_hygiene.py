@@ -33,6 +33,7 @@ Idempotent: every step can run twice without changing the result twice.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -426,6 +427,26 @@ _DUP_HAVING = """
          AND count(DISTINCT properties) = 1"""
 
 
+def _stage_edge_invalidations(conn, victims: list[tuple], reason: str) -> None:
+    """Event a deletion so the graph remains rebuildable from the log."""
+    from shared.events import build_event
+    from shared.scope import scope_parts
+
+    for edge_id, scope in victims:
+        event = build_event(
+            short_type="knowledge.edge.invalidated",
+            subject=edge_id,
+            scope=scope_parts(scope),
+            data={"edge_id": edge_id, "reason": reason},
+            actor="system",
+            source="curlyos-core/deploy/graph_hygiene",
+        )
+        conn.execute(
+            "INSERT INTO events (id, type, subject, scope, data) VALUES (%s, %s, %s, %s, %s)",
+            (event["id"], event["type"], event["subject"], scope, json.dumps(event["data"])),
+        )
+
+
 def step_janitor(conn, approve: bool, merge_aliases: bool = False) -> None:
     dup = one(conn, f"""
       WITH d AS (SELECT src_entity_id, dst_entity_id, rel_type, count(*) k
@@ -455,19 +476,37 @@ def step_janitor(conn, approve: bool, merge_aliases: bool = False) -> None:
         return
 
     with conn.transaction():
-        n = conn.execute(f"""
-          WITH d AS (SELECT min(id) keep FROM knowledge_edges {_DUP_HAVING})
-          DELETE FROM knowledge_edges e USING d WHERE e.id <> d.keep
-            AND EXISTS (SELECT 1 FROM knowledge_edges k WHERE k.id = d.keep
-                        AND k.src_entity_id = e.src_entity_id
-                        AND k.dst_entity_id = e.dst_entity_id
-                        AND k.rel_type = e.rel_type)""").rowcount
-        print(f"deleted duplicate edges   : {n}")
-        n = conn.execute("""
-          DELETE FROM knowledge_edges e USING knowledge_entities s, knowledge_entities d
-          WHERE s.id = e.src_entity_id AND d.id = e.dst_entity_id
-            AND (s.valid_to IS NOT NULL OR d.valid_to IS NOT NULL)""").rowcount
-        print(f"deleted stale edges       : {n}")
+        dup_victims = conn.execute("""
+          SELECT e.id, s.scope FROM knowledge_edges e
+          JOIN knowledge_entities s ON s.id = e.src_entity_id
+          WHERE e.id <> (
+            SELECT min(k.id) FROM knowledge_edges k
+            WHERE k.src_entity_id = e.src_entity_id
+              AND k.dst_entity_id = e.dst_entity_id
+              AND k.rel_type = e.rel_type
+              AND coalesce(k.source_episode_id, '') = coalesce(e.source_episode_id, '')
+              AND k.properties = e.properties
+          )""").fetchall()
+        if dup_victims:
+            conn.execute(
+                "DELETE FROM knowledge_edges WHERE id = ANY(%s)",
+                ([victim[0] for victim in dup_victims],),
+            )
+            _stage_edge_invalidations(conn, dup_victims, "graph_hygiene:duplicate")
+        print(f"deleted duplicate edges   : {len(dup_victims)}")
+
+        stale_victims = conn.execute("""
+          SELECT e.id, s.scope FROM knowledge_edges e
+          JOIN knowledge_entities s ON s.id = e.src_entity_id
+          JOIN knowledge_entities d ON d.id = e.dst_entity_id
+          WHERE s.valid_to IS NOT NULL OR d.valid_to IS NOT NULL""").fetchall()
+        if stale_victims:
+            conn.execute(
+                "DELETE FROM knowledge_edges WHERE id = ANY(%s)",
+                ([victim[0] for victim in stale_victims],),
+            )
+            _stage_edge_invalidations(conn, stale_victims, "graph_hygiene:stale")
+        print(f"deleted stale edges       : {len(stale_victims)}")
         if merge_aliases:
             n = conn.execute("""
               UPDATE knowledge_edges e SET src_entity_id = a.entity_id

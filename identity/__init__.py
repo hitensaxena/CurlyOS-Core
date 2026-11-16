@@ -62,6 +62,7 @@ async def propose_identity_fact(
             existing = await cur.fetchone()
 
         action_taken = "inserted"
+        superseded_id = None
 
         if existing:
             existing_id, existing_conf, existing_obj = existing
@@ -69,6 +70,7 @@ async def propose_identity_fact(
                 # New fact supersedes old — insert new FIRST,
                 # THEN invalidate old (to satisfy FK on superseded_by)
                 action_taken = "superseded"
+                superseded_id = existing_id
             else:
                 # Lower or equal confidence than existing — skip
                 return {
@@ -116,6 +118,10 @@ async def propose_identity_fact(
                 "epistemic_status": epistemic_status,
                 "action_taken": action_taken,
                 "source_episode_id": source_episode_id,
+                "valid_from": vf.isoformat() if vf else now.isoformat(),
+                "valid_to": None,
+                "superseded_by": None,
+                "superseded_id": superseded_id,
             },
         )
         if publisher is not None:
