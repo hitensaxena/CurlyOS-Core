@@ -90,14 +90,18 @@ async def detect_memory_conflicts(
     llm_client: Any = None,
     llm_model: str = "",
     candidate_limit: int = 200,
-    similarity_floor: float = 0.80,
-    similarity_ceiling: float = 0.97,
+    similarity_floor: float = 0.65,
+    similarity_ceiling: float = 0.92,
     max_pairs: int = 30,
     batch_size: int = 8,
-) -> tuple[list[dict], int, bool]:
-    """Return (candidates, pair_count, skipped_no_llm)."""
+) -> tuple[list[dict], int, bool, int]:
+    """Return (candidates, pair_count, skipped_no_llm, classifier_errors)."""
     if llm_client is None:
-        return [], 0, True
+        return [], 0, True, 0
+    if similarity_floor > similarity_ceiling:
+        raise ContradictionError(
+            f"similarity floor {similarity_floor} exceeds ceiling {similarity_ceiling}"
+        )
 
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
@@ -112,15 +116,23 @@ async def detect_memory_conflicts(
                 "       1 - (m1.embedding <=> m2.embedding) AS sim "
                 "FROM recent m1 JOIN recent m2 ON m1.id < m2.id "
                 "WHERE 1 - (m1.embedding <=> m2.embedding) BETWEEN %s AND %s "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM contradiction_candidates c "
+                "  WHERE c.scope = %s AND c.kind = 'memory_memory' "
+                "    AND c.left_id = m1.id AND c.right_id = m2.id"
+                ") "
                 "ORDER BY sim DESC LIMIT %s",
-                (scope, candidate_limit, similarity_floor, similarity_ceiling, max_pairs),
+                (scope, candidate_limit, similarity_floor, similarity_ceiling,
+                 scope, max_pairs),
             )
             pairs = await cur.fetchall()
 
     if not pairs:
-        return [], 0, False
+        return [], 0, False, 0
 
     candidates: list[dict] = []
+    classifier_errors = 0
+    batch_count = max(1, (len(pairs) + batch_size - 1) // batch_size)
     for start in range(0, len(pairs), batch_size):
         batch = pairs[start:start + batch_size]
         prompts = [(row[1], row[3]) for row in batch]
@@ -136,6 +148,7 @@ async def detect_memory_conflicts(
             )
             records = json_records(resp.choices[0].message.content)
         except Exception:
+            classifier_errors += 1
             log.warning("contradiction classifier failed for a batch", exc_info=True)
             continue
 
@@ -164,7 +177,11 @@ async def detect_memory_conflicts(
                     "relation": "contradiction",
                 },
             })
-    return candidates, len(pairs), False
+    if classifier_errors and classifier_errors == batch_count:
+        raise ContradictionError(
+            f"contradiction classifier failed for all {batch_count} batches"
+        )
+    return candidates, len(pairs), False, classifier_errors
 
 
 async def scan(
@@ -175,13 +192,13 @@ async def scan(
     llm_client: Any = None,
     llm_model: str = "",
     candidate_limit: int = 200,
-    similarity_floor: float = 0.80,
-    similarity_ceiling: float = 0.97,
+    similarity_floor: float = 0.65,
+    similarity_ceiling: float = 0.92,
     max_pairs: int = 30,
     batch_size: int = 8,
 ) -> dict:
     identity = await detect_identity_conflicts(pool, scope)
-    memory, pair_count, skipped_no_llm = await detect_memory_conflicts(
+    memory, pair_count, skipped_no_llm, classifier_errors = await detect_memory_conflicts(
         pool, scope,
         llm_client=llm_client, llm_model=llm_model,
         candidate_limit=candidate_limit,
@@ -197,6 +214,19 @@ async def scan(
         async with conn.transaction():
             async with conn.cursor() as cur:
                 for candidate in candidates:
+                    # Re-check validity at insertion: a consolidation or a
+                    # resolution can close one side during the LLM calls.
+                    table = (
+                        "memories" if candidate["kind"] == "memory_memory"
+                        else "identity_facts"
+                    )
+                    await cur.execute(
+                        f"SELECT count(*) FROM {table} "
+                        "WHERE id = ANY(%s) AND valid_to IS NULL",
+                        ([candidate["left_id"], candidate["right_id"]],),
+                    )
+                    if (await cur.fetchone())[0] != 2:
+                        continue
                     await cur.execute(
                         "INSERT INTO contradiction_candidates "
                         "(id, scope, kind, left_id, right_id, similarity, reason, "
@@ -220,7 +250,8 @@ async def scan(
                         subject=scope,
                         scope=scope_parts(scope),
                         data={"inserted": inserted, "identity": len(identity),
-                              "memory": len(memory), "pairs": pair_count},
+                              "memory": len(memory), "pairs": pair_count,
+                              "classifier_errors": classifier_errors},
                         actor="agent:contradiction",
                         source="curlyos-core/cognition",
                     )
@@ -239,6 +270,7 @@ async def scan(
         "pairs_examined": pair_count,
         "inserted": inserted,
         "skipped_no_llm": skipped_no_llm,
+        "classifier_errors": classifier_errors,
     }
 
 
@@ -299,23 +331,37 @@ async def resolve_candidate(
         raise ContradictionError(f"candidate is already {status}")
 
     victim = keeper = None
+    already_closed = False
     if action in ("supersede_left", "supersede_right"):
         victim, keeper = (
             (left_id, right_id) if action == "supersede_left" else (right_id, left_id)
         )
-        if kind == "memory_memory":
-            from memory.governance import invalidate
+        try:
+            if kind == "memory_memory":
+                from memory.governance import (
+                    AlreadyInvalidated, MemoryNotFound, SupersededByNotFound, invalidate,
+                )
 
-            await invalidate(
-                pool, publisher, scope, victim,
-                superseded_by=keeper, reason="contradiction_resolution",
-            )
-        else:
-            from identity import invalidate_identity_fact
+                await invalidate(
+                    pool, publisher, scope, victim,
+                    superseded_by=keeper, reason="contradiction_resolution",
+                )
+            else:
+                from identity import invalidate_identity_fact
 
-            await invalidate_identity_fact(
-                pool, publisher, scope, victim, superseded_by=keeper,
-            )
+                outcome = await invalidate_identity_fact(
+                    pool, publisher, scope, victim, superseded_by=keeper,
+                )
+                if outcome.get("valid_to") is None:
+                    already_closed = True
+        except (AlreadyInvalidated, SupersededByNotFound):
+            # The intended end state already holds; close the proposal.
+            already_closed = True
+        except MemoryNotFound:
+            # A stale proposal (the victim vanished); dismiss rather than
+            # leaving it open forever.
+            already_closed = True
+            action = "dismiss"
 
     new_status = "dismissed" if action == "dismiss" else "resolved"
     async with pool.connection() as conn:
@@ -340,5 +386,5 @@ async def resolve_candidate(
 
     return {
         "id": candidate_id, "status": new_status, "action": action,
-        "victim": victim, "keeper": keeper,
+        "victim": victim, "keeper": keeper, "already_closed": already_closed,
     }

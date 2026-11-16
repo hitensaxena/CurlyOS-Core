@@ -926,7 +926,8 @@ async def working_set_unpin(memory_id: str, scope: str = SCOPE):
 
 @app.get("/api/cognition/contradictions")
 async def contradictions_list(
-    scope: str = SCOPE, status: str = "open", limit: int = Query(default=50, le=200),
+    scope: str = SCOPE, status: str = "open",
+    limit: int = Query(default=50, ge=1, le=200),
 ):
     """Open contradiction proposals. Nothing here has been applied."""
     from cognition.contradiction import list_candidates
@@ -2596,9 +2597,9 @@ def _register_engines() -> None:
             llm_client=llm,
             llm_model=model,
             similarity_floor=float(await get_setting_cached(
-                pool, "contradiction_similarity_floor", 0.80)),
+                pool, "contradiction_similarity_floor", 0.65)),
             similarity_ceiling=float(await get_setting_cached(
-                pool, "contradiction_similarity_ceiling", 0.97)),
+                pool, "contradiction_similarity_ceiling", 0.92)),
             max_pairs=int(await get_setting_cached(pool, "contradiction_max_pairs", 30)),
         )
 

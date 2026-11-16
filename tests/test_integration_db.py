@@ -376,3 +376,49 @@ async def test_decision_reviews_become_intentions_once(pool):
         async with conn.cursor() as cur:
             await cur.execute("DELETE FROM intentions WHERE scope = %s", (scope,))
             await cur.execute("DELETE FROM decisions WHERE scope = %s", (scope,))
+
+
+@pytest.mark.asyncio
+async def test_resolve_already_closed_identity_candidate(pool):
+    from identity import invalidate_identity_fact
+
+    pub = _Publisher()
+    scope = "test:integration"
+    epi = await record_episode(pool, pub, scope, content="already closed conflict")
+    ids = []
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            for obj in ("alpha", "beta"):
+                fact_id = mint("idf")
+                ids.append(fact_id)
+                await cur.execute(
+                    "INSERT INTO identity_facts "
+                    "(id, scope, predicate, object, confidence, epistemic_status, "
+                    " valid_from, ingested_at, created_at, source_episode_id) "
+                    "VALUES (%s, %s, %s, %s, 0.9, 'canonical', now(), now(), now(), %s)",
+                    (fact_id, scope, "already_closed_predicate", obj, epi["epi_id"]),
+                )
+
+    await scan(pool, pub, scope)
+    candidates = await list_candidates(pool, scope)
+    candidate = next(
+        c for c in candidates
+        if c["kind"] == "identity_identity" and c.get("predicate") == "already_closed_predicate"
+    )
+    # Close the victim before the user resolves the proposal.
+    await invalidate_identity_fact(pool, pub, scope, candidate["left_id"])
+
+    resolved = await resolve_candidate(pool, pub, scope, candidate["id"], "supersede_left")
+    assert resolved["status"] == "resolved"
+    assert resolved["already_closed"] is True
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE identity_facts SET valid_to = now() "
+                "WHERE scope = %s AND predicate = 'already_closed_predicate' AND valid_to IS NULL",
+                (scope,),
+            )
+            await cur.execute(
+                "DELETE FROM contradiction_candidates WHERE scope = %s", (scope,),
+            )
