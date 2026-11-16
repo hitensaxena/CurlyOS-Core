@@ -113,6 +113,22 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def api_version_alias(request, call_next):
+    """Serve /api/v1/* as /api/* and stamp the version on every response.
+
+    Non-breaking: existing /api clients keep working, while new ones can pin
+    /api/v1. Only the path is rewritten; query and body pass through untouched.
+    """
+    path = request.scope.get("path", "")
+    if path.startswith("/api/v1/"):
+        request.scope["path"] = "/api/" + path[len("/api/v1/"):]
+        request.scope["raw_path"] = request.scope["path"].encode()
+    response = await call_next(request)
+    response.headers["X-CurlyOS-API-Version"] = "1"
+    return response
+
+
 # Goal OS router (Phase G) — the first router split out of this file; new
 # endpoint groups go in <package>/api.py from here on (curlyos-final/03 §6).
 def _include_goal_router() -> None:
@@ -404,6 +420,12 @@ def get_memory(mem_id: str):
 
 @app.post("/api/memories")
 async def add_memory(body: AddMemoryRequest):
+    from shared.scope import ScopeNotAllowed, require_scope
+
+    try:
+        require_scope(SCOPE)
+    except ScopeNotAllowed:
+        raise HTTPException(status_code=403, detail=f"scope not allowed: {SCOPE}")
     try:
         import hashlib
 
@@ -471,25 +493,35 @@ async def invalidate_memory(mem_id: str, body: InvalidateRequest | None = None):
     # concurrent invalidations of the same row wait on each other. The short
     # lock timeout makes contention fail fast instead of blocking the event
     # loop (this route used to hold a synchronous connection inside async).
+    from shared.scope import allowed_scopes, scope_allowed
+
+    allowed = allowed_scopes()
+    update_sql = (
+        "UPDATE memories SET valid_to = now() "
+        "WHERE id = %s AND valid_to IS NULL"
+    )
+    params: list[Any] = [mem_id]
+    if allowed is not None:
+        update_sql += " AND scope = ANY(%s)"
+        params.append(list(allowed))
+    update_sql += " RETURNING valid_to, scope"
+
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SET LOCAL lock_timeout = '5s'")
-                await cur.execute(
-                    "UPDATE memories SET valid_to = now() "
-                    "WHERE id = %s AND valid_to IS NULL "
-                    "RETURNING valid_to, scope",
-                    (mem_id,),
-                )
+                await cur.execute(update_sql, tuple(params))
                 row = await cur.fetchone()
                 if row is None:
                     await cur.execute(
-                        "SELECT valid_to FROM memories WHERE id = %s", (mem_id,)
+                        "SELECT valid_to, scope FROM memories WHERE id = %s", (mem_id,)
                     )
                     existing = await cur.fetchone()
                     if existing is None:
                         raise HTTPException(404, "Memory not found")
+                    if not scope_allowed(existing[1], allowed):
+                        raise HTTPException(403, f"scope not allowed: {existing[1]}")
                     raise HTTPException(409, "Already invalidated")
     except psycopg.errors.LockNotAvailable:
         raise HTTPException(409, "Memory is locked by another write; retry")
@@ -579,6 +611,12 @@ async def propose_identity(body: ProposeIdentityRequest):
     resolution, supersession, and confidence gating live in the identity
     module, not here. A missing source_episode_id gets a provenance episode
     recorded first (every derived fact traces to an episode)."""
+    from shared.scope import ScopeNotAllowed, require_scope
+
+    try:
+        require_scope(SCOPE)
+    except ScopeNotAllowed:
+        raise HTTPException(status_code=403, detail=f"scope not allowed: {SCOPE}")
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from identity import propose_identity_fact
     from memory.governance import record_episode
@@ -1651,6 +1689,7 @@ async def ingest(body: IngestRequest, background_tasks: BackgroundTasks):
            "epistemic_status"?: "canonical"|"hypothesis"|"belief" (default "canonical")}
     """
     from memory.ingest_service import ingest_text, strip_scaffolding
+    from shared.scope import ScopeNotAllowed, require_scope
 
     raw = body.text.strip()
     if not raw:
@@ -1663,6 +1702,10 @@ async def ingest(body: IngestRequest, background_tasks: BackgroundTasks):
         return {"skipped": "scaffolding-only"}
     source_ref = body.source_ref or "web:capture"
     scope = body.scope or SCOPE
+    try:
+        require_scope(scope)
+    except ScopeNotAllowed:
+        raise HTTPException(status_code=403, detail=f"scope not allowed: {scope}")
     add_memory = body.add_memory
     extract_knowledge = body.extract_knowledge
 
