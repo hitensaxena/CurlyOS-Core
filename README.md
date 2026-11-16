@@ -76,7 +76,7 @@ single fully-connected knowledge graph · 0 orphans
 - **Episodic provenance** — every distilled fact MUST cite a `source_episode_id`. No fact exists without the experience that produced it.
 - **Epistemic axis** — `hypothesis → belief → canonical` (plus producer-specific `seed`/`conjecture`/`possible_world`). Confidence is a first-class dimension, classified by an LLM at capture time.
 - **Capture hygiene** — ingestion strips harness/tooling scaffolding (system reminders, task notifications, command wrappers) so only genuine content becomes memory.
-- **Event sourcing** — writes emit CloudEvents; projections (like the graph) are rebuildable from the episodic log.
+- **Event sourcing** — writes emit CloudEvents into an append-only event log. `deploy/rebuild_projections.py` reports drift and restores graph and identity projections from it; memory facts written after 2026-11-16 carry their statement and are replayable too. Older events and historical graph-hygiene deletions predate those fields and are reported as untracked.
 
 ### LLM backend — tiered routing
 Every LLM call goes through a **failover chain** (`shared/models.py`), and work is routed to one of three **task tiers** so the right model does the right job:
@@ -319,7 +319,7 @@ mypy memory/ knowledge/ identity/ cognition/ shared/
 
 - Named Docker volumes (`curlyos_pgdata`, `curlyos_redisdata`) survive `docker compose down`.
 - Facts are **never deleted** — only invalidated (`valid_to = now()`).
-- Append-only episode log — full provenance chain, rebuildable projections.
+- Append-only episode log — full provenance chain; graph and identity projections replayable via `deploy/rebuild_projections.py`.
 
 ## License
 

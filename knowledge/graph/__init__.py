@@ -209,6 +209,12 @@ async def create_entity(
                 "label": label,
                 "epistemic_status": epistemic_status,
                 "scope": scope,
+                "properties": props,
+                "source_episode_id": source_episode_id,
+                "valid_from": (
+                    entity["valid_from"].isoformat()
+                    if entity.get("valid_from") else None
+                ),
             },
         )
         await publisher.stage(event, conn)
@@ -380,6 +386,12 @@ async def create_edge(
                 "src_entity_id": src_entity_id,
                 "dst_entity_id": dst_entity_id,
                 "rel_type": rel_type,
+                "scope": edge_scope,
+                "properties": props,
+                "valid_from": (
+                    edge["valid_from"].isoformat()
+                    if edge.get("valid_from") else None
+                ),
             },
         )
         await publisher.stage(event, conn)

@@ -28,7 +28,7 @@ Superseded facts are never `DELETE`d. When a fact stops being true, its `valid_t
 
 ## Episodic provenance
 
-Every distilled fact MUST cite a `source_episode_id`. No fact exists without the experience that produced it. Episodes form an append-only log; the knowledge graph and other projections are *rebuildable* from that log.
+Every distilled fact MUST cite a `source_episode_id`. No fact exists without the experience that produced it. Episodes form an append-only log; the knowledge graph and identity projections are *rebuildable* from the event log via `deploy/rebuild_projections.py`. Historical memory events and graph deletions that predate the replay fields are reported as untracked rather than silently restored.
 
 ## Epistemic axis
 
@@ -46,7 +46,7 @@ Ingestion strips harness/tooling scaffolding — system reminders, task notifica
 
 ## Event sourcing
 
-Writes emit **CloudEvents** (`shared/events`) into an event log. Projections — most importantly the knowledge graph — are derived from, and rebuildable from, that log. The full event catalog is documented in [Shared Infrastructure](../subsystems/shared-infrastructure.md).
+Writes emit **CloudEvents** (`shared/events`) into an event log. Projections — most importantly the knowledge graph — are derived from, and rebuildable from, that log. `deploy/rebuild_projections.py` reports drift and restores missing graph/identity rows (dry-run by default, never deletes). The full event catalog is documented in [Shared Infrastructure](../subsystems/shared-infrastructure.md).
 
 ## The hot path vs the "sleep" path
 

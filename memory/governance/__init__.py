@@ -227,7 +227,12 @@ async def add(
                 subject=mem_id,
                 scope=_scope_obj(scope_text),
                 data={"mem_id": mem_id, "scope": scope_text,
-                      "valid_from": vf.isoformat(), "source_episode_id": source_episode_id},
+                      "valid_from": vf.isoformat(), "source_episode_id": source_episode_id,
+                      # Rebuild inputs: without these the event cannot recreate
+                      # the row. Historical events lack them; new ones do not.
+                      "statement": statement, "kind": kind, "tier": tier,
+                      "epistemic_status": epistemic_status,
+                      "content_hash": content_hash},
                 actor="system",
                 source="curlyos-core/memory",
             )

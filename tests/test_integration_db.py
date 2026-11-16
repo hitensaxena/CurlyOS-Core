@@ -600,3 +600,103 @@ async def test_identity_fact_can_be_retired(pool):
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute("DELETE FROM identity_facts WHERE id = %s", (fact_id,))
+
+
+@pytest.mark.asyncio
+async def test_event_rebuild_restores_missing_rows(pool):
+    import json as _json
+
+    from memory.rebuild import (
+        rebuild_graph, rebuild_identity, rebuild_memories,
+    )
+    from shared.events import full_type
+
+    pub = _Publisher()
+    scope = "test:rebuild"
+    epi = await record_episode(pool, pub, scope, content="rebuild probe")
+    e1, e2 = mint("ent"), mint("ent")
+    edge, fact, mem = mint("cor"), mint("idf"), mint("mem")
+
+    def event(short, subject, data):
+        return (
+            mint("evt"), full_type(short), subject, scope, _json.dumps(data),
+        )
+
+    rows = [
+        event("knowledge.entity.created", e1, {
+            "entity_id": e1, "name": "Rebuild Alpha", "label": "Entity",
+            "epistemic_status": "canonical", "scope": scope, "properties": {},
+        }),
+        event("knowledge.entity.created", e2, {
+            "entity_id": e2, "name": "Rebuild Beta", "label": "Entity",
+            "epistemic_status": "canonical", "scope": scope, "properties": {},
+        }),
+        event("knowledge.edge.created", edge, {
+            "edge_id": edge, "src_entity_id": e1, "dst_entity_id": e2,
+            "rel_type": "related_to", "scope": scope, "properties": {},
+        }),
+        event("identity.fact.updated", f"identity_fact:{fact}", {
+            "idf_id": fact, "predicate": "rebuild_probe", "object": "value",
+            "confidence": 0.8, "epistemic_status": "canonical",
+            "action_taken": "inserted", "source_episode_id": epi["epi_id"],
+        }),
+        event("memory.fact.stored", mem, {
+            "mem_id": mem, "scope": scope, "statement": "Rebuild probe memory fact",
+            "kind": "fact", "tier": "semantic", "epistemic_status": "canonical",
+            "source_episode_id": epi["epi_id"],
+        }),
+    ]
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM events WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM knowledge_edges WHERE id = %s", (edge,))
+            await cur.execute("DELETE FROM knowledge_entities WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM identity_facts WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM memories WHERE scope = %s", (scope,))
+            for row in rows:
+                await cur.execute(
+                    "INSERT INTO events (id, type, subject, scope, data) "
+                    "VALUES (%s, %s, %s, %s, %s::jsonb)",
+                    row,
+                )
+
+    graph = await rebuild_graph(pool, scope, dry_run=True)
+    assert graph["entities_missing_count"] == 2
+    assert graph["edges_missing_count"] == 1
+    identity = await rebuild_identity(pool, scope, dry_run=True)
+    assert identity["facts_missing_count"] == 1
+    memories = await rebuild_memories(pool, scope, dry_run=True)
+    assert memories["missing_rebuildable_count"] == 1
+
+    await rebuild_graph(pool, scope)
+    await rebuild_identity(pool, scope)
+    await rebuild_memories(pool, scope)
+
+    graph = await rebuild_graph(pool, scope, dry_run=True)
+    assert graph["entities_missing_count"] == 0
+    assert graph["edges_missing_count"] == 0
+    assert (await rebuild_identity(pool, scope, dry_run=True))["facts_missing_count"] == 0
+    assert (await rebuild_memories(pool, scope, dry_run=True))["missing_rebuildable_count"] == 0
+
+    # A tracked deletion is not resurrected by a rebuild.
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO events (id, type, subject, scope, data) "
+                "VALUES (%s, %s, %s, %s, %s::jsonb)",
+                event("knowledge.edge.invalidated", edge, {
+                    "edge_id": edge, "reason": "integration",
+                }),
+            )
+            await cur.execute("DELETE FROM knowledge_edges WHERE id = %s", (edge,))
+    await rebuild_graph(pool, scope)
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT count(*) FROM knowledge_edges WHERE id = %s", (edge,))
+            assert (await cur.fetchone())[0] == 0
+            await cur.execute("DELETE FROM events WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM knowledge_edges WHERE id = %s", (edge,))
+            await cur.execute("DELETE FROM knowledge_entities WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM identity_facts WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM memories WHERE scope = %s", (scope,))
