@@ -24,7 +24,8 @@ Usage (from the repo root):
     .venv/bin/python -I deploy/graph_hygiene.py --report
     .venv/bin/python -I deploy/graph_hygiene.py --relations
     .venv/bin/python -I deploy/graph_hygiene.py --aliases
-    .venv/bin/python -I deploy/graph_hygiene.py --chatter
+    .venv/bin/python -I deploy/graph_hygiene.py --chatter            # dry run
+    .venv/bin/python -I deploy/graph_hygiene.py --chatter --approve  # writes
     .venv/bin/python -I deploy/graph_hygiene.py --janitor            # dry run
     .venv/bin/python -I deploy/graph_hygiene.py --janitor --approve  # writes
 
@@ -192,7 +193,18 @@ CHATTER_PATTERNS = [
     r"^new fact\.?$",
     r"^it'?s (?:live|done)\.?$",
     r"^session ended\.?$",
+    # Probes and self-tests: rows that exist to prove a write path works.
+    r"\bcache invalidation probe\b",
+    r"\bmemory check from\b",
+    r"^test (?:row|probe|entry|message)\b",
+    # Acknowledgements carry no information of their own.
+    r"^(?:ok|okay|done|got it|sure|cool|nice|yes|no|yep|nope)\.?$",
 ]
+
+# A short statement that ends on a colon is a lead-in whose body never arrived:
+# "The pattern was:" followed by an empty line and "1.". The colon is the tell —
+# a fact can end in a full stop, never in an invitation to keep reading.
+_DANGLING_COLON_MAX = 120
 _CHATTER_RE = re.compile("|".join(CHATTER_PATTERNS), re.IGNORECASE)
 
 # Markdown headers and bullets are only scaffolding when the whole memory is a
@@ -247,7 +259,12 @@ def chatter_reason(statement: str) -> str | None:
     if t.startswith("-") and _GUIDELINE_RE.search(t):
         return "assistant-guideline"
     m = _CHATTER_RE.search(t)
-    return m.group(0) if m else None
+    if m:
+        return m.group(0)
+    stripped = t.rstrip()
+    if stripped.endswith(":") and len(t) <= _DANGLING_COLON_MAX:
+        return "dangling-colon"
+    return None
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -401,8 +418,12 @@ def step_chatter(conn, dry_run: bool = False) -> None:
     print(f"\nscanned        : {len(rows)}")
     print(f"chatter found  : {len(flagged)}")
     from collections import Counter
-    for pat, n in Counter(r[2].lower() for r in flagged).most_common(10):
+    counts = Counter(r[2].lower() for r in flagged)
+    for pat, n in counts.most_common(12):
         print(f"  {n:>4}  pattern {pat!r}")
+        for sample in [r[1][:90].replace("\n", " ") for r in flagged
+                       if r[2].lower() == pat][:3]:
+            print(f"          e.g. {sample!r}")
     if dry_run:
         print("\n[dry-run] no rows written")
         return
@@ -564,7 +585,10 @@ def main() -> None:
     if args.aliases:
         step_aliases(conn, args.dry_run)
     if args.chatter:
-        step_chatter(conn, args.dry_run)
+        # --chatter alone reports; --approve writes. Same gate as the janitor:
+        # a scan flag that mutates rows by default is how 28k statements get
+        # flagged by accident.
+        step_chatter(conn, args.dry_run or not args.approve)
     if args.janitor:
         step_janitor(conn, args.approve, args.merge_aliases)
 
