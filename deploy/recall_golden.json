@@ -1,0 +1,62 @@
+[
+  {
+    "query": "what is the canonical CRAZYMAGE sonic identity",
+    "expect": ["CRAZYMAGE | Sonic Identity v1.2.1"],
+    "match": "prefix",
+    "note": "canonical identity record"
+  },
+  {
+    "query": "what is the Track 6 sonic direction",
+    "expect": ["CRAZYMAGE / Sonic Reference / Track 6 / v1"],
+    "match": "prefix",
+    "note": "authoritative track reference"
+  },
+  {
+    "query": "what is the 127 BPM discovery",
+    "expect": ["CRAZYMAGE / Sonic Reference / 127 BPM Discovery / v1"],
+    "match": "prefix",
+    "note": "127 BPM exploration"
+  },
+  {
+    "query": "what is the Track 5 production reference",
+    "expect": ["CRAZYMAGE | Track 5 | Production Brief"],
+    "match": "prefix",
+    "note": "Track 5 brief"
+  },
+  {
+    "query": "what is the CRAZYMAGE AI Studio",
+    "expect": ["CRAZYMAGE | AI Studio | Creative Architecture"],
+    "match": "prefix",
+    "note": "AI Studio node"
+  },
+  {
+    "query": "what is my first CRAZYMAGE release",
+    "expect": ["first CRAZYMAGE release is titled"],
+    "match": "contains",
+    "note": "Already Here release"
+  },
+  {
+    "query": "what is my Ableton track setup",
+    "expect": ["12-track Ableton Live setup"],
+    "match": "contains",
+    "note": "12-track live set"
+  },
+  {
+    "query": "what is the working memory implementation",
+    "expect": ["working_set"],
+    "match": "contains",
+    "note": "working memory records"
+  },
+  {
+    "query": "what is the Ballam automation business",
+    "expect": ["Ballam"],
+    "match": "contains",
+    "note": "automation venture"
+  },
+  {
+    "query": "what is neti neti meditation",
+    "expect": ["Neti Neti"],
+    "match": "contains",
+    "note": "meditation practice"
+  }
+]
