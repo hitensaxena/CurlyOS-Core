@@ -32,6 +32,15 @@ DSN = os.environ.get("CURLYOS_DATABASE_URL", "postgresql://curlyos:***@localhost
 REDIS_URL = os.environ.get("CURLYOS_REDIS_URL", "")
 SCOPE = os.environ.get("CURLYOS_SCOPE", "user:usr_hiten")
 
+# Full episode text is kept for provenance, but bge-m3 truncates long inputs
+# and episodes are not part of /api/recall. Cap the embedded span so a 20k
+# note does not pay a full encode it cannot use.
+MAX_EPISODE_EMBED_CHARS = 8000
+
+# Background ingestion is LLM and CPU heavy. Two at a time keeps a burst of
+# captures from exhausting the 3-connection pool or thrashing the CPU.
+_BG_CONCURRENCY = asyncio.Semaphore(2)
+
 # Root logging config: module loggers (memory/, knowledge/, cognition/) and
 # our own logger all flow to stderr → journald, independent of uvicorn's
 # --log-level (which only governs uvicorn's own loggers).
@@ -72,6 +81,8 @@ async def lifespan(app: FastAPI):
         )
         scheduler.start()
     app.state.scheduler = scheduler
+
+    _register_engines()
 
     yield
     if scheduler is not None:
@@ -187,6 +198,10 @@ class IngestRequest(BaseModel):
 
 class ConsolidationRunRequest(BaseModel):
     mode: Literal["fast", "deep"] = "fast"
+    scope: str = SCOPE
+
+
+class EngineRunRequest(BaseModel):
     scope: str = SCOPE
 
 
@@ -388,45 +403,110 @@ def get_memory(mem_id: str):
 
 
 @app.post("/api/memories")
-def add_memory(body: AddMemoryRequest):
+async def add_memory(body: AddMemoryRequest):
     try:
+        import hashlib
+
+        from memory.governance import statement_key
+
+        skey = statement_key(body.statement)
+        content_hash = hashlib.sha256(skey.encode("utf-8")).hexdigest()
+        deduplicated = False
         with get_conn() as conn:
             row = conn.execute(
-                "INSERT INTO memories (id, scope, statement, statement_key, kind, tier, "
+                "INSERT INTO memories (id, scope, statement, statement_key, content_hash, kind, tier, "
                 "epistemic_status, valid_from, ingested_at, source_episode_id) "
-                "VALUES (gen_random_uuid()::text, %s, %s, %s, %s, 'semantic', %s, now(), now(), %s) "
+                "VALUES (gen_random_uuid()::text, %s, %s, %s, %s, %s, 'semantic', %s, now(), now(), %s) "
+                "ON CONFLICT (scope, content_hash) WHERE valid_to IS NULL DO NOTHING "
                 "RETURNING id, created_at",
-                [SCOPE, body.statement, body.statement.lower().strip(), body.kind,
+                [SCOPE, body.statement, skey, content_hash, body.kind,
                  body.epistemic_status, body.source_episode_id],
             ).fetchone()
-        return {"id": row["id"], "created_at": row["created_at"].isoformat() if row else None}
+            if row is None:
+                row = conn.execute(
+                    "SELECT id, created_at FROM memories "
+                    "WHERE scope = %s AND content_hash = %s AND valid_to IS NULL",
+                    [SCOPE, content_hash],
+                ).fetchone()
+                deduplicated = True
+                if row is None:
+                    raise HTTPException(500, "content_hash conflict but no active row found")
+    except HTTPException:
+        raise
     except Exception as e:
         if "23503" in str(e):
             raise HTTPException(400, f"source_episode_id not found: {body.source_episode_id}")
         raise HTTPException(500, str(e))
 
+    mem_id = row["id"]
+    # This endpoint bypasses the ingest pipeline, so without an explicit embed
+    # the row stays embedding-less until the startup sweep and never enters
+    # dense recall. Embed immediately; best-effort so a write still succeeds.
+    # A deduplicated hit already has its vector.
+    if not deduplicated:
+        try:
+            pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+            embedder = await get_shared_embedder()
+            await _embed_row(pool, "memories", mem_id, body.statement, embedder)
+        except Exception:
+            logger.exception("embed after /api/memories insert failed mem=%s", mem_id)
+
+        redis = _make_redis()
+        if redis is not None:
+            try:
+                await _bump_recall_gen(redis, SCOPE)
+            except Exception:
+                logger.warning("could not invalidate recall cache after memory insert")
+            finally:
+                with contextlib.suppress(Exception):
+                    await redis.aclose()
+
+    return {"id": mem_id, "created_at": row["created_at"].isoformat() if row else None,
+            "deduplicated": deduplicated}
+
 
 @app.post("/api/memories/{mem_id}/invalidate")
 async def invalidate_memory(mem_id: str, body: InvalidateRequest | None = None):
-    with get_conn() as conn:
-        row = conn.execute("SELECT valid_to, scope FROM memories WHERE id = %s", [mem_id]).fetchone()
-        if not row:
-            raise HTTPException(404, "Memory not found")
-        if row["valid_to"] is not None:
-            raise HTTPException(409, "Already invalidated")
-        conn.execute("UPDATE memories SET valid_to = now() WHERE id = %s", [mem_id])
+    # One atomic UPDATE, not SELECT-then-UPDATE: the old window let two
+    # concurrent invalidations of the same row wait on each other. The short
+    # lock timeout makes contention fail fast instead of blocking the event
+    # loop (this route used to hold a synchronous connection inside async).
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SET LOCAL lock_timeout = '5s'")
+                await cur.execute(
+                    "UPDATE memories SET valid_to = now() "
+                    "WHERE id = %s AND valid_to IS NULL "
+                    "RETURNING valid_to, scope",
+                    (mem_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    await cur.execute(
+                        "SELECT valid_to FROM memories WHERE id = %s", (mem_id,)
+                    )
+                    existing = await cur.fetchone()
+                    if existing is None:
+                        raise HTTPException(404, "Memory not found")
+                    raise HTTPException(409, "Already invalidated")
+    except psycopg.errors.LockNotAvailable:
+        raise HTTPException(409, "Memory is locked by another write; retry")
+
+    valid_to, scope = row
     # Cached recall must stop returning this fact immediately, for hooks and
     # every other REST/MCP client, not just after the cache TTL expires.
     redis = _make_redis()
     if redis is not None:
         try:
-            await _bump_recall_gen(redis, row["scope"])
+            await _bump_recall_gen(redis, scope)
         except Exception:
             logger.warning("could not invalidate recall cache after memory update")
         finally:
             with contextlib.suppress(Exception):
                 await redis.aclose()
-    return {"id": mem_id, "valid_to": now_iso(), "deleted": False}
+    return {"id": mem_id, "valid_to": valid_to.isoformat(), "deleted": False}
 
 
 # ---------------------------------------------------------------------------
@@ -647,8 +727,8 @@ async def recall(body: RecallRequest):
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from memory.retrieval import (
-        conversation_key, diversify_by_episode, is_archive_summary, load_summary_index,
-        lookup_summary, retrieve,
+        blend_rank_scores, conversation_key, diversify_by_episode, is_archive_summary,
+        load_summary_index, lookup_summary, retrieve,
     )
     from shared.types import RetrievalRequest, RetrievedItem
     from shared.embeddings.implementations import FakeReranker, CachingEmbedder
@@ -668,6 +748,10 @@ async def recall(body: RecallRequest):
     max_per_ep = int(await get_setting_cached(pool, "recall_max_per_episode", 2))
     summary_boost = float(await get_setting_cached(pool, "recall_summary_boost", 0.03))
     chunk_penalty = float(await get_setting_cached(pool, "recall_chunk_penalty", 0.05))
+    blend_cosine = float(await get_setting_cached(pool, "recall_blend_cosine", 0.65))
+    blend_fused = float(await get_setting_cached(pool, "recall_blend_fused", 0.25))
+    blend_recency = float(await get_setting_cached(pool, "recall_blend_recency", 0.10))
+    blend_half_life = float(await get_setting_cached(pool, "recall_blend_half_life_days", 30.0))
 
     # Cache lookup — generation-versioned, so an ingest invalidates instantly.
     redis = _make_redis() if cache_enabled else None
@@ -676,13 +760,15 @@ async def recall(body: RecallRequest):
         gen = await _recall_gen(redis, scope)
         digest = hashlib.sha256(query.encode()).hexdigest()[:16]
         cache_key = (f"cache:recall:{scope}:{gen}:{mode}:{k}:{max_per_ep}:"
-                     f"{summary_boost}:{chunk_penalty}:{digest}")
+                     f"{summary_boost}:{chunk_penalty}:"
+                     f"{blend_cosine}:{blend_fused}:{blend_recency}:{blend_half_life}:{digest}")
         try:
             hit = await redis.get(cache_key)
             if hit is not None:
                 payload = hit.decode() if isinstance(hit, (bytes, bytearray)) else hit
                 cached = json.loads(payload)
                 cached["cached"] = True
+                cached["timings"] = {"cached": True}
                 metrics.incr("recall.cache_hits")
                 metrics.timing("recall.latency_cached", (time.monotonic() - t_start) * 1000)
                 return cached
@@ -702,21 +788,27 @@ async def recall(body: RecallRequest):
             pool=pool, embedder=emb, reranker=FakeReranker(), fast_followup=fast_followup,
         )
         cand = result.items
+        stage_timings: dict[str, float] = dict(result.timings)
+        for _name, _ms in stage_timings.items():
+            metrics.timing(f"recall.stage.{_name}", _ms)
+        _t_post = time.monotonic()
         # Rerank by true cosine relevance using the STORED memory embeddings:
         # embed the query once + one SQL pass over the candidate ids (NO per-doc
         # re-encoding, which is far too slow on this CPU box). This surfaces the
         # dense-relevant memories that rank-fusion buries.
         sims: dict[str, float] = {}
+        blend: dict[str, float] = {}
 
         def rank_of(it):
             """Relevance used for ordering and for the reported score.
 
-            A raw archive chunk is literal query text, so its cosine beats the
+            Blend of cosine, the retrieval layer's fused score and recency. A
+            raw archive chunk is literal query text, so its cosine beats the
             distilled summary of the same conversation. Demote it so recall
             surfaces the recall-shaped version; the raw text stays in episodes
             and the markdown mirror.
             """
-            sc = sims.get(it.id, it.score or 0.0)
+            sc = blend.get(it.id, it.score or 0.0)
             if (it.text or "").startswith("# archives/chatgpt/"):
                 sc -= chunk_penalty
             return sc
@@ -728,8 +820,11 @@ async def recall(body: RecallRequest):
             return rank_of(it) + boost
 
         if cand:
+            _t_embed = time.monotonic()
             qv = (await emb.embed([query]))[0]
             qlit = "[" + ",".join(repr(float(x)) for x in qv) + "]"
+            stage_timings["query_embed"] = round((time.monotonic() - _t_embed) * 1000, 2)
+            _t_score = time.monotonic()
             async with pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -739,7 +834,20 @@ async def recall(body: RecallRequest):
                     )
                     for rid, sim in await cur.fetchall():
                         sims[rid] = float(sim)
-            cand = sorted(cand, key=lambda it: -sims.get(it.id, -1.0))
+            stage_timings["cosine_rescore"] = round((time.monotonic() - _t_score) * 1000, 2)
+
+            _t_blend = time.monotonic()
+            blend = blend_rank_scores(
+                sims,
+                {it.id: float(it.score or 0.0) for it in cand},
+                {it.id: it.valid_from for it in cand},
+                w_cosine=blend_cosine,
+                w_fused=blend_fused,
+                w_recency=blend_recency,
+                half_life_days=blend_half_life,
+            )
+            stage_timings["blend"] = round((time.monotonic() - _t_blend) * 1000, 2)
+            cand = sorted(cand, key=lambda it: -rank_of(it))
 
             # A raw archive chunk is literal query text, so it out-scores the
             # distilled summary of the same conversation — and for some queries
@@ -752,11 +860,13 @@ async def recall(body: RecallRequest):
                     or (getattr(it, "source_episode_id", "") or it.id)
                 )
 
+            _t_sum = time.monotonic()
             try:
                 summary_index = await load_summary_index(pool, scope)
             except Exception:
                 logger.debug("summary index unavailable", exc_info=True)
                 summary_index = {}
+            stage_timings["summary_index"] = round((time.monotonic() - _t_sum) * 1000, 2)
             best_chunk: dict[str, float] = {}
             for it in cand[:12]:
                 ck = key_of(it)
@@ -778,20 +888,29 @@ async def recall(body: RecallRequest):
             # Cosine alone lets one long conversation fill every slot: bulk
             # imports put dozens of transcript chunks on a single item.
             # Cap per-conversation contribution, summaries first.
+            _t_div = time.monotonic()
             cand = diversify_by_episode(
                 cand, rank_of,
                 max_per_episode=max_per_ep, summary_boost=summary_boost, key_of=key_of,
             )
+            stage_timings["diversify"] = round((time.monotonic() - _t_div) * 1000, 2)
         items = [
             {"id": it.id, "text": it.text[:200],
              "score": round(shown_score(it), 4),
              "tier": it.tier, "epistemic_status": it.epistemic_status}
             for it in cand[:k]
         ]
-        out = {"results": items, "count": len(items)}
+        stage_timings["postprocess"] = round((time.monotonic() - _t_post) * 1000, 2)
+        stage_timings["total"] = round((time.monotonic() - t_start) * 1000, 2)
+        out = {"results": items, "count": len(items), "timings": stage_timings}
         if redis is not None and cache_key is not None:
             try:
-                await redis.set(cache_key, json.dumps(out), ex=cache_ttl)
+                # Cache the payload, not the timings: a cache hit is not a stage run.
+                await redis.set(
+                    cache_key,
+                    json.dumps({"results": items, "count": len(items)}),
+                    ex=cache_ttl,
+                )
             except Exception:
                 pass
         metrics.timing("recall.latency", (time.monotonic() - t_start) * 1000)
@@ -1537,13 +1656,23 @@ async def _embed_rows(pool: Any, rows: list[tuple[str, str, str]], embedder: Any
 
 
 async def _process_episode_bg(
-    scope: str, epi_id: str, mem_id: str | None, text: str, extract_knowledge: bool = True,
+    scope: str, epi_id: str, mem_chunks: list[tuple[str, str]], text: str,
+    extract_knowledge: bool = True,
 ) -> None:
-    """Background processing for an ingested episode. Embeds the episode + its
-    memory (so both are dense-recallable immediately), then runs knowledge
-    extraction (LLM → graph; regex fallback). Runs after the HTTP response so
-    capture stays snappy. Best-effort with retries; failures are logged and any
-    row still left unembedded is picked up by the startup sweep.
+    """Bounded entry point: at most two episodes process concurrently."""
+    async with _BG_CONCURRENCY:
+        await _process_episode_inner(scope, epi_id, mem_chunks, text, extract_knowledge)
+
+
+async def _process_episode_inner(
+    scope: str, epi_id: str, mem_chunks: list[tuple[str, str]], text: str,
+    extract_knowledge: bool = True,
+) -> None:
+    """Background processing for an ingested episode. Embeds the episode and
+    every stored chunk (so all are dense-recallable immediately), then runs
+    knowledge extraction (LLM → graph; regex fallback). Runs after the HTTP
+    response so capture stays snappy. Best-effort with retries; failures are
+    logged and any row still left unembedded is picked up by the startup sweep.
     """
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from knowledge.graph import extract_and_project
@@ -1556,9 +1685,9 @@ async def _process_episode_bg(
         # Embeddings first — these make the entry dense-recallable right away.
         # Episode + memory embed in ONE batched model call (identical text, the
         # common case, embeds once); retry only the rows still missing.
-        targets = [("episodes", epi_id, text)]
-        if mem_id:
-            targets.append(("memories", mem_id, text[:4000]))
+        targets = [("episodes", epi_id, text[:MAX_EPISODE_EMBED_CHARS])]
+        for mem_id, chunk in mem_chunks:
+            targets.append(("memories", mem_id, chunk))
         needed = {rid for (_, rid, _) in targets}
         for attempt in range(3):
             done = await _embed_rows(pool, [t for t in targets if t[1] in needed], embedder)
@@ -1573,20 +1702,26 @@ async def _process_episode_bg(
         # Classify the captured memory's epistemic status (canonical/belief/
         # hypothesis) instead of blanket canonical. Best-effort, background.
         # Gated by the epistemic_classify_enabled setting (an LLM call per ingest).
-        if mem_id and bool(await get_setting_cached(pool, "epistemic_classify_enabled", True)):
+        if mem_chunks and bool(await get_setting_cached(pool, "epistemic_classify_enabled", True)):
             try:
                 llm_client, model = _make_llm_client()
                 if llm_client:
                     from shared.epistemic import classify_statements
-                    res = await classify_statements(llm_client, model, [{"id": mem_id, "statement": text[:2000]}])
-                    status = res.get(mem_id, "canonical")
-                    if status != "canonical":
-                        async with pool.connection() as conn:
-                            async with conn.cursor() as cur:
-                                await cur.execute(
-                                    "UPDATE memories SET epistemic_status = %s WHERE id = %s AND valid_to IS NULL",
-                                    (status, mem_id),
-                                )
+                    statements = [
+                        {"id": mem_id, "statement": chunk[:2000]}
+                        for mem_id, chunk in mem_chunks
+                    ]
+                    res = await classify_statements(llm_client, model, statements)
+                    for mem_id, _chunk in mem_chunks:
+                        status = res.get(mem_id, "canonical")
+                        if status != "canonical":
+                            async with pool.connection() as conn:
+                                async with conn.cursor() as cur:
+                                    await cur.execute(
+                                        "UPDATE memories SET epistemic_status = %s "
+                                        "WHERE id = %s AND valid_to IS NULL",
+                                        (status, mem_id),
+                                    )
             except Exception:
                 logger.exception("epistemic classify failed epi=%s", epi_id)
 
@@ -1655,7 +1790,7 @@ async def _sweep_unembedded() -> None:
             return
         done = 0
         for table, row_id, txt in rows:
-            text = txt[:4000] if table == "memories" else txt
+            text = txt[:4000] if table == "memories" else txt[:MAX_EPISODE_EMBED_CHARS]
             done += await _embed_row(pool, table, row_id, text, embedder)
         logger.info("sweep: embedded %d/%d rows", done, len(rows))
     except asyncio.CancelledError:
@@ -1727,6 +1862,7 @@ async def ingest(body: IngestRequest, background_tasks: BackgroundTasks):
     pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
     pub = _make_publisher_sync()
     epi_id = None
+    mem_chunks: list[tuple[str, str]] = []
     result: dict = {}
     try:
         epi = await record_episode(
@@ -1735,25 +1871,33 @@ async def ingest(body: IngestRequest, background_tasks: BackgroundTasks):
         epi_id = epi["epi_id"]
         result["epi_id"] = epi_id
         if add_memory:
-            mem = await add(
-                pool, pub, scope,
-                statement=text[:4000],
-                source_episode_id=epi_id,
-                kind=body.kind,
-                # canonical (default) so it's recallable: fast/deep recall
-                # filter to epistemic_status='canonical' only ("belief" is in
-                # no mode's filter, so belief memories never surface). Callers
-                # that want non-recallable drafts pass "hypothesis".
-                epistemic_status=body.epistemic_status,
-            )
-            result["mem_id"] = mem.get("mem_id")
+            from memory.chunking import split_text
+
+            # Store every chunk rather than truncating at 4,000 characters:
+            # anything past the cap used to be unreachable by recall.
+            for chunk in split_text(text):
+                mem = await add(
+                    pool, pub, scope,
+                    statement=chunk,
+                    source_episode_id=epi_id,
+                    kind=body.kind,
+                    # canonical (default) so it's recallable: fast/deep recall
+                    # filter to epistemic_status='canonical' only ("belief" is in
+                    # no mode's filter, so belief memories never surface). Callers
+                    # that want non-recallable drafts pass "hypothesis".
+                    epistemic_status=body.epistemic_status,
+                )
+                mem_chunks.append((mem["mem_id"], chunk))
+            result["mem_id"] = mem_chunks[0][0] if mem_chunks else None
+            result["mem_ids"] = [mid for mid, _ in mem_chunks]
+            result["chunks"] = len(mem_chunks)
     except Exception as e:
         logger.exception("ingest failed source_ref=%s", source_ref)
         return {"error": str(e)}
 
     if epi_id:
         background_tasks.add_task(
-            _process_episode_bg, scope, epi_id, result.get("mem_id"), text, extract_knowledge,
+            _process_episode_bg, scope, epi_id, mem_chunks, text, extract_knowledge,
         )
         # Invalidate this scope's recall cache — a new memory may change results.
         _r = _make_redis()
@@ -2356,6 +2500,102 @@ def _reflection_period_guard(report_type: str, trunc: str):
 
 
 
+def _register_engines() -> None:
+    """Register the built-in engines with the shared contract.
+
+    This is the seam that lets cognition be added, removed or upgraded without
+    editing an API handler. Scheduling still lives in `_scheduler_jobs`; the
+    next step is to derive jobs from these descriptors.
+    """
+    from shared.engines import REGISTRY, Engine
+
+    if REGISTRY.names():
+        return
+
+    async def _consolidation(scope: str, mode: str) -> dict:
+        return await consolidation_run(ConsolidationRunRequest(mode=mode, scope=scope))
+
+    async def _embedding_sweep(scope: str) -> dict:
+        await _sweep_unembedded()
+        return {"ok": True}
+
+    for engine in (
+        Engine(
+            name="consolidation_fast",
+            category="memory",
+            description="Dedup, conflict resolution and summarization of recent episodes.",
+            schedule="every 20m",
+            inputs=("episodes", "memories", "events"),
+            outputs=("memories",),
+            run=lambda scope: _consolidation(scope, "fast"),
+        ),
+        Engine(
+            name="consolidation_deep",
+            category="memory",
+            description="Full consolidation: dedup, merge, summarize, decay, recombine.",
+            schedule="daily 03:05",
+            inputs=("episodes", "memories", "events"),
+            outputs=("memories", "knowledge_edges"),
+            run=lambda scope: _consolidation(scope, "deep"),
+        ),
+        Engine(
+            name="embedding_sweep",
+            category="operations",
+            description="Embed any active or historical rows left without a vector.",
+            schedule="every 5m",
+            inputs=("memories", "episodes"),
+            outputs=("memories", "episodes"),
+            run=_embedding_sweep,
+        ),
+        Engine(
+            name="attention_scan",
+            category="cognition",
+            description="Heuristic focus, neglect, breadth and alignment scan.",
+            schedule="Mon,Thu 08:10",
+            inputs=("episodes", "knowledge_entities", "identity_facts", "goals"),
+            outputs=("alignment_signals",),
+            run=lambda scope: attention_scan(AttentionScanRequest(scope=scope)),
+        ),
+        Engine(
+            name="reflection_weekly",
+            category="cognition",
+            description="Weekly reflection report with identity and goal write-back.",
+            schedule="Mon 06:20",
+            inputs=("episodes", "identity_facts", "goals", "knowledge_entities"),
+            outputs=("reflection_reports", "identity_facts", "goals"),
+            run=lambda scope: reflection_weekly(ReflectionRequest(scope=scope)),
+        ),
+        Engine(
+            name="reflection_monthly",
+            category="cognition",
+            description="Monthly reflection and long-horizon synthesis.",
+            schedule="monthly 1st 06:40",
+            inputs=("episodes", "identity_facts", "goals"),
+            outputs=("reflection_reports", "identity_facts", "goals"),
+            run=lambda scope: reflection_monthly(ReflectionRequest(scope=scope)),
+        ),
+        Engine(
+            name="meta_audit",
+            category="cognition",
+            description="Decision audits and principle distillation.",
+            schedule="monthly 1st 07:20",
+            inputs=("decisions", "episodes", "memories"),
+            outputs=("decision_audits", "principles", "memories"),
+            run=lambda scope: meta_audit(MetaAuditRequest(scope=scope)),
+        ),
+        Engine(
+            name="narrative_generate",
+            category="cognition",
+            description="Themes and life chapters from episodes and the knowledge graph.",
+            schedule="Sun 05:20",
+            inputs=("episodes", "knowledge_entities"),
+            outputs=("themes", "life_chapters"),
+            run=lambda scope: narrative_generate(NarrativeGenerateRequest(scope=scope)),
+        ),
+    ):
+        REGISTRY.register(engine)
+
+
 def _scheduler_jobs():
     from shared.scheduler import DailyAt, Every, Job, MonthlyAt, WeeklyAt
 
@@ -2376,10 +2616,18 @@ def _scheduler_jobs():
             auto_record=True, llm_client=llm, llm_model=model,
         )
 
+    async def _embedding_sweep_job() -> dict:
+        # Safety net: consolidation and direct SQL paths can create memories
+        # without a vector. Startup-only sweeping left them dark indefinitely.
+        await _sweep_unembedded()
+        return {"ok": True}
+
     return [
         # consolidation is internally locked per scope — overlap-safe at any cadence
         Job("consolidation_fast", Every(20),
             lambda: consolidation_run(ConsolidationRunRequest(mode="fast"))),
+        # bounded, sequential; no-op when nothing is NULL
+        Job("embedding_sweep", Every(5), _embedding_sweep_job),
         Job("consolidation_deep", DailyAt("03:05"),
             lambda: consolidation_run(ConsolidationRunRequest(mode="deep"))),
         # LLM-bearing cognition: output-based period guards prevent double-spend
@@ -2498,6 +2746,39 @@ async def run_scheduler_job(name: str, request: Request):
         return await sched.trigger(name)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"no such job: {name}")
+
+
+@app.get("/api/engines")
+def list_engines(category: str | None = None):
+    """Inspect the registered engines and their declared inputs/outputs."""
+    from shared.engines import REGISTRY
+
+    engines = [e.descriptor() for e in REGISTRY.list(category)]
+    return {"engines": engines, "count": len(engines)}
+
+
+@app.post("/api/engines/{name}/run")
+async def run_engine(name: str, body: EngineRunRequest | None = None):
+    """Run one engine on demand through the shared contract."""
+    from shared import metrics
+    from shared.engines import (
+        REGISTRY, EngineDisabled, EngineNotFound, EngineNotRunnable,
+    )
+
+    scope = body.scope if body else SCOPE
+    t0 = time.monotonic()
+    try:
+        result = await REGISTRY.run(name, scope)
+    except EngineNotFound:
+        raise HTTPException(404, f"no such engine: {name}")
+    except EngineDisabled:
+        raise HTTPException(409, f"engine disabled: {name}")
+    except EngineNotRunnable:
+        raise HTTPException(400, f"engine has no run entry: {name}")
+    elapsed = (time.monotonic() - t0) * 1000
+    metrics.incr(f"engine.{name}.runs")
+    metrics.timing(f"engine.{name}.latency", elapsed)
+    return {"engine": name, "scope": scope, "duration_ms": round(elapsed, 1), "result": result}
 
 
 @app.get("/api/agent-runs")

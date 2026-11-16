@@ -24,6 +24,15 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
       # PGDATA stays at the image default (/var/lib/postgresql/data),
       # matching the original container so the migrated volume mounts cleanly.
+    # pg_stat_statements must be preloaded by the server, not just created as
+    # an extension. This makes per-statement latency/call counts available for
+    # recall and consolidation tuning.
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_preload_libraries=pg_stat_statements"
+      - "-c"
+      - "pg_stat_statements.track=all"
     ports:
       - "127.0.0.1:54321:5432"
     volumes:

@@ -178,6 +178,68 @@ async def _entity_match(
 # ── Stage 2: RRF fusion ────────────────────────────────────────────────────
 
 
+def blend_rank_scores(
+    cosines: dict[str, float],
+    fused: dict[str, float],
+    valid_from: dict[str, datetime | None],
+    *,
+    w_cosine: float = 0.65,
+    w_fused: float = 0.25,
+    w_recency: float = 0.10,
+    half_life_days: float = 30.0,
+    now: datetime | None = None,
+) -> dict[str, float]:
+    """Blend final ranking signals into one comparable score.
+
+    Cosine and the retrieval layer's fused score are min-max normalised across
+    the candidate set; recency is an exponential half-life decay. Weights are
+    renormalised, so the result always stays in [0, 1].
+    """
+    ids = set(cosines) | set(fused) | set(valid_from)
+    if not ids:
+        return {}
+
+    w_cosine = max(w_cosine, 0.0)
+    w_fused = max(w_fused, 0.0)
+    w_recency = max(w_recency, 0.0)
+    total_w = w_cosine + w_fused + w_recency
+    if total_w <= 0:
+        w_cosine, w_fused, w_recency = 1.0, 0.0, 0.0
+        total_w = 1.0
+
+    def _minmax(values: dict[str, float]) -> dict[str, float]:
+        if not values:
+            return {}
+        lo = min(values.values())
+        hi = max(values.values())
+        if hi - lo <= 1e-12:
+            return {k: 0.5 for k in values}
+        return {k: (v - lo) / (hi - lo) for k, v in values.items()}
+
+    cos_n = _minmax({k: float(v) for k, v in cosines.items()})
+    fused_n = _minmax({k: float(v) for k, v in fused.items()})
+
+    now = now or datetime.now(timezone.utc)
+    rec_n: dict[str, float] = {}
+    for key, vf in valid_from.items():
+        if vf is None:
+            rec_n[key] = 0.5
+            continue
+        if vf.tzinfo is None:
+            vf = vf.replace(tzinfo=timezone.utc)
+        age_days = max(0.0, (now - vf).total_seconds() / 86400.0)
+        rec_n[key] = 0.5 ** (age_days / half_life_days)
+
+    return {
+        key: (
+            w_cosine * cos_n.get(key, 0.0)
+            + w_fused * fused_n.get(key, 0.0)
+            + w_recency * rec_n.get(key, 0.0)
+        ) / total_w
+        for key in ids
+    }
+
+
 def _rrf_fuse(
     candidates: list[dict],
     dense_ranked: list[dict],
@@ -903,6 +965,18 @@ async def retrieve(
     divergent = mode == "divergent"
     deep = mode == "deep"
 
+    timings: dict[str, float] = {}
+
+    async def _timed(name: str, coro: Any) -> Any:
+        t0 = time.monotonic()
+        try:
+            return await coro
+        finally:
+            timings[name] = round((time.monotonic() - t0) * 1000, 2)
+
+    def _mark(name: str, t0: float) -> None:
+        timings[name] = round((time.monotonic() - t0) * 1000, 2)
+
     ef_search = 128 if deep else 64
     k = 50 if deep else 20
     graph_hops = 2 if deep else 1
@@ -925,6 +999,7 @@ async def retrieve(
 
     # Check if embeddings exist
     has_embeddings = False
+    _t0 = time.monotonic()
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -935,26 +1010,36 @@ async def retrieve(
                 has_embeddings = await cur.fetchone() is not None
     except Exception:
         pass
+    _mark("has_embeddings_probe", _t0)
 
     # Stage 1: Hybrid first-stage (dense + sparse + entity in parallel)
     dense_task = None
     if has_embeddings:
         dense_task = asyncio.create_task(
-            _dense_recall(
-                pool, embedder, request.query, request.scope, k=k,
-                ef_search=ef_search, as_of=request.as_of,
-                epistemic_filter=epistemic_filter,
+            _timed(
+                "dense",
+                _dense_recall(
+                    pool, embedder, request.query, request.scope, k=k,
+                    ef_search=ef_search, as_of=request.as_of,
+                    epistemic_filter=epistemic_filter,
+                ),
             )
         )
     sparse_task = asyncio.create_task(
-        _sparse_recall(
-            pool, request.query, request.scope, k=k,
-            as_of=request.as_of, epistemic_filter=epistemic_filter,
+        _timed(
+            "sparse",
+            _sparse_recall(
+                pool, request.query, request.scope, k=k,
+                as_of=request.as_of, epistemic_filter=epistemic_filter,
+            ),
         )
     )
     entity_task = asyncio.create_task(
-        _entity_match(
-            pool, request.query, request.scope, as_of=request.as_of,
+        _timed(
+            "entity",
+            _entity_match(
+                pool, request.query, request.scope, as_of=request.as_of,
+            ),
         )
     )
 
@@ -977,6 +1062,7 @@ async def retrieve(
     entity = await entity_task
 
     # Stage 2: RRF fusion with proper per-signal ranks
+    _t0 = time.monotonic()
     candidates = _rrf_fuse(
         dense + sparse + entity,
         dense_ranked=dense,
@@ -984,11 +1070,13 @@ async def retrieve(
         entity_ranked=entity,
         divergent=divergent,
     )
+    _mark("rrf", _t0)
 
     # Stage 3: Graph expansion from top seed nodes
     graph_items: list[dict] = []
     graph_skipped = False
     seed_ids = [c["id"] for c in candidates[:5]]
+    _t0 = time.monotonic()
     try:
         graph_items = await _graph_expand(
             pool, seed_ids, request.scope,
@@ -998,6 +1086,8 @@ async def retrieve(
     except Exception as exc:
         log.warning("Graph expansion skipped: %s", exc)
         graph_skipped = True
+    finally:
+        _mark("graph", _t0)
 
     # Merge graph items into candidates
     all_candidates = candidates + graph_items
@@ -1014,9 +1104,12 @@ async def retrieve(
         )
 
     # Stage 3b: Cross-encoder rerank (top-50 → top-30)
+    _t0 = time.monotonic()
     reranked = await _rerank(reranker, request.query, all_candidates, top_k=50)
+    _mark("rerank", _t0)
 
     # Stage 4: Agentic iterative loop
+    _t0 = time.monotonic()
     rounds_done = 1
     current_query = request.query
     all_retrieved: dict[str, dict] = {item["id"]: item for item in reranked}
@@ -1056,6 +1149,8 @@ async def retrieve(
             if item["id"] not in all_retrieved:
                 all_retrieved[item["id"]] = item
 
+    _mark("rounds", _t0)
+
     # Collect all unique items
     final_items = sorted(
         all_retrieved.values(),
@@ -1067,9 +1162,11 @@ async def retrieve(
         final_items = _mmr_diversify(final_items, lambda_param=0.5, top_k=30)
 
     # Stage 5: Context assembler
+    _t0 = time.monotonic()
     assembled, used_tokens, truncated = _assemble_context(
         final_items, budget=request.token_budget,
     )
+    _mark("assemble", _t0)
 
     # Build result items
     result_items = [
@@ -1098,4 +1195,5 @@ async def retrieve(
         cache_key=cache_key,
         graph_skipped=graph_skipped,
         reranked=reranker is not None,
+        timings=timings,
     )
