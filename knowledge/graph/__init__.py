@@ -13,8 +13,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any
 
+from knowledge.graph.projection import apply_event
 from shared.types.ulid import mint
 from shared.events import build_event
 from shared.scope import scope_parts
@@ -150,8 +152,9 @@ async def create_entity(
 ) -> dict:
     """Create a knowledge entity node.
 
-    Generates a ULID with 'ent' prefix, inserts into knowledge_entities,
-    optionally generates an embedding, and stages a knowledge.entity.created event.
+    Computes the payload, stages a `knowledge.entity.created` event, and lets
+    :func:`apply_event` write the row — on the same cursor, in the same
+    transaction, so the row and its event commit together.
 
     Raises ValueError for a placeholder name (see :func:`is_placeholder_name`),
     so a quantity can never become a node. Every caller is expected to have
@@ -161,6 +164,7 @@ async def create_entity(
         raise ValueError(f"refusing to create an entity named {name!r}: not a name")
     entity_id = mint("ent")
     props = properties or {}
+    created = datetime.now(timezone.utc)
 
     # Build embedding text if embedder is provided. Use embed_single — embed()
     # expects a list and returns a list-of-vectors; passing a bare string only
@@ -173,51 +177,38 @@ async def create_entity(
         except Exception as e:
             log.warning("Embedding generation failed for entity %s: %s", entity_id, e)
 
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            if embedding is not None:
-                await cur.execute(
-                    "INSERT INTO knowledge_entities "
-                    "(id, scope, name, label, properties, embedding, epistemic_status, source_episode_id) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
-                    "RETURNING id, scope, name, label, properties, embedding, "
-                    "epistemic_status, valid_from, valid_to, ingested_at, source_episode_id, created_at",
-                    (entity_id, scope, name, label,
-                     json.dumps(props), embedding, epistemic_status, source_episode_id),
-                )
-            else:
-                await cur.execute(
-                    "INSERT INTO knowledge_entities "
-                    "(id, scope, name, label, properties, epistemic_status, source_episode_id) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s) "
-                    "RETURNING id, scope, name, label, properties, embedding, "
-                    "epistemic_status, valid_from, valid_to, ingested_at, source_episode_id, created_at",
-                    (entity_id, scope, name, label,
-                     json.dumps(props), epistemic_status, source_episode_id),
-                )
-            row = await cur.fetchone()
-            entity = _row_to_entity(row)
+    event = build_event(
+        short_type="knowledge.entity.created",
+        subject=entity_id,
+        scope={"level": "user", "scope": scope},
+        data={
+            "entity_id": entity_id,
+            "name": name,
+            "label": label,
+            "epistemic_status": epistemic_status,
+            "scope": scope,
+            "properties": props,
+            "source_episode_id": source_episode_id,
+            "valid_from": created.isoformat(),
+        },
+    )
 
-        # Stage event inside the same transaction
-        event = build_event(
-            short_type="knowledge.entity.created",
-            subject=entity_id,
-            scope={"level": "user", "scope": scope},
-            data={
-                "entity_id": entity_id,
-                "name": name,
-                "label": label,
-                "epistemic_status": epistemic_status,
-                "scope": scope,
-                "properties": props,
-                "source_episode_id": source_episode_id,
-                "valid_from": (
-                    entity["valid_from"].isoformat()
-                    if entity.get("valid_from") else None
-                ),
-            },
-        )
-        await publisher.stage(event, conn)
+    async with pool.connection() as conn:
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await publisher.stage(event, conn)
+                await apply_event(
+                    cur, "knowledge.entity.created", event["data"], scope, created,
+                    embedding=embedding,
+                )
+                await cur.execute(
+                    "SELECT id, scope, name, label, properties, embedding, "
+                    "epistemic_status, valid_from, valid_to, ingested_at, "
+                    "source_episode_id, created_at "
+                    "FROM knowledge_entities WHERE id = %s",
+                    (entity_id,),
+                )
+                entity = _row_to_entity(await cur.fetchone())
 
     return entity
 
@@ -336,65 +327,66 @@ async def create_edge(
 ) -> dict:
     """Create a knowledge edge between two entities.
 
-    Validates both entities exist, inserts into knowledge_edges,
-    and stages a knowledge.edge.created event.
+    Validates both entities exist, stages a `knowledge.edge.created` event, and
+    lets :func:`apply_event` write the row in the same transaction.
     """
     edge_id = mint("cor")
     props = properties or {}
+    created = datetime.now(timezone.utc)
 
     async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            # Validate source entity exists, and take its scope for the event:
-            # an edge belongs to the same scope as the entity it starts from.
-            await cur.execute(
-                "SELECT id, scope FROM knowledge_entities WHERE id = %s AND valid_to IS NULL",
-                (src_entity_id,),
-            )
-            src_row = await cur.fetchone()
-            if src_row is None:
-                raise ValueError(f"Source entity {src_entity_id} not found or invalidated")
-            edge_scope = src_row[1] or ""
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                # Validate source entity exists, and take its scope for the
+                # event: an edge belongs to the scope of its source entity.
+                await cur.execute(
+                    "SELECT id, scope FROM knowledge_entities "
+                    "WHERE id = %s AND valid_to IS NULL",
+                    (src_entity_id,),
+                )
+                src_row = await cur.fetchone()
+                if src_row is None:
+                    raise ValueError(
+                        f"Source entity {src_entity_id} not found or invalidated")
+                edge_scope = src_row[1] or ""
 
-            # Validate destination entity exists
-            await cur.execute(
-                "SELECT id FROM knowledge_entities WHERE id = %s AND valid_to IS NULL",
-                (dst_entity_id,),
-            )
-            if await cur.fetchone() is None:
-                raise ValueError(f"Destination entity {dst_entity_id} not found or invalidated")
+                await cur.execute(
+                    "SELECT id FROM knowledge_entities "
+                    "WHERE id = %s AND valid_to IS NULL",
+                    (dst_entity_id,),
+                )
+                if await cur.fetchone() is None:
+                    raise ValueError(
+                        f"Destination entity {dst_entity_id} not found or invalidated")
 
-            # Insert edge
-            await cur.execute(
-                "INSERT INTO knowledge_edges "
-                "(id, src_entity_id, dst_entity_id, rel_type, properties, source_episode_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s) "
-                "RETURNING id, src_entity_id, dst_entity_id, rel_type, properties, "
-                "valid_from, valid_to, source_episode_id, created_at",
-                (edge_id, src_entity_id, dst_entity_id, rel_type,
-                 json.dumps(props), source_episode_id),
-            )
-            row = await cur.fetchone()
-            edge = _row_to_edge(row)
+                event = build_event(
+                    short_type="knowledge.edge.created",
+                    subject=edge_id,
+                    scope=scope_parts(edge_scope),
+                    data={
+                        "edge_id": edge_id,
+                        "src_entity_id": src_entity_id,
+                        "dst_entity_id": dst_entity_id,
+                        "rel_type": rel_type,
+                        "scope": edge_scope,
+                        "properties": props,
+                        "source_episode_id": source_episode_id,
+                        "valid_from": created.isoformat(),
+                    },
+                )
+                await publisher.stage(event, conn)
+                await apply_event(
+                    cur, "knowledge.edge.created", event["data"], edge_scope, created,
+                )
+                await cur.execute(
+                    "SELECT id, src_entity_id, dst_entity_id, rel_type, properties, "
+                    "valid_from, valid_to, source_episode_id, created_at "
+                    "FROM knowledge_edges WHERE id = %s",
+                    (edge_id,),
+                )
+                edge = _row_to_edge(await cur.fetchone())
 
-        # Stage event inside the same transaction
-        event = build_event(
-            short_type="knowledge.edge.created",
-            subject=edge_id,
-            scope=scope_parts(edge_scope),
-            data={
-                "edge_id": edge_id,
-                "src_entity_id": src_entity_id,
-                "dst_entity_id": dst_entity_id,
-                "rel_type": rel_type,
-                "scope": edge_scope,
-                "properties": props,
-                "valid_from": (
-                    edge["valid_from"].isoformat()
-                    if edge.get("valid_from") else None
-                ),
-            },
-        )
-        await publisher.stage(event, conn)
+    return edge
 
     return edge
 
@@ -554,28 +546,41 @@ async def invalidate_entity(
     publisher: Any,
     entity_id: str,
 ) -> dict:
-    """Invalidate (soft-delete) an entity by setting valid_to = now()."""
+    """Invalidate (soft-delete) an entity by setting valid_to = now().
+
+    Idempotent: invalidating an already-invalidated entity stages and applies
+    nothing new and returns the existing `valid_to`.
+    """
     async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "UPDATE knowledge_entities SET valid_to = now() WHERE id = %s "
-                "RETURNING id, valid_to, scope",
-                (entity_id,),
-            )
-            row = await cur.fetchone()
-            if row is None:
-                raise ValueError(f"Entity {entity_id} not found")
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT scope, valid_to FROM knowledge_entities WHERE id = %s",
+                    (entity_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise ValueError(f"Entity {entity_id} not found")
+                entity_scope = row[0]
 
-        # Stage event inside the same transaction, scoped to the entity's owner.
-        event = build_event(
-            short_type="knowledge.entity.invalidated",
-            subject=entity_id,
-            scope=scope_parts(row[2]),
-            data={"entity_id": entity_id, "scope": row[2]},
-        )
-        await publisher.stage(event, conn)
+                event = build_event(
+                    short_type="knowledge.entity.invalidated",
+                    subject=entity_id,
+                    scope=scope_parts(entity_scope),
+                    data={"entity_id": entity_id, "scope": entity_scope},
+                )
+                await publisher.stage(event, conn)
+                await apply_event(
+                    cur, "knowledge.entity.invalidated", event["data"],
+                    entity_scope, datetime.now(timezone.utc),
+                )
+                await cur.execute(
+                    "SELECT valid_to FROM knowledge_entities WHERE id = %s",
+                    (entity_id,),
+                )
+                valid_to = (await cur.fetchone())[0]
 
-    return {"id": row[0], "valid_to": row[1], "action": "invalidated"}
+    return {"id": entity_id, "valid_to": valid_to, "action": "invalidated"}
 
 
 async def invalidate_edge(
@@ -583,33 +588,43 @@ async def invalidate_edge(
     publisher: Any,
     edge_id: str,
 ) -> dict:
-    """Invalidate (soft-delete) an edge by setting valid_to = now()."""
+    """Invalidate (soft-delete) an edge by setting valid_to = now().
+
+    Idempotent, as :func:`invalidate_entity`.
+    """
     async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "UPDATE knowledge_edges SET valid_to = now() WHERE id = %s "
-                "RETURNING id, valid_to, src_entity_id",
-                (edge_id,),
-            )
-            row = await cur.fetchone()
-            if row is None:
-                raise ValueError(f"Edge {edge_id} not found")
-            await cur.execute(
-                "SELECT scope FROM knowledge_entities WHERE id = %s", (row[2],)
-            )
-            scope_row = await cur.fetchone()
-            edge_scope = scope_row[0] if scope_row else "user"
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT src_entity_id, valid_to FROM knowledge_edges WHERE id = %s",
+                    (edge_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise ValueError(f"Edge {edge_id} not found")
+                await cur.execute(
+                    "SELECT scope FROM knowledge_entities WHERE id = %s", (row[0],)
+                )
+                scope_row = await cur.fetchone()
+                edge_scope = scope_row[0] if scope_row else "user"
 
-        # Stage event inside the same transaction, scoped to the source entity.
-        event = build_event(
-            short_type="knowledge.edge.invalidated",
-            subject=edge_id,
-            scope=scope_parts(edge_scope),
-            data={"edge_id": edge_id, "scope": edge_scope},
-        )
-        await publisher.stage(event, conn)
+                event = build_event(
+                    short_type="knowledge.edge.invalidated",
+                    subject=edge_id,
+                    scope=scope_parts(edge_scope),
+                    data={"edge_id": edge_id, "scope": edge_scope},
+                )
+                await publisher.stage(event, conn)
+                await apply_event(
+                    cur, "knowledge.edge.invalidated", event["data"],
+                    edge_scope, datetime.now(timezone.utc),
+                )
+                await cur.execute(
+                    "SELECT valid_to FROM knowledge_edges WHERE id = %s", (edge_id,)
+                )
+                valid_to = (await cur.fetchone())[0]
 
-    return {"id": row[0], "valid_to": row[1], "action": "invalidated"}
+    return {"id": edge_id, "valid_to": valid_to, "action": "invalidated"}
 
 
 # ── Legacy / compatibility functions ────────────────────────────────────────
