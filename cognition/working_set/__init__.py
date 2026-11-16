@@ -53,10 +53,11 @@ def compute_salience(
     goal_terms: set[str],
     identity_terms: set[str],
     *,
+    attention_terms: set[str] | None = None,
     pinned: bool = False,
     now: datetime | None = None,
 ) -> float:
-    """0..1 salience from recency, goal overlap and identity overlap."""
+    """0..1 salience from recency, goals, identity and attention gaps."""
     if pinned:
         return 1.0
     now = now or datetime.now(timezone.utc)
@@ -70,8 +71,17 @@ def compute_salience(
     goal_score = min(1.0, goal_hits / max(1, min(len(goal_terms), 5)))
     identity_hits = sum(1 for term in identity_terms if term in text)
     identity_score = min(1.0, identity_hits / max(1, min(len(identity_terms), 5)))
+    attention_terms = attention_terms or set()
+    attention_hits = sum(1 for term in attention_terms if term in text)
+    attention_score = min(1.0, attention_hits / max(1, min(len(attention_terms), 5)))
 
-    return round(0.60 * recency + 0.25 * goal_score + 0.15 * identity_score, 4)
+    return round(
+        0.50 * recency
+        + 0.20 * goal_score
+        + 0.15 * identity_score
+        + 0.15 * attention_score,
+        4,
+    )
 
 
 async def refresh_working_set(
@@ -101,6 +111,19 @@ async def refresh_working_set(
             )
             identity_terms = _terms(row[0] for row in await cur.fetchall())
 
+            # Attention's active gaps name a value or goal that is stated but
+            # not being acted on; those terms make related memories warmer.
+            await cur.execute(
+                "SELECT description FROM alignment_signals "
+                "WHERE scope = %s AND valid_to IS NULL",
+                (scope,),
+            )
+            attention_terms = _terms(
+                subject
+                for (description,) in await cur.fetchall()
+                for subject in re.findall(r"'([^']+)'", description or "")
+            )
+
             await cur.execute(
                 "SELECT id, statement, valid_from FROM memories "
                 "WHERE scope = %s AND valid_to IS NULL "
@@ -122,6 +145,7 @@ async def refresh_working_set(
             mem_id,
             compute_salience(
                 statement, valid_from, goal_terms, identity_terms,
+                attention_terms=attention_terms,
                 pinned=mem_id in pinned,
             ),
         )
@@ -138,6 +162,7 @@ async def refresh_working_set(
         "expired_deleted": 0,
         "goal_terms": len(goal_terms),
         "identity_terms": len(identity_terms),
+        "attention_terms": len(attention_terms),
     }
     subject = stamped = None
     async with pool.connection() as conn:
