@@ -28,18 +28,27 @@ SCOPE = os.environ.get("CURLYOS_SCOPE", "user:usr_hiten")
 STATE = Path.home() / ".local/share/curlyos"
 SOURCE = "claude"
 
+# The shared client is stdlib-only and ships with the checkout this hook lives
+# in. CURLYOS_CORE_ROOT overrides the resolved path.
+_CORE_ROOT = Path(os.environ.get(
+    "CURLYOS_CORE_ROOT", str(Path(__file__).resolve().parents[3]),
+))
+if str(_CORE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_CORE_ROOT))
+
+from shared.client import ClientError, SyncCurlyOSClient  # noqa: E402
+
+_client = SyncCurlyOSClient(base_url=API, scope=SCOPE, timeout=15)
+
 
 def api(path, body=None, timeout=15):
-    request = urllib.request.Request(
-        API + path,
-        data=json.dumps(body).encode() if body is not None else None,
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        result = json.load(response)
-    if isinstance(result, dict) and result.get("error"):
-        raise RuntimeError("CurlyOS request failed")
-    return result
+    """One round-trip through the shared client contract."""
+    try:
+        return _client.request(
+            "POST" if body is not None else "GET", path, body=body, timeout=timeout,
+        )
+    except ClientError as exc:
+        raise RuntimeError(str(exc)) from None
 
 
 def redact(text):

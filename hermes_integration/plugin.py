@@ -13,15 +13,25 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
+
+# The shared client is stdlib-only (its async transport imports httpx lazily),
+# so it is safe to import into the Hermes venv. Point CURLYOS_CORE_ROOT at the
+# checkout when it is not in the default location.
+_CORE_ROOT = Path(os.environ.get(
+    "CURLYOS_CORE_ROOT", "/Users/crazymage/Tech Projects/CurlyOS-Core",
+))
+if str(_CORE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_CORE_ROOT))
+
+from shared.client import ClientError, SyncCurlyOSClient  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -36,28 +46,26 @@ def _api_url() -> str:
     return os.environ.get("CURLYOS_API_URL", DEFAULT_API_URL).rstrip("/")
 
 
+_client = SyncCurlyOSClient(
+    base_url=_api_url(),
+    scope=os.environ.get("CURLYOS_SCOPE"),
+    timeout=30.0,
+)
+
+
 def _api(method: str, path: str, payload: Optional[dict] = None,
          params: Optional[dict] = None, timeout: float = 30.0) -> dict:
-    """One round-trip to curlyos-core. HTTP errors raise RuntimeError carrying
-    the server's detail message — 404/409 are meaningful (not found / already
-    decided) and get relayed to the model verbatim."""
-    url = _api_url() + path
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(
-        url, data=data, method=method,
-        headers={"Content-Type": "application/json"} if data is not None else {},
-    )
+    """One round-trip through the shared client contract.
+
+    HTTP and payload errors become RuntimeError carrying the server's detail,
+    which the tool surface relays to the model verbatim.
+    """
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode() or "{}")
-    except urllib.error.HTTPError as e:
-        try:
-            detail = json.loads(e.read().decode()).get("detail", "")
-        except Exception:
-            detail = ""
-        raise RuntimeError(f"HTTP {e.code} {path}: {detail or e.reason}") from None
+        return _client.request(
+            method, path, body=payload, params=params, timeout=timeout,
+        )
+    except ClientError as exc:
+        raise RuntimeError(str(exc)) from None
 
 
 # ---------------------------------------------------------------------------
