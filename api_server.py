@@ -491,10 +491,15 @@ def list_memories(
     where = " AND ".join(conditions)
     with get_conn() as conn:
         rows = conn.execute(
-            f"SELECT * FROM memories WHERE {where} ORDER BY created_at DESC LIMIT %s OFFSET %s",
+            f"SELECT * FROM memories WHERE {where} "
+            "ORDER BY coalesce(valid_from, created_at) DESC, id DESC "
+            "LIMIT %s OFFSET %s",
             params + [limit, offset],
         ).fetchall()
-    return {"items": rows, "count": len(rows)}
+        total = conn.execute(
+            f"SELECT count(*) AS n FROM memories WHERE {where}", params,
+        ).fetchone()["n"]
+    return {"items": rows, "count": len(rows), "total": total}
 
 
 @app.get("/api/memories/{mem_id}")
@@ -677,7 +682,8 @@ def list_episodes(
     where = " AND ".join(conditions)
     with get_conn() as conn:
         rows = conn.execute(
-            f"SELECT * FROM episodes WHERE {where} ORDER BY created_at DESC LIMIT %s OFFSET %s",
+            f"SELECT * FROM episodes WHERE {where} "
+            "ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s",
             params + [limit, offset],
         ).fetchall()
         total = conn.execute(
