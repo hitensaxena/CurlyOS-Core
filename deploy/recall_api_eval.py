@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import os
 import statistics
 import time
 import urllib.request
@@ -25,6 +26,12 @@ import psycopg
 
 API = "http://127.0.0.1:8643/api/recall"
 SCOPE = "user:usr_hiten"
+
+def _auth() -> dict[str, str]:
+    """Bearer token when the API gate is armed (dormant by default)."""
+    token = os.environ.get("CURLYOS_API_TOKEN", "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else ""
+
 K = 8
 
 QUERIES = [
@@ -50,7 +57,8 @@ def dsn() -> str:
 
 def call(query: str) -> tuple[list[dict], float]:
     body = json.dumps({"query": query, "scope": SCOPE, "mode": "deep", "k": K}).encode()
-    req = urllib.request.Request(API, data=body, headers={"content-type": "application/json"})
+    req = urllib.request.Request(API, data=body,
+                                 headers={"content-type": "application/json", **_auth()})
     t0 = time.monotonic()
     payload = json.load(urllib.request.urlopen(req, timeout=120))
     return payload.get("results", []), (time.monotonic() - t0) * 1000

@@ -29,6 +29,12 @@ from memory.retrieval.eval import aggregate, score_query  # noqa: E402
 DEFAULT_DATASET = Path(__file__).with_name("recall_golden.json")
 SCOPE = os.environ.get("CURLYOS_SCOPE", "user:usr_hiten")
 
+def _auth() -> dict[str, str]:
+    """Bearer token when the API gate is armed (dormant by default)."""
+    token = os.environ.get("CURLYOS_API_TOKEN", "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else ""
+
+
 
 def dsn() -> str:
     value = os.environ.get("CURLYOS_DATABASE_URL")
@@ -68,7 +74,7 @@ def call(query: str, api: str, k: int, mode: str) -> tuple[list[str], bool]:
     body = json.dumps({"query": query, "scope": SCOPE, "mode": mode, "k": k}).encode()
     request = urllib.request.Request(
         api.rstrip("/") + "/api/recall", data=body,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **_auth()},
     )
     with urllib.request.urlopen(request, timeout=120) as response:
         payload = json.load(response)

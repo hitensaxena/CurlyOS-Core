@@ -22,9 +22,15 @@ SCOPE = os.environ.get("CURLYOS_SCOPE", "user:usr_hiten")
 STATE = Path.home() / ".local/share/curlyos"
 
 
+def _auth_headers():
+    """Bearer token when the operator has armed the API gate (dormant by default)."""
+    token = os.environ.get("CURLYOS_API_TOKEN", "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def api(path, body=None, timeout=15):
     request = urllib.request.Request(API + path, data=json.dumps(body).encode() if body is not None else None,
-                                     headers={"Content-Type": "application/json"})
+                                     headers={"Content-Type": "application/json", **_auth_headers()})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         result = json.load(response)
     if isinstance(result, dict) and result.get("error"):
