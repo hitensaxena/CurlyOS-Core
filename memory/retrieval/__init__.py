@@ -188,6 +188,8 @@ def blend_rank_scores(
     w_fused: float = 0.25,
     w_recency: float = 0.10,
     half_life_days: float = 30.0,
+    chatter: set[str] | None = None,
+    chatter_factor: float = 0.5,
     now: datetime | None = None,
 ) -> dict[str, float]:
     """Blend final ranking signals into one comparable score.
@@ -195,6 +197,11 @@ def blend_rank_scores(
     Cosine and the retrieval layer's fused score are min-max normalised across
     the candidate set; recency is an exponential half-life decay. Weights are
     renormalised, so the result always stays in [0, 1].
+
+    `chatter` holds ids graph hygiene flagged as conversational scaffolding.
+    They are multiplied by `chatter_factor` rather than dropped: "It's live."
+    ranked first for "where do I live" on the word 'live' alone, but a flagged
+    row is still better than nothing when it is the only match.
     """
     ids = set(cosines) | set(fused) | set(valid_from)
     if not ids:
@@ -231,12 +238,14 @@ def blend_rank_scores(
         age_days = max(0.0, (now - vf).total_seconds() / 86400.0)
         rec_n[key] = 0.5 ** (age_days / half_life_days)
 
+    chatter = chatter or set()
+    factor = max(0.0, min(1.0, chatter_factor))
     return {
         key: (
             w_cosine * cos_n.get(key, 0.0)
             + w_fused * fused_n.get(key, 0.0)
             + w_recency * rec_n.get(key, 0.0)
-        ) / total_w
+        ) / total_w * (factor if key in chatter else 1.0)
         for key in ids
     }
 

@@ -35,6 +35,8 @@ class RecallSettings:
     blend_half_life_days: float = 30.0
     working_set_boost: float = 0.08
     lexical_boost: float = 0.0
+    # Multiplier for memories graph hygiene flagged as chatter. 1.0 disables.
+    chatter_factor: float = 0.5
 
 
 def recall_cache_key(
@@ -138,12 +140,16 @@ async def recall_query(
             async with pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
-                        "SELECT id, 1 - (embedding <=> %s::vector) FROM memories "
+                        "SELECT id, 1 - (embedding <=> %s::vector), is_chatter "
+                        "FROM memories "
                         "WHERE id = ANY(%s) AND embedding IS NOT NULL",
                         (qlit, [it.id for it in cand]),
                     )
-                    for rid, sim in await cur.fetchall():
+                    chatter: set[str] = set()
+                    for rid, sim, is_chatter in await cur.fetchall():
                         sims[rid] = float(sim)
+                        if is_chatter:
+                            chatter.add(rid)
             stage_timings["cosine_rescore"] = round((time.monotonic() - _t_score) * 1000, 2)
 
             _t_blend = time.monotonic()
@@ -155,6 +161,8 @@ async def recall_query(
                 w_fused=settings.blend_fused,
                 w_recency=settings.blend_recency,
                 half_life_days=settings.blend_half_life_days,
+                chatter=chatter,
+                chatter_factor=settings.chatter_factor,
             )
             stage_timings["blend"] = round((time.monotonic() - _t_blend) * 1000, 2)
 
