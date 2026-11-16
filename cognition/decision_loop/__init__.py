@@ -27,9 +27,13 @@ the reflection/meta engines (LLM), not here.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any, Optional, Sequence
 
 from shared.types.ulid import mint
+from shared.events import build_event
+from shared.scope import scope_parts
+from knowledge.graph.projection import apply_event
 
 EMBED_DIM = 1024
 
@@ -201,8 +205,14 @@ async def mirror_lesson_to_kg_async(
     lesson_id: str,
     rel_type: str = "applies_to",
     source_episode_id: Optional[str] = None,
+    publisher: Any = None,
 ) -> str:
-    """Async mirror_lesson_to_kg — idempotent (cached on lessons.properties.kg_entity_id)."""
+    """Async mirror_lesson_to_kg — idempotent (cached on lessons.properties.kg_entity_id).
+
+    Writes the Lesson entity and its `applies_to` edges through the same
+    `apply_event` the rest of the graph uses, so lessons are evented like every
+    other node instead of appearing in the projection with no record of why.
+    """
     async with conn.cursor() as cur:
         await cur.execute(
             "SELECT statement, embedding, applies_to_entities, properties->>'kg_entity_id' "
@@ -216,25 +226,60 @@ async def mirror_lesson_to_kg_async(
         if existing:
             return existing
 
+        if publisher is None:
+            from shared.events.implementations import PgOnlyPublisher
+
+            publisher = PgOnlyPublisher()
+
         entity_id = mint("ent")
         name = statement if len(statement) <= 120 else statement[:117] + "..."
-        await cur.execute(
-            "INSERT INTO knowledge_entities "
-            "(id, scope, name, label, properties, embedding, epistemic_status, source_episode_id) "
-            "VALUES (%s, %s, %s, 'Lesson', %s, %s::vector, 'provisional', %s)",
-            (entity_id, scope, name, json.dumps({"lesson_id": lesson_id, "statement": statement}),
-             str(embedding) if embedding is not None else None, source_episode_id),
+        created = datetime.now(timezone.utc)
+
+        entity_event = build_event(
+            short_type="knowledge.entity.created",
+            subject=entity_id,
+            scope={"level": "user", "scope": scope},
+            data={
+                "entity_id": entity_id,
+                "name": name,
+                "label": "Lesson",
+                "epistemic_status": "provisional",
+                "scope": scope,
+                "properties": {"lesson_id": lesson_id, "statement": statement},
+                "source_episode_id": source_episode_id,
+                "valid_from": created.isoformat(),
+            },
         )
+        await publisher.stage(entity_event, conn)
+        await apply_event(
+            cur, "knowledge.entity.created", entity_event["data"], scope, created,
+            embedding=embedding,
+        )
+
         for dst in (applies_to_entities or []):
             await cur.execute(
                 "SELECT 1 FROM knowledge_entities WHERE id = %s AND valid_to IS NULL", (dst,))
             if await cur.fetchone() is None:
                 continue
-            await cur.execute(
-                "INSERT INTO knowledge_edges "
-                "(id, src_entity_id, dst_entity_id, rel_type, properties, source_episode_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s)",
-                (mint("cor"), entity_id, dst, rel_type, json.dumps({}), source_episode_id),
+            edge_id = mint("cor")
+            edge_event = build_event(
+                short_type="knowledge.edge.created",
+                subject=edge_id,
+                scope=scope_parts(scope),
+                data={
+                    "edge_id": edge_id,
+                    "src_entity_id": entity_id,
+                    "dst_entity_id": dst,
+                    "rel_type": rel_type,
+                    "scope": scope,
+                    "properties": {},
+                    "source_episode_id": source_episode_id,
+                    "valid_from": created.isoformat(),
+                },
+            )
+            await publisher.stage(edge_event, conn)
+            await apply_event(
+                cur, "knowledge.edge.created", edge_event["data"], scope, created,
             )
         await cur.execute(
             "UPDATE lessons SET properties = properties || jsonb_build_object('kg_entity_id', %s::text) "

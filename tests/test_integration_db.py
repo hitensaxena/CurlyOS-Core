@@ -861,3 +861,162 @@ async def test_graph_projection_handler_is_idempotent(pool):
             await cur.execute("DELETE FROM events WHERE scope = %s", (scope,))
             await cur.execute("DELETE FROM knowledge_edges WHERE id = %s", (edge,))
             await cur.execute("DELETE FROM knowledge_entities WHERE scope = %s", (scope,))
+
+
+@pytest.mark.asyncio
+async def test_graph_writes_are_evented_in_one_transaction(pool):
+    """Every graph write goes through apply_event, so the row and its event
+    commit together — no dispatcher run is needed for a row to exist."""
+    from knowledge.graph import (
+        create_edge, create_entity, invalidate_edge, invalidate_entity,
+    )
+    from shared.events.implementations import PgOnlyPublisher
+
+    class _Embedder:
+        async def embed_single(self, text: str) -> list[float]:
+            return [0.25] * 1024
+
+    scope = "test:graph-single-writer"
+    pub = PgOnlyPublisher()
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM events WHERE scope = %s", (scope,))
+            await cur.execute(
+                "DELETE FROM knowledge_edges WHERE src_entity_id IN "
+                "(SELECT id FROM knowledge_entities WHERE scope = %s)", (scope,))
+            await cur.execute(
+                "DELETE FROM knowledge_entities WHERE scope = %s", (scope,))
+
+    src = await create_entity(pool, pub, scope, "Single Writer Alpha",
+                              embedder=_Embedder())
+    dst = await create_entity(pool, pub, scope, "Single Writer Beta", label="Concept")
+    edge = await create_edge(pool, pub, src["id"], dst["id"], "depends_on")
+    closed_edge = await invalidate_edge(pool, pub, edge["id"])
+    closed_dst = await invalidate_entity(pool, pub, dst["id"])
+
+    # Return values come from the same transaction that wrote the row.
+    assert src["scope"] == scope
+    assert src["embedding"] is not None, "the vector must survive the single writer"
+    assert src["valid_to"] is None
+    assert dst["label"] == "Concept"
+    assert edge["src_entity_id"] == src["id"] and edge["rel_type"] == "depends_on"
+    assert closed_edge["valid_to"] is not None and closed_dst["valid_to"] is not None
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT vector_dims(embedding) FROM knowledge_entities WHERE id = %s",
+                (src["id"],))
+            assert (await cur.fetchone())[0] == 1024
+            await cur.execute(
+                "SELECT valid_to IS NOT NULL FROM knowledge_edges WHERE id = %s",
+                (edge["id"],))
+            assert (await cur.fetchone())[0] is True
+            await cur.execute(
+                "SELECT type, data FROM events WHERE scope = %s ORDER BY seq", (scope,))
+            rows = await cur.fetchall()
+
+    assert [t.split("curlyos.")[-1] for t, _ in rows] == [
+        "knowledge.entity.created",
+        "knowledge.entity.created",
+        "knowledge.edge.created",
+        "knowledge.edge.invalidated",
+        "knowledge.entity.invalidated",
+    ]
+    assert rows[0][1]["entity_id"] == src["id"]
+    assert rows[2][1]["edge_id"] == edge["id"]
+    assert rows[3][1]["edge_id"] == edge["id"]
+
+    # Invalidating again is a no-op that reports the same valid_to.
+    again = await invalidate_entity(pool, pub, dst["id"])
+    assert again["valid_to"] == closed_dst["valid_to"]
+
+    # Replaying every event through the handler changes nothing.
+    from knowledge.graph.projection import build_graph_handler
+    from shared.events.dispatch import Handler, dispatch_once
+
+    async def factory():
+        return pool
+
+    base = build_graph_handler(pool_factory=factory)
+    handler = Handler("graph_replay_test", base.fn, base.types)
+    await dispatch_once(pool, scope, handler_list=[handler], backfill=True)
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT count(*) FROM knowledge_entities WHERE scope = %s", (scope,))
+            assert (await cur.fetchone())[0] == 2
+            await cur.execute(
+                "SELECT count(*) FROM knowledge_edges WHERE src_entity_id = %s",
+                (src["id"],))
+            assert (await cur.fetchone())[0] == 1
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM events WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM knowledge_edges WHERE src_entity_id = %s",
+                              (src["id"],))
+            await cur.execute("DELETE FROM knowledge_entities WHERE scope = %s", (scope,))
+
+
+@pytest.mark.asyncio
+async def test_lesson_mirror_writes_events(pool):
+    """A lesson promoted to the graph is evented like any other node."""
+    from cognition.decision_loop import mirror_lesson_to_kg_async
+    from shared.events.implementations import PgOnlyPublisher
+
+    scope = "test:lesson-mirror"
+    lesson_id, target = mint("les"), mint("ent")
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM events WHERE scope = %s", (scope,))
+            await cur.execute(
+                "DELETE FROM knowledge_edges WHERE src_entity_id IN "
+                "(SELECT id FROM knowledge_entities WHERE scope = %s)", (scope,))
+            await cur.execute(
+                "DELETE FROM knowledge_entities WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM lessons WHERE scope = %s", (scope,))
+            await cur.execute(
+                "INSERT INTO knowledge_entities (id, scope, name) VALUES (%s, %s, %s)",
+                (target, scope, "Mirror Target"))
+            await cur.execute(
+                "INSERT INTO lessons (id, scope, statement, applies_to_entities) "
+                "VALUES (%s, %s, %s, %s)",
+                (lesson_id, scope, "When the take sounds thin, double the bass.",
+                 [target]))
+
+    async with pool.connection() as conn:
+        async with conn.transaction():
+            entity_id = await mirror_lesson_to_kg_async(
+                conn, scope=scope, lesson_id=lesson_id,
+                publisher=PgOnlyPublisher(),
+            )
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT label, epistemic_status FROM knowledge_entities WHERE id = %s",
+                (entity_id,))
+            row = await cur.fetchone()
+            await cur.execute(
+                "SELECT count(*) FROM knowledge_edges "
+                "WHERE src_entity_id = %s AND dst_entity_id = %s AND rel_type = 'applies_to'",
+                (entity_id, target))
+            edge_count = (await cur.fetchone())[0]
+            await cur.execute(
+                "SELECT type FROM events WHERE scope = %s ORDER BY seq", (scope,))
+            types = [r[0].split("curlyos.")[-1] for r in await cur.fetchall()]
+
+    assert row == ("Lesson", "provisional")
+    assert edge_count == 1
+    assert types == ["knowledge.entity.created", "knowledge.edge.created"]
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM events WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM knowledge_edges WHERE src_entity_id = %s",
+                              (entity_id,))
+            await cur.execute("DELETE FROM knowledge_entities WHERE scope = %s", (scope,))
+            await cur.execute("DELETE FROM lessons WHERE scope = %s", (scope,))

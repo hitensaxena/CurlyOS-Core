@@ -1,10 +1,14 @@
-"""Graph projection handler for the event dispatcher.
+"""Graph projection: the single implementation that writes graph rows.
 
-Phase 1 of the migration: the inline writes in `create_entity`/`create_edge`
-remain (callers need read-your-writes), and this handler independently applies
-the same events idempotently. It is a verifier and repair path, not yet the
-sole writer. Every operation is ON CONFLICT/WHERE valid_to IS NULL, so
-replaying an event twice is harmless.
+Every writer — `create_entity`, `create_edge`, the invalidation paths, the
+decision-loop lesson mirror, and the event dispatcher — calls `apply_event` on
+the cursor of its own transaction. The event payload is therefore both the
+record of the write and its description: there is one INSERT for entities and
+one for edges in the whole system, so a payload and a row cannot drift.
+
+The dispatcher replay is the repair path, not the primary one. `apply_event` is
+idempotent (`ON CONFLICT (id) DO NOTHING`, `WHERE valid_to IS NULL`), so
+replaying an event that was already applied inline changes nothing.
 """
 
 from __future__ import annotations
@@ -39,10 +43,31 @@ def _dt(value: Any, fallback: datetime) -> datetime:
     return fallback
 
 
+def _vector(value: Any) -> str | None:
+    """Render an embedding as a pgvector literal.
+
+    Callers hand us either a list of floats (the embedder's return type) or an
+    already-formatted string. Normalising here means no connection-level
+    pgvector adapter is required, and `%s::vector` accepts both.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return "[" + ",".join(repr(float(x)) for x in value) + "]"
+
+
 async def apply_event(
     cur: Any, short: str, data: dict, scope: str, created_at: Any,
+    *, embedding: Any = None,
 ) -> int:
-    """Apply one graph event idempotently. Returns affected row count."""
+    """Apply one graph event idempotently. Returns affected row count.
+
+    Call this on the cursor of the caller's own transaction, right after
+    staging the event on the same connection, so the row and its event commit
+    together. `embedding` is the one field not carried by the event: vectors
+    are derived state, so a replay correctly leaves them untouched.
+    """
     created = (
         created_at if isinstance(created_at, datetime)
         else _dt(created_at, datetime.now(timezone.utc))
@@ -51,14 +76,15 @@ async def apply_event(
     if short == "knowledge.entity.created":
         await cur.execute(
             "INSERT INTO knowledge_entities "
-            "(id, scope, name, label, properties, epistemic_status, "
+            "(id, scope, name, label, properties, embedding, epistemic_status, "
             " valid_from, valid_to, ingested_at, source_episode_id, created_at) "
-            "VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, NULL, %s, %s, %s) "
+            "VALUES (%s, %s, %s, %s, %s::jsonb, %s::vector, %s, %s, NULL, %s, %s, %s) "
             "ON CONFLICT (id) DO NOTHING",
             (
                 data.get("entity_id"), scope, data.get("name") or data.get("entity_id"),
                 data.get("label") or "Entity",
                 json.dumps(data.get("properties") or {}),
+                _vector(embedding),
                 data.get("epistemic_status") or "canonical",
                 _dt(data.get("valid_from"), created), created,
                 data.get("source_episode_id"), created,
@@ -71,13 +97,14 @@ async def apply_event(
             "INSERT INTO knowledge_edges "
             "(id, src_entity_id, dst_entity_id, rel_type, properties, "
             " valid_from, valid_to, source_episode_id, created_at) "
-            "VALUES (%s, %s, %s, %s, %s::jsonb, %s, NULL, NULL, %s) "
+            "VALUES (%s, %s, %s, %s, %s::jsonb, %s, NULL, %s, %s) "
             "ON CONFLICT (id) DO NOTHING",
             (
                 data.get("edge_id"), data.get("src_entity_id"),
                 data.get("dst_entity_id"), data.get("rel_type"),
                 json.dumps(data.get("properties") or {}),
-                _dt(data.get("valid_from"), created), created,
+                _dt(data.get("valid_from"), created),
+                data.get("source_episode_id"), created,
             ),
         )
         return cur.rowcount or 0
