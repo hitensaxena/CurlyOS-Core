@@ -974,7 +974,7 @@ async def recall(body: RecallRequest):
         )
     except Exception as e:
         logger.exception("recall failed query=%r", body.query[:80])
-        return {"error": str(e), "results": [], "count": 0}
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         if redis is not None:
             with contextlib.suppress(Exception):
@@ -2162,7 +2162,7 @@ async def ingest(body: IngestRequest, background_tasks: BackgroundTasks):
             invalidate_caches()
     except Exception as e:
         logger.exception("ingest failed source_ref=%s", source_ref)
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
     if epi_id:
         background_tasks.add_task(
@@ -2220,7 +2220,7 @@ async def consolidation_run(body: ConsolidationRunRequest | None = None):
         return result
     except Exception as e:
         logger.exception("consolidation run failed scope=%s deep=%s", scope, deep)
-        return {"error": str(e), "scope": scope, "deep": deep}
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         if redis:
             await redis.close()
@@ -2501,7 +2501,7 @@ async def reflection_weekly(body: ReflectionRequest | None = None):
         return result
     except Exception as e:
         logger.exception("weekly reflection failed scope=%s", scope)
-        return {"error": str(e), "scope": scope, "type": "weekly"}
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @app.post("/api/reflection/monthly")
@@ -2532,7 +2532,7 @@ async def reflection_monthly(body: ReflectionRequest | None = None):
         return result
     except Exception as e:
         logger.exception("monthly reflection failed scope=%s", scope)
-        return {"error": str(e), "scope": scope, "type": "monthly"}
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 # Internal — called by the `reflection_daily` scheduler job. No HTTP surface:
@@ -2558,7 +2558,7 @@ async def reflection_daily(body: ReflectionRequest | None = None):
         return result
     except Exception as e:
         logger.exception("daily reflection failed scope=%s", scope)
-        return {"error": str(e), "scope": scope, "type": "daily"}
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @app.post("/api/meta/audit")
@@ -2602,7 +2602,7 @@ async def meta_audit(body: MetaAuditRequest | None = None):
         }
     except Exception as e:
         logger.exception("meta audit failed scope=%s", scope)
-        return {"error": str(e), "scope": scope}
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @app.post("/api/meta/distill")
@@ -2635,7 +2635,7 @@ async def meta_distill(body: MetaDistillRequest | None = None):
                 "mirror": sync}
     except Exception as e:
         logger.exception("meta distill failed scope=%s", scope)
-        return {"error": str(e), "scope": scope}
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @app.post("/api/narrative/generate")
@@ -2674,7 +2674,7 @@ async def narrative_generate(body: NarrativeGenerateRequest | None = None):
         }
     except Exception as e:
         logger.exception("narrative generate failed scope=%s", scope)
-        return {"error": str(e), "scope": scope}
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @app.post("/api/attention/scan")
@@ -2711,7 +2711,7 @@ async def attention_scan(body: AttentionScanRequest | None = None):
         }
     except Exception as e:
         logger.exception("attention scan failed scope=%s", scope)
-        return {"error": str(e), "scope": scope}
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 # ── Mood / Health endpoints ──────────────────────────────────────────────────
@@ -2731,7 +2731,7 @@ async def attention_infer_mood(scope: str = SCOPE):
         return result
     except Exception as e:
         logger.exception("mood inference failed scope=%s", scope)
-        return {"error": str(e), "scope": scope}
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
