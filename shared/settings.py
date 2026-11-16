@@ -51,6 +51,8 @@ SETTINGS_REGISTRY: dict[str, dict[str, Any]] = {
                                 "description": "Maximum memory pairs classified per scan."},
     "intentions_enabled": {"type": "bool", "default": True, "category": "cognition",
                            "description": "Run the prospective-memory scan and surface due intentions."},
+    "curiosity_scan_enabled": {"type": "bool", "default": True, "category": "cognition",
+                               "description": "Run the weekly curiosity scan for grounded questions."},
     # ingest
     "epistemic_classify_enabled": {"type": "bool", "default": True, "category": "ingest",
                                    "description": "Run the per-ingest LLM epistemic classification (canonical/belief/hypothesis)."},

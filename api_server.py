@@ -246,6 +246,11 @@ class IntentionSnoozeRequest(BaseModel):
     until: datetime
 
 
+class CuriosityResolveRequest(BaseModel):
+    scope: str = SCOPE
+    note: str = ""
+
+
 class IntentionReviewRequest(BaseModel):
     scope: str = SCOPE
     outcome: str
@@ -1108,6 +1113,55 @@ async def intentions_review(intention_id: str, body: IntentionReviewRequest):
 
     await complete_intention(pool, _make_publisher_sync(), body.scope, intention_id)
     return {"intention_id": intention_id, "status": "done", "decision": result}
+
+
+@app.get("/api/cognition/curiosity")
+async def curiosity_list(
+    scope: str = SCOPE, status: str = "open",
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    """Grounded questions about gaps. Nothing has been researched or written."""
+    from cognition.curiosity import list_questions
+
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    items = await list_questions(pool, scope, status, limit)
+    return {"items": items, "count": len(items), "scope": scope, "status": status}
+
+
+@app.post("/api/cognition/curiosity/{question_id}/dismiss")
+async def curiosity_dismiss(question_id: str, body: CuriosityResolveRequest | None = None):
+    from cognition.curiosity import dismiss_question
+    from shared.scope import ScopeNotAllowed, require_scope
+
+    scope = body.scope if body else SCOPE
+    try:
+        require_scope(scope)
+    except ScopeNotAllowed:
+        raise HTTPException(status_code=403, detail=f"scope not allowed: {scope}")
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    if not await dismiss_question(
+        pool, _make_publisher_sync(), scope, question_id,
+        body.note if body else "",
+    ):
+        raise HTTPException(status_code=404, detail="question not found or already resolved")
+    return {"id": question_id, "status": "dismissed"}
+
+
+@app.post("/api/cognition/curiosity/{question_id}/answer")
+async def curiosity_answer(question_id: str, body: CuriosityResolveRequest):
+    from cognition.curiosity import answer_question
+    from shared.scope import ScopeNotAllowed, require_scope
+
+    try:
+        require_scope(body.scope)
+    except ScopeNotAllowed:
+        raise HTTPException(status_code=403, detail=f"scope not allowed: {body.scope}")
+    pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+    if not await answer_question(
+        pool, _make_publisher_sync(), body.scope, question_id, body.note,
+    ):
+        raise HTTPException(status_code=404, detail="question not found or already resolved")
+    return {"id": question_id, "status": "answered"}
 
 
 @app.get("/api/cognition/reflection")
@@ -2647,6 +2701,15 @@ def _register_engines() -> None:
         surfaced = await surface_due_intentions(pool, pub, scope)
         return {"synced": synced, "surfaced": surfaced}
 
+    async def _curiosity_scan(scope: str) -> dict:
+        from cognition.curiosity import scan_curiosity
+        from shared.settings import get_setting_cached
+
+        pool = await _get_async_pool(row_factory=psycopg.rows.tuple_row)
+        if not bool(await get_setting_cached(pool, "curiosity_scan_enabled", True)):
+            return {"skipped": "disabled"}
+        return await scan_curiosity(pool, _make_publisher_sync(), scope)
+
     async def _contradiction_scan(scope: str) -> dict:
         from cognition.contradiction import scan
         from shared.settings import get_setting_cached
@@ -2739,6 +2802,16 @@ def _register_engines() -> None:
             inputs=("memories", "identity_facts"),
             outputs=("contradiction_candidates",),
             run=_contradiction_scan,
+        ),
+        Engine(
+            name="curiosity_scan",
+            category="cognition",
+            description="Ask grounded questions about goal, entity and hypothesis gaps.",
+            schedule="Sun 07:00",
+            cadence=WeeklyAt((6,), "07:00"),
+            inputs=("goals", "memories", "knowledge_entities", "identity_facts"),
+            outputs=("curiosity_questions",),
+            run=_curiosity_scan,
         ),
         Engine(
             name="attention_scan",

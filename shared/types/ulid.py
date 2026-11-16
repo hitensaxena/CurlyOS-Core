@@ -53,6 +53,7 @@ PREFIXES: dict[str, str] = {
     "mood_log": "moo",
     "contradiction_candidate": "ctr",
     "intention": "int",
+    "curiosity_question": "cur",
     # Infrastructure
     "lock": "lck",
     "correlation": "cor",

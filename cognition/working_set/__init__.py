@@ -11,8 +11,9 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any
 
+from cognition.text import terms
 from shared.events import build_event
 from shared.scope import scope_parts
 
@@ -23,28 +24,8 @@ DEFAULT_CANDIDATES = 300
 DEFAULT_TTL_HOURS = 24
 HALF_LIFE_DAYS = 14.0
 
-_STOPWORDS = {
-    "the", "and", "for", "with", "that", "this", "from", "into", "about",
-    "your", "their", "have", "has", "are", "was", "were", "will", "would",
-    "should", "could", "been", "being", "they", "them", "there", "here",
-    "what", "when", "where", "which", "while", "also", "more", "most",
-    "some", "such", "only", "over", "under", "than", "then", "very",
-}
-
-
 class WorkingSetError(ValueError):
     pass
-
-
-def _terms(values: Iterable[str], limit: int = 30) -> set[str]:
-    terms: set[str] = set()
-    for value in values:
-        for word in re.findall(r"[a-z0-9][a-z0-9_-]{3,}", (value or "").lower()):
-            if word not in _STOPWORDS:
-                terms.add(word)
-                if len(terms) >= limit:
-                    return terms
-    return terms
 
 
 def compute_salience(
@@ -101,7 +82,7 @@ async def refresh_working_set(
                 "WHERE scope = %s AND status = 'active' AND valid_to IS NULL",
                 (scope,),
             )
-            goal_terms = _terms(f"{t} {d}" for t, d in await cur.fetchall())
+            goal_terms = terms(f"{t} {d}" for t, d in await cur.fetchall())
 
             await cur.execute(
                 "SELECT object FROM identity_facts "
@@ -109,7 +90,7 @@ async def refresh_working_set(
                 "AND epistemic_status = 'canonical' AND confidence >= 0.75",
                 (scope,),
             )
-            identity_terms = _terms(row[0] for row in await cur.fetchall())
+            identity_terms = terms(row[0] for row in await cur.fetchall())
 
             # Attention's active gaps name a value or goal that is stated but
             # not being acted on; those terms make related memories warmer.
@@ -118,7 +99,7 @@ async def refresh_working_set(
                 "WHERE scope = %s AND valid_to IS NULL",
                 (scope,),
             )
-            attention_terms = _terms(
+            attention_terms = terms(
                 subject
                 for (description,) in await cur.fetchall()
                 for subject in re.findall(r"'([^']+)'", description or "")
