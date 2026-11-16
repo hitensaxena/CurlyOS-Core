@@ -127,6 +127,13 @@ def scan_statement(statement: str) -> list[dict]:
         window = statement[max(0, match.start() - 80):match.start()]
         if not _PROXIMITY_WORD.search(window):
             continue
+        # Transcript metadata and tutorial placeholders: an id near the word
+        # "token" is not a token, and "Replace with your …" is an instruction.
+        nearby = statement[max(0, match.start() - 120):match.end() + 120]
+        if "conversation_id" in nearby or "Replace with your" in nearby:
+            continue
+        if "pen." in statement[max(0, match.start() - 12):match.start()]:
+            continue
         found.append({"kind": "proximity", "masked": _mask(value),
                       "span": list(match.span()),
                       "context": _context(statement, match)})
@@ -301,13 +308,37 @@ async def main() -> int:
         # Redacting the span in place is the only option short of deleting the
         # transcript, and the embedding is dropped so the sweep re-embeds from
         # the redacted text.
+        # Episodes are stricter than memories because the rewrite cannot be
+        # undone: only formats that are unambiguous on their own, plus a
+        # proximity hit that names a real service. Bare proximity, JWTs and
+        # vendored package docs are skipped — in a 10k-transcript corpus they
+        # fire on gallery ids, plist logs and example configs.
+        precise = {"openai-key", "github-token", "figma-token", "google-key",
+                   "aws-key", "slack-token", "labelled"}
+        services = re.compile(r"(?i)delta|serpapi|podcast ?index|omniroute|noesis|figma")
+        skip_sources = ("mind:systems/",)
+
         async with pool.connection() as conn:
             async with conn.transaction():
                 async with conn.cursor() as cur:
                     await cur.execute(
-                        "SELECT id, content FROM episodes WHERE scope = %s", (scope,))
-                    for epi_id, content in await cur.fetchall():
+                        "SELECT id, content, source_ref FROM episodes WHERE scope = %s",
+                        (scope,))
+                    for epi_id, content, source_ref in await cur.fetchall():
+                        if (source_ref or "").startswith(skip_sources):
+                            continue
                         found = scan_statement(content or "")
+                        if not found:
+                            continue
+                        found = [
+                            f for f in found
+                            if f["kind"] in precise
+                            or (f["kind"] == "proximity" and services.search(f["context"]))
+                        ]
+                        if not found:
+                            continue
+                        if "X-Amz-Credential=" in (content or ""):
+                            found = [f for f in found if f["kind"] != "aws-key"]
                         if not found:
                             continue
                         safe = redact(content or "", [f["span"] for f in found])
